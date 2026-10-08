@@ -172,8 +172,41 @@ impl FecParams {
 
 /// Every S2X code (normal and short FECFRAMEs; medium ones come with VL-SNR).
 pub fn all_s2x() -> impl Iterator<Item = FecParams> {
-    const NORMAL: [(u16, u16); 24] = [(2, 9), (13, 45), (9, 20), (90, 180), (96, 180), (11, 20), (100, 180), (104, 180), (26, 45), (18, 30), (28, 45), (23, 36), (116, 180), (20, 30), (124, 180), (25, 36), (128, 180), (13, 18), (132, 180), (22, 30), (135, 180), (140, 180), (7, 9), (154, 180)];
-    const SHORT: [(u16, u16); 7] = [(11, 45), (4, 15), (14, 45), (7, 15), (8, 15), (26, 45), (32, 45)];
+    const NORMAL: [(u16, u16); 24] = [
+        (2, 9),
+        (13, 45),
+        (9, 20),
+        (90, 180),
+        (96, 180),
+        (11, 20),
+        (100, 180),
+        (104, 180),
+        (26, 45),
+        (18, 30),
+        (28, 45),
+        (23, 36),
+        (116, 180),
+        (20, 30),
+        (124, 180),
+        (25, 36),
+        (128, 180),
+        (13, 18),
+        (132, 180),
+        (22, 30),
+        (135, 180),
+        (140, 180),
+        (7, 9),
+        (154, 180),
+    ];
+    const SHORT: [(u16, u16); 7] = [
+        (11, 45),
+        (4, 15),
+        (14, 45),
+        (7, 15),
+        (8, 15),
+        (26, 45),
+        (32, 45),
+    ];
     NORMAL
         .iter()
         .map(|&(n, d)| (FecFrame::Normal, n, d))
@@ -227,7 +260,10 @@ mod tests {
         for p in all_s2x() {
             let t = p.ldpc_table();
             assert_eq!((t.n, t.k), (p.n_ldpc, p.n_bch), "{p:?}");
-            assert_eq!(p.n_bch - p.k_bch, if p.frame == FecFrame::Normal { 16 } else { 14 } * p.t);
+            assert_eq!(
+                p.n_bch - p.k_bch,
+                if p.frame == FecFrame::Normal { 16 } else { 14 } * p.t
+            );
             assert_eq!(p.k_bch % 8, 0);
             n += 1;
         }
