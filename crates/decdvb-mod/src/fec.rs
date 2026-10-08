@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use decdvb_core::{FecFrame, RollOff};
+use decdvb_fec::vlsnr::VlsnrCode;
 use decdvb_fec::{Bch, FecParams, LdpcCode};
 use decdvb_frame::{BBHEADER_LEN, BbHeader, StreamFormat, bb_scramble, crc8};
 use decdvb_gse::{GseEncapsulator, Label, Variant};
@@ -23,6 +24,8 @@ pub trait BbFrameSource: Send {
 #[derive(Default)]
 pub struct FecEncoder {
     codes: HashMap<(FecFrame, u16, u16), (Bch, LdpcCode)>,
+    /// VL-SNR codes by header index.
+    vlsnr: HashMap<u8, (Bch, LdpcCode)>,
 }
 
 impl FecEncoder {
@@ -49,6 +52,27 @@ impl FecEncoder {
         let (info, parity) = out.split_at_mut(p.n_bch / 8);
         ldpc.encode(info, parity);
         out
+    }
+
+    /// Encode a VL-SNR BBFRAME (`code.k_bch` bits, the last byte's spare
+    /// bits ignored) and return the bits sent, one per byte: the BCH
+    /// codeword after `xs` zeros, LDPC, then shortened and punctured
+    /// (EN 302 307-2 §5.5.2.6).
+    pub fn encode_vlsnr(&mut self, code: &VlsnrCode, bbframe: &[u8]) -> Vec<u8> {
+        assert_eq!(bbframe.len(), code.bbframe_bytes());
+        let (bch, ldpc) = self.vlsnr.entry(code.header).or_insert_with(|| {
+            (
+                Bch::new(code.frame, 12, code.n_bch),
+                LdpcCode::new(code.table),
+            )
+        });
+        let mut cw = vec![0u8; code.n_ldpc() / 8];
+        let at = code.xs / 8;
+        cw[at..at + bbframe.len()].copy_from_slice(bbframe);
+        bch.encode(&mut cw[at..at + code.n_bch / 8]);
+        let (info, parity) = cw.split_at_mut(code.k_ldpc() / 8);
+        ldpc.encode(info, parity);
+        code.sent_bits_of(&cw)
     }
 }
 

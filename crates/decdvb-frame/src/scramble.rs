@@ -117,6 +117,12 @@ impl PlScrambler {
         }
     }
 
+    /// The receive factor for payload symbol `i` (multiply by it to
+    /// descramble; the transmit factor is its conjugate).
+    pub fn factor(&self, i: usize) -> Iq {
+        self.descramble_seq[i]
+    }
+
     /// Undo scrambling in place. `payload` starts at the first symbol after the
     /// PLHEADER and includes pilot blocks.
     ///

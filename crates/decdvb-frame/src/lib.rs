@@ -12,6 +12,8 @@ pub mod plsc;
 pub mod rm;
 pub mod scramble;
 pub mod sync;
+pub mod vlsnr;
+mod vlsnr_tables;
 
 pub use bbframe::{BBHEADER_LEN, BbHeader, BbHeaderError, StreamFormat, bb_scramble, crc8};
 pub use defs::*;

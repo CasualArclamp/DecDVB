@@ -23,7 +23,10 @@ use std::time::{Instant, SystemTime};
 
 use decdvb_core::Iq;
 use decdvb_fec::demap::{Mapper, quantize};
+use decdvb_fec::vlsnr::VlsnrCode;
 use decdvb_fec::{Bch, BchError, DecodeOutcome, FecParams, LdpcCode, LdpcDecoder};
+use decdvb_frame::pi2bpsk::pi2_soft;
+use decdvb_frame::vlsnr::{self as vl, Slot};
 use decdvb_frame::{BBHEADER_LEN, BbHeader, BbHeaderError, PlsInfo, StreamFormat, bb_scramble};
 use decdvb_gse::{GseIp, IpPacket, Source, Variant, VariantReport};
 use decdvb_ip::mcast::udp_payload;
@@ -77,10 +80,21 @@ struct Code {
     bch: Bch,
 }
 
+/// A VL-SNR code's decoders.
+struct VlCode {
+    code: &'static VlsnrCode,
+    ldpc: LdpcDecoder,
+    bch: Bch,
+    /// QPSK demapping for the 2/9 code.
+    qpsk: Option<Mapper>,
+}
+
 /// Decodes PLFRAMEs; holds a decoder per code met so far.
 #[derive(Default)]
 pub struct FecDecoder {
     codes: HashMap<(bool, u8), Option<Code>>,
+    vl_codes: HashMap<u8, Option<VlCode>>,
+    sent: Vec<f32>,
     data: Vec<Iq>,
     llr: Vec<f32>,
     quantized: Vec<i8>,
@@ -98,12 +112,16 @@ impl FecDecoder {
         if f.pls.dummy_frame {
             return None;
         }
+        if let (Some(set), Some((k, _))) = (f.pls.vlsnr, f.vlsnr) {
+            return self.decode_vlsnr(f, set, k);
+        }
         let FecDecoder {
             codes,
             data,
             llr,
             quantized,
             info,
+            ..
         } = self;
         let code = codes
             .entry((f.pls.short_fecframe, f.pls.modcod))
@@ -137,6 +155,99 @@ impl FecDecoder {
         let bch = code.bch.decode(&mut bytes);
         bytes.truncate(p.bbframe_bytes());
         bb_scramble(&mut bytes);
+        let header = BbHeader::parse(&bytes);
+        Some(BbFrame {
+            pls: f.pls,
+            bytes,
+            header,
+            ldpc,
+            bch,
+            es_n0_db: f.es_n0_db(),
+        })
+    }
+}
+
+impl FecDecoder {
+    /// A VL-SNR frame (EN 302 307-2 §5.5.2.6): data symbols from the
+    /// layout, LLRs (pi/2-BPSK, spreading combined; or QPSK), the shortened
+    /// and punctured bits put back, then LDPC and BCH as usual.
+    fn decode_vlsnr(&mut self, f: &PlFrame, set: u8, k: u8) -> Option<BbFrame> {
+        let vc = self
+            .vl_codes
+            .entry(k)
+            .or_insert_with(|| {
+                let code = VlsnrCode::for_header(k)?;
+                Some(VlCode {
+                    code,
+                    ldpc: LdpcDecoder::new(LdpcCode::new(code.table)),
+                    bch: Bch::new(code.frame, 12, code.n_bch),
+                    qpsk: code.qpsk.then(|| {
+                        Mapper::s2(
+                            decdvb_fec::Constellation::qpsk(),
+                            decdvb_core::CodeRate::new(2, 9),
+                            code.sent_bits(),
+                        )
+                    }),
+                })
+            })
+            .as_mut()?;
+        let code = vc.code;
+        let inv = 1.0 / f.gain.max(1e-6);
+        let noise = (f.noise_var * inv * inv).max(1e-6);
+        let layout = vl::layout(set);
+        self.data.clear();
+        self.data.extend(
+            f.payload
+                .iter()
+                .zip(layout)
+                .filter(|(_, s)| **s == Slot::Data)
+                .map(|(&y, _)| y * inv),
+        );
+        if self.data.len() != code.symbols() {
+            return None;
+        }
+        self.sent.clear();
+        match &vc.qpsk {
+            Some(m) => {
+                self.sent.resize(code.sent_bits(), 0.0);
+                m.demap_llr(&self.data, noise, &mut self.sent);
+            }
+            None => {
+                // Unit-amplitude 2-PAM: LLR = 4·y/N0; spread bits add.
+                let reps = if code.spread { 2 } else { 1 };
+                for pair in self.data.chunks(reps).enumerate() {
+                    let (j, ys) = pair;
+                    let llr: f32 = ys
+                        .iter()
+                        .enumerate()
+                        .map(|(r, &y)| 4.0 * pi2_soft(j * reps + r, y) / noise)
+                        .sum();
+                    self.sent.push(llr);
+                }
+            }
+        }
+        let n = code.n_ldpc();
+        self.llr.resize(n, 0.0);
+        code.expand_llr(&self.sent, &mut self.llr);
+        self.quantized.resize(n, 0);
+        quantize(&self.llr, LLR_SCALE, &mut self.quantized);
+        self.info.resize(code.k_ldpc() / 8, 0);
+        let ldpc = vc
+            .ldpc
+            .decode(&self.quantized, &mut self.info, MAX_ITERATIONS);
+
+        let at = code.xs / 8;
+        let mut bytes = self.info[at..at + code.n_bch / 8].to_vec();
+        let bch = vc.bch.decode(&mut bytes);
+        bytes.truncate(code.bbframe_bytes());
+        bb_scramble(&mut bytes);
+        // A ragged K (the medium codes): the last byte's spare bits are
+        // BCH parity, not BBFRAME.
+        if !code.k_bch.is_multiple_of(8)
+            && let Some(last) = bytes.last_mut()
+        {
+            *last &= 0xFF << (8 - code.k_bch % 8);
+        }
         let header = BbHeader::parse(&bytes);
         Some(BbFrame {
             pls: f.pls,
@@ -1004,6 +1115,14 @@ mod tests {
             .take(frames)
             // Frames with nothing to encode (dummy, reserved) take no BBFRAME.
             .filter_map(|s| {
+                if let Some(k) = s.vlsnr {
+                    // Whole bytes from the source; the receiver's ragged
+                    // last byte is compared only that far.
+                    let code = VlsnrCode::for_header(k)?;
+                    let mut f = ts.next_frame(code.k_bch / 8);
+                    bb_scramble(&mut f);
+                    return Some(f);
+                }
                 let mc = s.info().modcod()?;
                 let p = FecParams::new(mc.frame, mc.rate)?;
                 let mut f = ts.next_frame(p.bbframe_bytes());
@@ -1096,6 +1215,63 @@ mod tests {
             seen.insert(b.pls.modcod);
         }
         assert!(seen.len() >= 10, "MODCODs decoded: {seen:?}");
+    }
+
+    #[test]
+    fn decodes_every_vlsnr_modcod() {
+        // Set 1 (QPSK 2/9, pi/2-BPSK 1/5, 11/45, 1/3 medium, 1/5 and 11/45
+        // SF2 short) and set 2 (pi/2-BPSK 1/5, 4/15, 1/3 short, and a dummy),
+        // between S2 QPSK 1/2 frames, at 8 dB.
+        let mut schedule = vec![FrameSpec::new(4, false, true)];
+        for k in [0u8, 1, 2, 3, 4, 5, 9, 10, 11, 12] {
+            schedule.push(FrameSpec::vlsnr(k));
+        }
+        let x = signal(&schedule, 600_000, 0.001, 8.0, 25);
+        let got = decode_all(&x);
+        let want = expected(&schedule, 40, 25);
+        assert!(got.len() >= 10, "only {} frames", got.len());
+        let first = want
+            .iter()
+            .position(|w| got[0].bytes.starts_with(w))
+            .expect("first frame not in the sent sequence");
+        let mut kinds = std::collections::BTreeSet::new();
+        for (k, b) in got.iter().enumerate() {
+            assert!(
+                b.ok(),
+                "frame {k} (PLS {}): {:?} {:?}",
+                b.pls.plsc,
+                b.ldpc,
+                b.bch
+            );
+            let w = &want[first + k];
+            assert_eq!(
+                &b.bytes[..w.len()],
+                &w[..],
+                "frame {k} (PLS {})",
+                b.pls.plsc
+            );
+            kinds.insert(b.bytes.len());
+        }
+        // Nine codes, nine BBFRAME sizes.
+        assert!(kinds.len() >= 8, "sizes {kinds:?}");
+    }
+
+    /// How low VL-SNR goes with this receiver (run by hand:
+    /// `cargo test -p decdvb-engine --release vlsnr_snr_sweep -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn vlsnr_snr_sweep() {
+        for snr in [4.0, 2.0, 0.0, -2.0, -4.0] {
+            let schedule = [
+                FrameSpec::vlsnr(1),
+                FrameSpec::vlsnr(4),
+                FrameSpec::vlsnr(9),
+            ];
+            let x = signal(&schedule, 400_000, 0.001, snr, 26);
+            let got = decode_all(&x);
+            let ok = got.iter().filter(|b| b.ok()).count();
+            println!("{snr:+.0} dB: {ok} of {} frames good", got.len());
+        }
     }
 
     #[test]

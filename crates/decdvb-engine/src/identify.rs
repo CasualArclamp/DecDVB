@@ -207,11 +207,7 @@ impl Identification {
                     .modcods
                     .iter()
                     .filter(|(m, _)| **m != 0)
-                    .map(|(m, n)| {
-                        decdvb_core::modcod(*m, decdvb_core::FecFrame::Normal)
-                            .map(|mc| format!("{mc}×{n}"))
-                            .unwrap_or_else(|| format!("MODCOD {m}×{n}"))
-                    })
+                    .map(|(m, n)| format!("{}×{n}", decdvb_core::modcod_name(*m)))
                     .collect();
                 let kind = if d.is_s2x() { "DVB-S2X" } else { "DVB-S2" };
                 let mode = if d.variable_coding() {

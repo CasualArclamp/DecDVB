@@ -145,9 +145,7 @@ pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
             Some(LockState::Locked) => {
                 let mc = st
                     .last_modcod
-                    .and_then(|m| decdvb_core::modcod(m, decdvb_core::FecFrame::Normal))
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| "dummy".into());
+                    .map_or_else(|| "dummy".into(), decdvb_core::modcod_name);
                 match &st.fec {
                     Some(f) if f.ok > 0 && f.payload_bps > 0.0 => {
                         let rec = f.gse.as_ref().is_some_and(|g| g.pcap_active)

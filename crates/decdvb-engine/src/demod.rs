@@ -28,6 +28,7 @@ use decdvb_core::{Iq, Modulation};
 use decdvb_dsp::{Agc, CarrierPll, Fir, LOCK_COHERENCE, SymbolSync, rrc_taps};
 use decdvb_fec::Constellation;
 use decdvb_frame::pi2bpsk::map_bpsk;
+use decdvb_frame::vlsnr::{self, Slot, VLSNR_HEADER_LEN};
 use decdvb_frame::{
     PILOT_BLK_LEN, PLHEADER_LEN, PlHeaderCorrelator, PlScrambler, PlsInfo, PlscDecoder, PlscDemap,
     PlscEncoder, SLOT_LEN, SLOTS_PER_PILOT_BLK, SOF_BIG_ENDIAN, SOF_LEN,
@@ -89,6 +90,10 @@ pub struct PlFrame {
     /// The first frame after (re)acquiring lock: whatever came before it was
     /// lost, so a stream reassembled across frames must start over.
     pub after_gap: bool,
+    /// A VL-SNR frame: its header index (Table 18b) and how well the header
+    /// matched (1 when clean). Its payload is then as sent before
+    /// scrambling throughout — header, pilots, and pi/2-BPSK data too.
+    pub vlsnr: Option<(u8, f32)>,
 }
 
 impl PlFrame {
@@ -404,6 +409,7 @@ impl Demod {
                     let mut payload = self.sym[p0..p0 + pls.payload_len as usize].to_vec();
                     self.scrambler.descramble(&mut payload);
                     let (gain, noise_var) = self.recover_carrier(hdr_end, pls, &mut payload);
+                    let vlsnr = pls.vlsnr.map(|set| self.vlsnr_finish(set, &mut payload));
 
                     let (k, coherent_pls, c) = self.best_coherent_header(next);
                     let confirmed_at = if c > COHERENT_CONFIRM {
@@ -423,6 +429,7 @@ impl Demod {
                             gain,
                             noise_var,
                             after_gap: confirmed == 0,
+                            vlsnr,
                         });
                         self.frames += 1;
                         // Frames on the grid: the timing loop can go quiet.
@@ -604,10 +611,24 @@ impl Demod {
             )
         };
         self.data.clear();
+        // A VL-SNR frame's extra pilot blocks are known symbols too.
+        let layout = pls.vlsnr.map(vlsnr::layout);
         for i in 0..payload.len() {
-            let pilot = pls.has_pilots && i % PILOT_PERIOD >= PILOT_AFTER;
-            if pilot && i % PILOT_PERIOD == PILOT_AFTER {
-                let end = (i + PILOT_BLK_LEN).min(payload.len());
+            let pilot = match layout {
+                Some(l) => l[i] == Slot::Pilot,
+                None => pls.has_pilots && i % PILOT_PERIOD >= PILOT_AFTER,
+            };
+            let block_start = match layout {
+                Some(l) => pilot && (i == 0 || l[i - 1] != Slot::Pilot),
+                None => pilot && i % PILOT_PERIOD == PILOT_AFTER,
+            };
+            if block_start {
+                let end = match layout {
+                    Some(l) => (i..l.len())
+                        .find(|&j| l[j] != Slot::Pilot)
+                        .unwrap_or(l.len()),
+                    None => (i + PILOT_BLK_LEN).min(payload.len()),
+                };
                 self.pll.anchor(&payload[i..end], |_| PILOT);
             }
             let x = payload[i];
@@ -661,6 +682,27 @@ impl Demod {
             self.recent.push_back(y);
         }
         level
+    }
+
+    /// A VL-SNR frame's payload, carrier-corrected and descrambled as if
+    /// all of it had been scrambled by quarter turns: put back the VL-SNR
+    /// header (sent unscrambled), read it, and for pi/2-BPSK data take off
+    /// the rest of their ±1 scrambling (EN 302 307-2 §5.5.4.1). Returns
+    /// the header index and match.
+    fn vlsnr_finish(&self, set: u8, payload: &mut [Iq]) -> (u8, f32) {
+        for (i, y) in payload[..VLSNR_HEADER_LEN].iter_mut().enumerate() {
+            *y *= self.scrambler.factor(i).conj();
+        }
+        let (k, c) = vlsnr::decode_header(&payload[..VLSNR_HEADER_LEN]);
+        let bpsk = decdvb_fec::vlsnr::VlsnrCode::for_header(k).is_some_and(|c| !c.qpsk);
+        if bpsk {
+            for (i, slot) in vlsnr::layout(set).iter().enumerate() {
+                if *slot == Slot::Data {
+                    payload[i] *= self.scrambler.factor(i);
+                }
+            }
+        }
+        (k, c)
     }
 
     /// Drop symbols nothing will look at again.

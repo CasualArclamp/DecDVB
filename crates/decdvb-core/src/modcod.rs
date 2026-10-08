@@ -310,6 +310,18 @@ pub fn modcod(index: u8, frame: FecFrame) -> Option<Modcod> {
     }
 }
 
+/// What to call a MODCOD number from a PLS code, whatever it is: "dummy",
+/// a MODCOD's name, an S2X VL-SNR set (whose MODCOD is in its own header),
+/// or "reserved".
+pub fn modcod_name(index: u8) -> String {
+    match index {
+        0 => "dummy".into(),
+        128 => "VL-SNR set 1".into(),
+        130 => "VL-SNR set 2".into(),
+        _ => modcod(index, FecFrame::Normal).map_or_else(|| "reserved".into(), |m| m.to_string()),
+    }
+}
+
 /// The standard DVB-S2 MODCOD table (see [`S2_MODCODS`]).
 pub fn s2_modcod_table() -> &'static [Modcod] {
     &S2_MODCODS

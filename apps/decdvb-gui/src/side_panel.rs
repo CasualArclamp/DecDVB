@@ -1304,9 +1304,7 @@ fn modcod_table(ui: &mut Ui, counts: &BTreeMap<u8, u64>) {
                 let name = if m == 0 {
                     "dummy".to_string()
                 } else {
-                    decdvb_core::modcod(m, decdvb_core::FecFrame::Normal)
-                        .map(|mc| format!("{m:2} {mc}"))
-                        .unwrap_or_else(|| format!("{m:2} (S2X/reserved)"))
+                    format!("{m:2} {}", decdvb_core::modcod_name(m))
                 };
                 ui.label(RichText::new(name).monospace());
                 ui.label(n.to_string());

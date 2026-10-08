@@ -14,8 +14,11 @@
 
 use decdvb_core::{FecFrame, Iq, Modulation, modcod};
 use decdvb_fec::demap::Mapper;
+use decdvb_fec::vlsnr::VlsnrCode;
 use decdvb_fec::{Constellation, FecParams};
 use decdvb_frame::pi2bpsk::map_bpsk;
+use decdvb_frame::pi2bpsk::pi2_symbol;
+use decdvb_frame::vlsnr::{self, Slot, VLSNR_HEADER_LEN};
 
 use crate::fec::{BbFrameSource, FecEncoder, TsBbFramer};
 use decdvb_frame::{
@@ -32,6 +35,8 @@ pub struct FrameSpec {
     /// S2 only: the short FECFRAME (S2X codes name their own).
     pub short_fecframe: bool,
     pub pilots: bool,
+    /// A VL-SNR frame with this header index (Table 18b).
+    pub vlsnr: Option<u8>,
 }
 
 impl FrameSpec {
@@ -40,6 +45,18 @@ impl FrameSpec {
             modcod,
             short_fecframe,
             pilots,
+            vlsnr: None,
+        }
+    }
+
+    /// A VL-SNR frame (S2X): header index 0–5 (set 1), 9–11 (set 2) or 12
+    /// (a set 2 dummy frame).
+    pub const fn vlsnr(header: u8) -> Self {
+        FrameSpec {
+            modcod: if header <= 8 { 129 } else { 131 },
+            short_fecframe: false,
+            pilots: true,
+            vlsnr: Some(header),
         }
     }
 
@@ -49,6 +66,7 @@ impl FrameSpec {
             modcod: pls,
             short_fecframe: false,
             pilots,
+            vlsnr: None,
         }
     }
 
@@ -124,6 +142,11 @@ impl PlFramer {
             .encode(info.plsc, &mut out[start + SOF_LEN..start + PLHEADER_LEN]);
 
         let payload_start = out.len();
+        if let Some(k) = spec.vlsnr {
+            self.build_vlsnr(k, out);
+            debug_assert_eq!(out.len() - start, info.plframe_len as usize);
+            return;
+        }
         if info.dummy_frame {
             // A dummy frame's payload is 36 slots of the unmodulated symbol.
             out.extend(std::iter::repeat_n(PILOT, info.xfecframe_len as usize));
@@ -174,6 +197,59 @@ impl PlFramer {
 
         debug_assert_eq!(out.len() - start, info.plframe_len as usize);
         self.scrambler.scramble(&mut out[payload_start..]);
+    }
+
+    /// The rest of a VL-SNR frame after its PLHEADER: the VL-SNR header,
+    /// then data and pilots as Figures 17/18 lay them out, scrambled per
+    /// §5.5.4.1 — the header not at all, pilots and QPSK by quarter turns,
+    /// pi/2-BPSK by ±1.
+    fn build_vlsnr(&mut self, k: u8, out: &mut Vec<Iq>) {
+        let set = vlsnr::set_of(k);
+        let layout = vlsnr::layout(set);
+        let code = VlsnrCode::for_header(k);
+        // The data symbols, or none for a dummy (all pilots after the header).
+        self.data.clear();
+        if let Some(code) = code {
+            // A BBFRAME of K bits: whole bytes from the source, the ragged
+            // tail (medium codes) zero.
+            let mut bb = self.source.next_frame(code.k_bch / 8);
+            bb.resize(code.bbframe_bytes(), 0);
+            let bits = self.fec.encode_vlsnr(code, &bb);
+            if code.qpsk {
+                let q = Constellation::qpsk();
+                for pair in bits.chunks(2) {
+                    self.data.push(q.map(((pair[0] << 1) | pair[1]) as usize));
+                }
+            } else {
+                let reps = if code.spread { 2 } else { 1 };
+                for (i, b) in bits
+                    .iter()
+                    .flat_map(|&b| std::iter::repeat_n(b, reps))
+                    .enumerate()
+                {
+                    self.data.push(pi2_symbol(i, b));
+                }
+            }
+        }
+        let start = out.len();
+        let mut header = vec![Iq::new(0.0, 0.0); VLSNR_HEADER_LEN];
+        vlsnr::header_symbols(k, &mut header);
+        let bpsk = code.is_some_and(|c| !c.qpsk);
+        let mut data = self.data.iter();
+        for (i, slot) in layout.iter().enumerate() {
+            let f = self.scrambler.factor(i).conj();
+            out.push(match slot {
+                Slot::Header => header[i],
+                Slot::Data if code.is_some() => {
+                    let d = *data.next().unwrap();
+                    if bpsk { d * f * f } else { d * f }
+                }
+                // Pilots, and a dummy frame's symbols.
+                _ => PILOT * f,
+            });
+        }
+        debug_assert!(data.next().is_none());
+        debug_assert_eq!(out.len() - start, layout.len());
     }
 
     /// Build frames following `schedule`, cycling it until at least `n_symbols`

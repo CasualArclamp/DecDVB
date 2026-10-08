@@ -24,6 +24,17 @@ const MAP: [[Iq; 2]; 2] = [
 /// part. These are `conj` of the bit-0 symbols above.
 const ROT: [Iq; 2] = [Iq::new(S, -S), Iq::new(-S, -S)];
 
+/// One pi/2-BPSK symbol: `bit` at position `index` of its sequence.
+pub fn pi2_symbol(index: usize, bit: u8) -> Iq {
+    MAP[index & 1][bit as usize & 1]
+}
+
+/// The 2-PAM soft decision of a pi/2-BPSK symbol at position `index`:
+/// positive for a 0 bit, ±1 when clean.
+pub fn pi2_soft(index: usize, y: Iq) -> f32 {
+    (y * ROT[index & 1]).re
+}
+
 /// Map the top `n` bits of `code` (MSB first) to pi/2-BPSK symbols.
 ///
 /// # Panics

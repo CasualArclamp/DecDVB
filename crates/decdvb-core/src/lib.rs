@@ -9,7 +9,8 @@ pub mod crc;
 pub mod modcod;
 
 pub use modcod::{
-    CodeRate, FecFrame, Modcod, Modulation, modcod, s2_modcod, s2_modcod_table, s2x_modcod_table,
+    CodeRate, FecFrame, Modcod, Modulation, modcod, modcod_name, s2_modcod, s2_modcod_table,
+    s2x_modcod_table,
 };
 
 use num_complex::Complex32;

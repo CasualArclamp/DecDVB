@@ -449,3 +449,38 @@ was the cross-check.
 pilots, pi/2-BPSK with spreading, shortening and puncturing, medium
 FECFRAMEs with GF(2^15) BCH), the other PL scrambling sequences of Table 19e
 in acquisition, and superframing (Annex E; DESIGN puts it in M5).
+
+## M3, part 3 — S2X VL-SNR (done, 2026-10-08)
+
+- **Medium FECFRAMEs**: BCH over GF(2^15) (g1 = 0x802D; the built generator
+  equals the product of Table 7's g1…g12), with messages that are not whole
+  bytes (K = 5660, 7740, 10 620: 180 parity bits); the medium LDPC tables
+  were already in from part 1.
+- **VL-SNR header** (`decdvb-frame::vlsnr`, §5.5.2.5): 16 base rows of 56
+  bits signed by Walsh–Hadamard rows — generated from the standard's text,
+  and all 16 resulting sequences equal gr-dtv's `ph_vlsnr_seq`. Decoded by
+  correlating row by row (896 bits: decodes at −3 dB in a test). The frame
+  layout of Figures 17/18 (extra pilot blocks of 34/36 and 32/36 symbols
+  mid-group), cross-checked against gr-dtv's pilot insertion.
+- **VL-SNR codes** (`decdvb-fec::vlsnr`, Tables 18a, 19a–19d): QPSK 2/9 and
+  pi/2-BPSK 1/5, 11/45, 1/3 (medium), 1/5 and 11/45 with spreading factor 2,
+  1/5, 4/15, 1/3 (short; "1/5" is S2's short 1/4 code). Shortening (Xs
+  zeros, certain at the decoder) and puncturing (every P-th parity bit until
+  Xp, erased), as gr-dtv's encoder does.
+- **Demod**: anchors the carrier on the extra pilots too; after the frame,
+  puts the VL-SNR header back as sent (it is not scrambled), reads it, and
+  for pi/2-BPSK takes off the rest of the ±1 scrambling (§5.5.4.1).
+- **FEC**: data symbols by layout, LLRs (2-PAM, spread pairs summed; or
+  QPSK), shortened and punctured bits restored, LDPC, BCH, BBFRAME (a ragged
+  K's spare bits cleared).
+- **Modulator**: `FrameSpec::vlsnr(header)` builds them, dummy included.
+- **Tests**: every VL-SNR MODCOD and the dummy, between S2 frames, decode at
+  8 dB to the BBFRAMEs sent. A sweep (`vlsnr_snr_sweep`, ignored) decodes
+  them down to 0 dB; below about −2 dB the PLHEADER is not acquired at all —
+  VL-SNR's own territory (−10 dB) needs acquisition built for it (longer
+  correlation, header-aided). One seed lost three of six frames at +2 dB
+  while 0 dB was clean: worth a look when a real VL-SNR signal turns up.
+
+**S2X left**: superframing (Annex E, M5 in DESIGN), and searching the
+preferred PL scrambling sequences of Table 19e when the default does not
+lock.

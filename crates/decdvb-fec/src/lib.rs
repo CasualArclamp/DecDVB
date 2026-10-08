@@ -7,6 +7,7 @@
 //! - [`demap`]: bit interleaving, mapping, and max-log soft demapping.
 //!
 //! - [`apsk_tables`]: the S2X constellation and interleaver tables.
+//! - [`vlsnr`]: the shortened and punctured codes of S2X VL-SNR frames.
 
 pub mod apsk_tables;
 pub mod bch;
@@ -14,6 +15,7 @@ pub mod constellation;
 pub mod demap;
 pub mod ldpc;
 pub mod params;
+pub mod vlsnr;
 
 pub use bch::{Bch, BchError};
 pub use constellation::Constellation;

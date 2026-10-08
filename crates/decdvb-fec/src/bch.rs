@@ -1,14 +1,16 @@
 //! The BCH outer code (EN 302 307-1 §5.3.1).
 //!
 //! A t-error-correcting binary BCH code, shortened, over GF(2^16) for normal
-//! FECFRAMEs and GF(2^14) for short ones. The generator is the product of the
-//! minimal polynomials of α, α³, …, α^(2t−1) — Tables 6a/6b list them as
-//! g1 … g12 — so it is built here from the field rather than typed in, and the
-//! tests check its degree and its first factor against the tables.
+//! FECFRAMEs, GF(2^14) for short ones and GF(2^15) for S2X's medium ones
+//! (EN 302 307-2 Table 7). The generator is the product of the minimal
+//! polynomials of α, α³, …, α^(2t−1) — the tables list them as g1 … g12 — so
+//! it is built here from the field rather than typed in, and the tests check
+//! it against the tables.
 //!
 //! Bit order: the codeword is sent highest-degree coefficient first —
 //! `m_(k−1) … m_0` then the parity `d_(n−k−1) … d_0` — and is held here as
-//! bytes, MSB first. Every S2 code length is a whole number of bytes.
+//! bytes, MSB first. Every codeword is a whole number of bytes, but medium
+//! FECFRAMEs have 180 parity bits, so their messages are not (K = 5660).
 //!
 //! Decoding: a byte-wise remainder (CRC-style) says in one pass whether the
 //! codeword is clean, which after LDPC it nearly always is. Only otherwise are
@@ -62,6 +64,12 @@ impl Gf {
     pub fn short() -> &'static Gf {
         static F: OnceLock<Gf> = OnceLock::new();
         F.get_or_init(|| Gf::new(14, 0x402B))
+    }
+
+    /// GF(2^15), g1(x) = 1 + x² + x³ + x⁵ + x¹⁵ (EN 302 307-2 Table 7).
+    pub fn medium() -> &'static Gf {
+        static F: OnceLock<Gf> = OnceLock::new();
+        F.get_or_init(|| Gf::new(15, 0x802D))
     }
 
     #[inline]
@@ -162,6 +170,8 @@ pub struct Bch {
     p: usize,
     /// Byte-wise remainder table, left-aligned.
     table: Box<[Reg; 256]>,
+    /// g(x) without its x^p term, left-aligned, for single-bit steps.
+    g_low: Reg,
 }
 
 impl Bch {
@@ -171,12 +181,12 @@ impl Bch {
         let gf = match frame {
             FecFrame::Normal => Gf::normal(),
             FecFrame::Short => Gf::short(),
-            FecFrame::Medium => unimplemented!("medium FECFRAMEs are S2X (M3)"),
+            FecFrame::Medium => Gf::medium(),
         };
         let g = generator(gf, t);
         let p = g.len() - 1;
         assert_eq!(p, gf.m as usize * t, "generator degree");
-        assert!(p.is_multiple_of(8) && n_bits.is_multiple_of(8) && p <= 192);
+        assert!(n_bits.is_multiple_of(8) && p <= 192);
 
         // g without its x^p term, left-aligned: x^(p-1) at bit 191.
         let mut g_low: Reg = [0; 3];
@@ -207,17 +217,18 @@ impl Bch {
             n_bits,
             p,
             table,
+            g_low,
         }
     }
 
-    /// Parity bytes.
-    pub fn parity_bytes(&self) -> usize {
-        self.p / 8
+    /// Parity bits, m·t.
+    pub fn parity_bits(&self) -> usize {
+        self.p
     }
 
-    /// Message bytes (K_bch / 8).
-    pub fn message_bytes(&self) -> usize {
-        (self.n_bits - self.p) / 8
+    /// Message bits, K_bch.
+    pub fn message_bits(&self) -> usize {
+        self.n_bits - self.p
     }
 
     /// x^p · bytes(x) mod g(x), left-aligned.
@@ -231,14 +242,32 @@ impl Bch {
         r
     }
 
-    /// Fill the parity bytes at the end of `codeword` from the message before
-    /// them (systematic encoding).
+    /// Fill the parity bits at the end of `codeword` from the K_bch message
+    /// bits before them (systematic encoding).
     pub fn encode(&self, codeword: &mut [u8]) {
-        let k = self.message_bytes();
-        assert_eq!(codeword.len(), k + self.parity_bytes());
-        let r = self.remainder(&codeword[..k]);
-        for (i, out) in codeword[k..].iter_mut().enumerate() {
-            *out = (r[i / 8] >> (56 - 8 * (i % 8))) as u8;
+        assert_eq!(codeword.len() * 8, self.n_bits);
+        let k = self.message_bits();
+        // Whole message bytes through the table, any last bits one by one.
+        let mut r = self.remainder(&codeword[..k / 8]);
+        for i in (k / 8) * 8..k {
+            let bit = (codeword[i / 8] >> (7 - i % 8)) & 1 == 1;
+            let fb = bit ^ bit_from_top(&r, 0);
+            r[0] = (r[0] << 1) | (r[1] >> 63);
+            r[1] = (r[1] << 1) | (r[2] >> 63);
+            r[2] <<= 1;
+            if fb {
+                xor(&mut r, &self.g_low);
+            }
+        }
+        // The p parity bits are the top of the remainder.
+        for i in 0..self.p {
+            let pos = k + i;
+            let mask = 0x80 >> (pos % 8);
+            if bit_from_top(&r, i) {
+                codeword[pos / 8] |= mask;
+            } else {
+                codeword[pos / 8] &= !mask;
+            }
         }
     }
 
@@ -385,6 +414,64 @@ mod tests {
         for j in (1..24).step_by(2) {
             assert_eq!(Gf::normal().minimal_polynomial(j).len(), 17, "α^{j}");
             assert_eq!(Gf::short().minimal_polynomial(j).len(), 15, "α^{j}");
+        }
+    }
+
+    #[test]
+    fn medium_generator_is_the_product_of_table_7() {
+        // EN 302 307-2 Table 7, g1 … g12 as exponent lists.
+        let table: [&[usize]; 12] = [
+            &[0, 2, 3, 5, 15],
+            &[0, 1, 4, 7, 10, 11, 15],
+            &[0, 2, 4, 6, 8, 10, 12, 13, 15],
+            &[0, 2, 3, 5, 6, 8, 10, 11, 15],
+            &[0, 1, 2, 4, 6, 7, 10, 12, 15],
+            &[0, 4, 6, 7, 12, 13, 15],
+            &[0, 2, 4, 5, 7, 11, 12, 14, 15],
+            &[0, 2, 4, 6, 8, 9, 11, 14, 15],
+            &[0, 1, 2, 4, 5, 7, 9, 11, 12, 13, 15],
+            &[0, 1, 2, 3, 4, 7, 10, 11, 12, 13, 15],
+            &[0, 1, 2, 4, 9, 11, 15],
+            &[0, 2, 4, 8, 10, 11, 13, 14, 15],
+        ];
+        let mut want = vec![true];
+        for exps in table {
+            let mut mp = [false; 16];
+            for &e in exps {
+                mp[e] = true;
+            }
+            let mut out = vec![false; want.len() + 15];
+            for (a, &x) in want.iter().enumerate() {
+                if x {
+                    for (b, &y) in mp.iter().enumerate() {
+                        out[a + b] ^= y;
+                    }
+                }
+            }
+            want = out;
+        }
+        assert_eq!(generator(Gf::medium(), 12), want);
+    }
+
+    #[test]
+    fn medium_codes_with_ragged_messages() {
+        // VL-SNR's medium codes: K_bch of 5660, 7740, 10620 bits — not
+        // whole bytes (Table 19c).
+        let mut next = rng(7);
+        for n in [5840usize, 7920, 10_800] {
+            let bch = Bch::new(FecFrame::Medium, 12, n);
+            assert_eq!(bch.parity_bits(), 180);
+            let mut cw: Vec<u8> = (0..n / 8).map(|_| next() as u8).collect();
+            bch.encode(&mut cw);
+            let clean = cw.clone();
+            assert_eq!(bch.decode(&mut cw.clone()), Ok(0), "N {n}");
+            let mut bad = clean.clone();
+            for k in 0..12 {
+                let b = (k * 467 + 13) % n;
+                bad[b / 8] ^= 0x80 >> (b % 8);
+            }
+            assert_eq!(bch.decode(&mut bad), Ok(12), "N {n}");
+            assert_eq!(bad, clean);
         }
     }
 
