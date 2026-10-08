@@ -4,11 +4,19 @@
 //! scrambled) followed by the payload: `S` slots of 90 data symbols with a
 //! 36-symbol pilot block after every 16 slots when pilots are on, the whole
 //! payload — pilots included — then PL-scrambled.
+//!
+//! The data symbols are real: a TS-mode BBFRAME of test packets, BCH and LDPC
+//! encoded, interleaved and mapped (`fec`), so a test signal decodes end to
+//! end. The one exception is a code the standard does not define (short
+//! FECFRAME 9/10): its PLHEADER can still be built, with random points after.
 
 use decdvb_core::{FecFrame, Modulation};
 use decdvb_core::{Iq, s2_modcod};
-use decdvb_fec::Constellation;
+use decdvb_fec::demap::map_fecframe;
+use decdvb_fec::{Constellation, FecParams};
 use decdvb_frame::pi2bpsk::map_bpsk;
+
+use crate::fec::{FecEncoder, TsBbFramer};
 use decdvb_frame::{
     PILOT_BLK_LEN, PLHEADER_LEN, PlScrambler, PlsInfo, PlscEncoder, SLOT_LEN, SLOTS_PER_PILOT_BLK,
     SOF_BIG_ENDIAN, SOF_LEN,
@@ -50,6 +58,10 @@ pub struct PlFramer {
     scrambler: PlScrambler,
     plsc: PlscEncoder,
     rng: u64,
+    /// The BBFRAME source; set its roll-off to match the shaping filter.
+    pub ts: TsBbFramer,
+    fec: FecEncoder,
+    data: Vec<Iq>,
 }
 
 impl PlFramer {
@@ -58,6 +70,9 @@ impl PlFramer {
             scrambler: PlScrambler::new(gold_code),
             plsc: PlscEncoder::new(),
             rng: seed | 1,
+            ts: TsBbFramer::new(seed ^ 0x7E57),
+            fec: FecEncoder::new(),
+            data: Vec::new(),
         }
     }
 
@@ -90,17 +105,35 @@ impl PlFramer {
             // A dummy frame's payload is 36 slots of the unmodulated symbol.
             out.extend(std::iter::repeat_n(PILOT, info.xfecframe_len as usize));
         } else {
-            let mc = s2_modcod(spec.modcod, FecFrame::Normal)
+            let size = if spec.short_fecframe {
+                FecFrame::Short
+            } else {
+                FecFrame::Normal
+            };
+            let mc = s2_modcod(spec.modcod, size)
                 .unwrap_or_else(|| panic!("MODCOD {} is not a DVB-S2 MODCOD", spec.modcod));
             let cst = Constellation::for_modcod(mc.modulation, mc.rate)
                 .unwrap_or_else(|| panic!("no constellation for {mc}"));
-            let mask = (1usize << cst.bits()) - 1;
 
-            for slot in 0..info.n_slots as usize {
-                for _ in 0..SLOT_LEN {
-                    let bits = (self.next_u64() >> 32) as usize & mask;
-                    out.push(cst.map(bits));
+            self.data.clear();
+            match FecParams::new(size, mc.rate) {
+                Some(p) => {
+                    let bb = self.ts.next_frame(p.bbframe_bytes());
+                    let fec = self.fec.encode(p, &bb);
+                    map_fecframe(&fec, &cst, mc.rate, &mut self.data);
                 }
+                None => {
+                    let mask = (1usize << cst.bits()) - 1;
+                    for _ in 0..info.xfecframe_len {
+                        let bits = (self.next_u64() >> 32) as usize & mask;
+                        self.data.push(cst.map(bits));
+                    }
+                }
+            }
+            debug_assert_eq!(self.data.len(), info.xfecframe_len as usize);
+
+            for (slot, data) in self.data.as_chunks::<SLOT_LEN>().0.iter().enumerate() {
+                out.extend_from_slice(data);
                 // A pilot block after every 16th slot, unless it would be last.
                 let done = slot + 1;
                 if info.has_pilots
@@ -125,6 +158,10 @@ impl PlFramer {
             "need at least one frame in the schedule"
         );
         let mut out = Vec::with_capacity(n_symbols + 40_000);
+        // One MODCOD throughout is CCM; anything else is ACM/VCM (MATYPE).
+        self.ts.ccm = schedule.iter().filter(|s| s.modcod != 0).all(|s| {
+            (s.modcod, s.short_fecframe) == (schedule[0].modcod, schedule[0].short_fecframe)
+        });
         let mut k = 0;
         while out.len() < n_symbols {
             self.build(schedule[k % schedule.len()], &mut out);

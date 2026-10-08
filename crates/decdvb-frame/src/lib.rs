@@ -5,6 +5,7 @@
 //! pilot blocks) that the PLS code implies. BBFRAME/BBHEADER parsing and
 //! superframing follow in M2 and M5 — see `docs/DESIGN.md`.
 
+pub mod bbframe;
 pub mod defs;
 pub mod pi2bpsk;
 pub mod plsc;
@@ -12,6 +13,7 @@ pub mod rm;
 pub mod scramble;
 pub mod sync;
 
+pub use bbframe::{BBHEADER_LEN, BbHeader, BbHeaderError, StreamFormat, bb_scramble, crc8};
 pub use defs::*;
 pub use plsc::{PlsInfo, PlscDecoder, PlscDemap, PlscEncoder};
 pub use rm::ReedMuller;

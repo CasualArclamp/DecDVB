@@ -7,6 +7,7 @@
 pub mod carriers;
 pub mod demod;
 pub mod estimate;
+pub mod fec;
 pub mod frontend;
 pub mod identify;
 pub mod psk;
@@ -16,6 +17,7 @@ pub mod vfo;
 pub use carriers::{Carrier, detect_carriers};
 pub use demod::{Demod, LockState, PlFrame};
 pub use estimate::{BandEstimate, estimate_band};
+pub use fec::{BbFrame, FecDecoder, FecStats};
 pub use frontend::{Engine, EngineOptions, FrontStatus, SourceState};
 pub use identify::{
     ConstellationGuess, Identification, RateSource, Verdict, identify, identify_in,

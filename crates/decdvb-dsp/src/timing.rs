@@ -89,6 +89,12 @@ impl SymbolSync {
         }
     }
 
+    /// Change the loop's noise bandwidth (relative to the symbol rate),
+    /// keeping its state: wide to pull in, narrow to track quietly.
+    pub fn set_bandwidth(&mut self, bn_t: f64) {
+        (self.k1, self.k2) = loop_gains(bn_t, std::f64::consts::FRAC_1_SQRT_2, 1.0);
+    }
+
     /// Current samples-per-symbol estimate.
     pub fn sps(&self) -> f64 {
         self.sps

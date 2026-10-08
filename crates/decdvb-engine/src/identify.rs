@@ -1094,24 +1094,31 @@ mod tests {
 
     #[test]
     fn works_through_a_ddc_at_fractional_sps() {
-        // The real VFO path: a wideband capture at 10 samples/symbol, a VFO
+        // The real VFO path: a wideband capture at 13 samples/symbol, a VFO
         // dropped on the carrier, and a DDC that decimates by 3 — leaving
-        // 3.33 samples per symbol, which nothing downstream may assume away.
+        // 4.33 samples per symbol, which nothing downstream may assume away.
+        // The VFO is 1.6 wide: the carrier occupies 1.35, and a VFO that
+        // clips it (1.3, as this test once had) clips the roll-off it is
+        // asked to measure.
         let x = dvbs2_signal(
             &[FrameSpec::new(12, false, true)],
             100_000,
-            10,
+            13,
             0.35,
             0.05,
             16.0,
             3,
         );
-        let mut ddc = decdvb_dsp::Ddc::new(10.0, 0.5, 1.3);
+        // The carrier sits at 0.05 of the sample rate: 0.65.
+        let mut ddc = decdvb_dsp::Ddc::new(13.0, 0.65, 1.6);
         assert_eq!(ddc.decimation(), 3);
         let mut bb = Vec::new();
         ddc.process(&x, &mut bb);
 
-        let id = identify(&bb, ddc.out_rate());
+        // As a VFO calls it: told its width, so the DDC's stopband beyond the
+        // edges is not mistaken for the noise floor. (Plain `identify` here
+        // fits the roll-off against that stopband and reads 0.35 as 0.25.)
+        let id = identify_in(&bb, ddc.out_rate(), Some(1.6));
         let rs = id.symbol_rate.unwrap();
         assert!((rs - 1.0).abs() < 0.005, "Rs {rs} ({})", id.summary());
         assert!(matches!(id.verdict, Verdict::DvbS2(_)), "{}", id.summary());

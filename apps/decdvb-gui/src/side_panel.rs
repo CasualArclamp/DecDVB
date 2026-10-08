@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use decdvb_core::Modulation;
 use decdvb_engine::{
-    CarrierState, ConstellationGuess, DecoderKind, Identification, LockState, RateSource, Verdict,
-    VfoId, VfoStatus,
+    CarrierState, ConstellationGuess, DecoderKind, FecStats, Identification, LockState, RateSource,
+    Verdict, VfoId, VfoStatus,
 };
 use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, Ui, vec2};
 use egui_plot::{Line, Plot, PlotPoints, Points};
@@ -234,7 +234,10 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                     let (label, tip) = if s.record {
                         ("⏹ Stop", "Close the .bin file")
                     } else {
-                        ("● Record", "Write the hard-decided symbols to a .bin file, one byte each")
+                        (
+                            "● Record",
+                            "Write the hard-decided symbols to a .bin file, one byte each",
+                        )
                     };
                     let b = egui::Button::new(label).selected(s.record);
                     if ui.add(b).on_hover_text(tip).clicked() {
@@ -324,7 +327,12 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
     );
     if !demodulates && let Some(id) = &st.identification {
         ui.add_space(6.0);
-        identification_card(ui, id, inp.rf_center + v.settings.offset_hz);
+        identification_card(
+            ui,
+            id,
+            inp.rf_center + v.settings.offset_hz,
+            st.carrier.as_ref(),
+        );
     }
 
     if matches!(
@@ -355,6 +363,9 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                 ui.end_row();
             }
         });
+        if let Some(f) = &st.fec {
+            fec_card(ui, f);
+        }
     }
 
     if v.settings.decoder == DecoderKind::PskSymbols
@@ -414,11 +425,96 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
         egui::CollapsingHeader::new("Acquisition (Identify)")
             .id_salt(("acq", v.id))
             .show(ui, |ui| {
-                identification_card(ui, id, inp.rf_center + v.settings.offset_hz);
+                identification_card(ui, id, inp.rf_center + v.settings.offset_hz, None);
             });
     }
 
     actions
+}
+
+/// What FEC made of a DVB-S2 VFO's frames, and the stream the BBHEADERs
+/// describe.
+fn fec_card(ui: &mut Ui, f: &FecStats) {
+    ui.add_space(6.0);
+    ui.label(RichText::new("FEC").strong());
+    egui::Grid::new("fec").num_columns(2).show(ui, |ui| {
+        ui.label("BBFRAMEs");
+        let pct = 100.0 * f.ok as f64 / f.frames.max(1) as f64;
+        let col = if f.frames == 0 {
+            ui.visuals().weak_text_color()
+        } else if f.ok == f.frames {
+            Color32::from_rgb(110, 220, 110)
+        } else if f.ok > 0 {
+            Color32::from_rgb(240, 200, 80)
+        } else {
+            Color32::from_rgb(230, 110, 110)
+        };
+        ui.colored_label(col, format!("{} of {} good ({pct:.1} %)", f.ok, f.frames));
+        ui.end_row();
+        if f.bch_failed + f.crc_failed > 0 {
+            ui.label("Failed");
+            ui.label(format!(
+                "{} LDPC/BCH, {} header CRC",
+                f.bch_failed, f.crc_failed
+            ));
+            ui.end_row();
+        }
+        if f.frames > 0 {
+            ui.label("LDPC");
+            ui.label(format!(
+                "{:.1} iterations avg · BCH fixed {} bits",
+                f.iterations as f64 / f.frames as f64,
+                f.bch_corrected
+            ));
+            ui.end_row();
+        }
+        if let Some(e) = f.es_n0_db {
+            ui.label("Es/N0");
+            ui.label(format!("{e:.1} dB (pilots and headers)"));
+            ui.end_row();
+        }
+        if f.payload_bps > 0.0 {
+            ui.label("Payload");
+            ui.label(format::bitrate(f.payload_bps));
+            ui.end_row();
+        }
+        if let Some(h) = &f.last_header {
+            ui.label("Stream");
+            let streams = if h.single_stream {
+                "single stream".to_string()
+            } else {
+                let isis: Vec<String> = f.streams.keys().map(|i| i.to_string()).collect();
+                format!("multistream, ISI {}", isis.join(", "))
+            };
+            ui.label(format!(
+                "{} · {} · {}{}",
+                h.format.label(),
+                if h.ccm { "CCM" } else { "ACM/VCM" },
+                streams,
+                if h.high_efficiency { " · HEM" } else { "" }
+            ));
+            ui.end_row();
+            if h.upl > 0 {
+                ui.label("Packets");
+                ui.label(format!("{} bytes, sync 0x{:02X}", h.upl / 8, h.sync));
+                ui.end_row();
+            }
+            if let Some(r) = h.roll_off {
+                ui.label("Roll-off");
+                ui.label(format!("{:.2} (BBHEADER)", r.as_f64()));
+                ui.end_row();
+            }
+        }
+        if f.dropped > 0 || f.load > 0.5 {
+            ui.label("FEC load");
+            ui.label(format!(
+                "{:.0} % · {} frames dropped",
+                f.load * 100.0,
+                f.dropped
+            ));
+            ui.end_row();
+        }
+    });
 }
 
 /// Carrier loop rows for a two-column grid.
@@ -453,7 +549,13 @@ fn psk_note(ui: &mut Ui) {
     );
 }
 
-fn identification_card(ui: &mut Ui, id: &Identification, abs_center: f64) {
+/// `live`: Identify's live view of the carrier, when it is running.
+fn identification_card(
+    ui: &mut Ui,
+    id: &Identification,
+    abs_center: f64,
+    live: Option<&CarrierState>,
+) {
     let (headline, col) = match &id.verdict {
         Verdict::NoSignal => ("No signal".to_string(), Color32::GRAY),
         Verdict::Carrier => (
@@ -537,7 +639,19 @@ fn identification_card(ui: &mut Ui, id: &Identification, abs_center: f64) {
                 ui.label("S/N (spectrum)");
                 ui.label(format!("{:.1} dB", id.snr_db));
                 ui.end_row();
-                if let (Some(mer), Some(coh)) = (id.mer_db, id.coherence) {
+                if let Some(c) = live {
+                    // Live: the demodulator running between identifications.
+                    ui.label("Carrier");
+                    if c.locked {
+                        ui.colored_label(
+                            Color32::from_rgb(110, 220, 110),
+                            format!("locked · MER {:.1} dB (live)", c.mer_db),
+                        );
+                    } else {
+                        ui.colored_label(Color32::from_rgb(230, 150, 90), "not locked (live)");
+                    }
+                    ui.end_row();
+                } else if let (Some(mer), Some(coh)) = (id.mer_db, id.coherence) {
                     ui.label("Carrier");
                     if id.carrier_locked {
                         ui.colored_label(

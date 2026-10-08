@@ -78,6 +78,32 @@ impl CarrierPll {
         self.phase = radians;
     }
 
+    /// Change the loop's noise bandwidth, keeping its phase and frequency.
+    pub fn set_bandwidth(&mut self, bn_t: f64) {
+        (self.k1, self.k2) = loop_gains(bn_t);
+    }
+
+    /// Re-anchor the phase on a block of known symbols about to be stepped
+    /// through: whatever phase error the loop would carry into the block —
+    /// including a whole cycle slip of 90° or more — is removed at once, from
+    /// the block's average, instead of being pulled in over ~1/Bn symbols.
+    /// `sent(n)` is the reference for `block[n]`.
+    pub fn anchor(&mut self, block: &[Iq], sent: impl Fn(usize) -> Iq) {
+        let mut acc = Iq::new(0.0, 0.0);
+        for (n, &y) in block.iter().enumerate() {
+            let ph = -(self.phase + self.freq * n as f64);
+            acc += y * Iq::new(ph.cos() as f32, ph.sin() as f32) * sent(n).conj();
+        }
+        if acc.norm() > 0.0 {
+            self.phase += acc.arg() as f64;
+            if self.phase > PI {
+                self.phase -= TAU;
+            } else if self.phase < -PI {
+                self.phase += TAU;
+            }
+        }
+    }
+
     pub fn phase(&self) -> f64 {
         self.phase
     }

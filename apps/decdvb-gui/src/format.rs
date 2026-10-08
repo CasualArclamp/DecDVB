@@ -24,6 +24,15 @@ pub fn rate(sps: f64) -> String {
     }
 }
 
+/// A bit rate: `2.10 Mbit/s`, `850.0 kbit/s`.
+pub fn bitrate(bps: f64) -> String {
+    if bps.abs() >= 1e6 {
+        format!("{:.2} Mbit/s", bps / 1e6)
+    } else {
+        format!("{:.1} kbit/s", bps / 1e3)
+    }
+}
+
 /// A short axis label for a frequency, at a precision suited to the tick step.
 pub fn tick(hz: f64, step: f64) -> String {
     // Unit from the larger of the value and the step, so a tick at 0 Hz uses

@@ -1,14 +1,14 @@
 //! DVB-S2 modulator.
 //!
-//! M1b provides the physical layer: PLFRAME construction (PLHEADER, payload,
-//! pilots, scrambling) and pulse shaping. Payload symbols are random points
-//! on the right constellation until the FEC encoder exists (M2), which makes
-//! the output statistically and spectrally identical to a real carrier — all
-//! that acquisition and identification can see — but not decodable past the
-//! PL layer. The full encode chain arrives in M6.
+//! Builds real DVB-S2 signals for tests and test captures: TS-mode BBFRAMEs
+//! (`fec`), BCH + LDPC encoding, interleaving and mapping, PLFRAMEs
+//! (`framer`: header, pilots, scrambling) and pulse shaping (`shaper`). The
+//! HackRF transmit path and a user-facing modulator arrive in M6.
 
+pub mod fec;
 pub mod framer;
 pub mod shaper;
 
+pub use fec::{FecEncoder, TsBbFramer};
 pub use framer::{FrameSpec, PlFramer};
 pub use shaper::Shaper;

@@ -20,6 +20,7 @@ use decdvb_dsp::Ddc;
 use decdvb_io::IqFileWriter;
 
 use crate::demod::{Demod, LockState};
+use crate::fec::{FecStats, FecWorker};
 use crate::identify::{Identification, Verdict, identify_in};
 use crate::psk::PskDemod;
 use crate::spectrum::Spectrum;
@@ -153,8 +154,10 @@ pub struct VfoStatus {
     pub recording: Option<(PathBuf, u64)>,
     /// `recording` is being written now (not just the last file).
     pub recording_active: bool,
-    /// Carrier loop of a running demodulator.
+    /// Carrier loop of a running demodulator (for Identify: its live view).
     pub carrier: Option<CarrierState>,
+    /// DVB-S2 decoders: what FEC has made of the frames.
+    pub fec: Option<FecStats>,
 }
 
 /// A running demodulator's carrier loop, for display.
@@ -278,6 +281,8 @@ enum Decoder {
         target: usize,
         /// The last result came from too short a listen to rule DVB-S2 out.
         provisional: bool,
+        /// Demodulating live between identifications.
+        live: Option<LiveView>,
     },
     Spectrum,
     Record {
@@ -288,6 +293,8 @@ enum Decoder {
     Dvbs2 {
         buf: Vec<Iq>,
         demod: Option<Box<Demod>>,
+        /// LDPC/BCH on its own thread, started with the demodulator.
+        fec: Option<FecWorker>,
     },
     Psk {
         buf: Vec<Iq>,
@@ -361,6 +368,7 @@ impl Worker {
                 rest_until: None,
                 target: first_look(ddc.out_rate()),
                 provisional: false,
+                live: None,
             },
             DecoderKind::Spectrum => Decoder::Spectrum,
             DecoderKind::IqRecord => {
@@ -382,6 +390,7 @@ impl Worker {
             DecoderKind::Dvbs2Ip | DecoderKind::Dvbs2Ts => Decoder::Dvbs2 {
                 buf: Vec::new(),
                 demod: None,
+                fec: None,
             },
             DecoderKind::PskSymbols => Decoder::Psk {
                 buf: Vec::new(),
@@ -493,7 +502,13 @@ impl Worker {
                 rest_until,
                 target,
                 provisional,
+                live,
             } => {
+                // Between identifications the last result drives a live
+                // demodulator, so the constellation keeps moving.
+                if let Some(l) = live {
+                    l.process(&self.bb, &mut self.syms);
+                }
                 // After a confident result, rest before checking again: a
                 // carrier rarely changes, and re-analysing millions of samples
                 // back to back was most of a wide Identify VFO's CPU. A retune
@@ -523,17 +538,27 @@ impl Worker {
                             *rest_until = Some(Instant::now() + IDENTIFY_REST);
                         }
                     }
+                    // Keep the live view running if this is the same carrier;
+                    // start a new one if not.
+                    if !live.as_ref().is_some_and(|l| l.same_carrier(&id)) {
+                        *live = LiveView::new(&id, out_rate);
+                    }
                     self.identification = Some(id);
                     buf.clear();
                 }
             }
-            Decoder::Dvbs2 { buf, demod } => match demod {
+            Decoder::Dvbs2 { buf, demod, fec } => match demod {
                 Some(d) => {
                     self.frames.clear();
                     d.process(&self.bb, &mut self.frames);
                     for f in &self.frames {
                         *self.modcods.entry(f.pls.modcod).or_default() += 1;
                         self.last_modcod = Some(f.pls.modcod);
+                    }
+                    if let Some(w) = fec {
+                        for f in self.frames.drain(..) {
+                            w.offer(f);
+                        }
                     }
                 }
                 None => {
@@ -561,6 +586,11 @@ impl Worker {
                                 .set_offset(self.settings.offset_hz + id.center_offset_hz);
                             self.frames.clear();
                             d.process(&shifted, &mut self.frames);
+                            let w = FecWorker::spawn(rs);
+                            for f in self.frames.drain(..) {
+                                w.offer(f);
+                            }
+                            *fec = Some(w);
                             *demod = Some(d);
                         } else {
                             buf.clear();
@@ -670,12 +700,14 @@ impl Worker {
         st.recording = None;
         st.recording_active = false;
         st.carrier = None;
+        st.fec = None;
 
         match &self.decoder {
             Decoder::Identify {
                 buf,
                 target,
                 provisional,
+                live,
                 ..
             } => {
                 st.progress = buf.len() as f32 / (*target).max(1) as f32;
@@ -689,19 +721,31 @@ impl Worker {
                     None => "listening…".into(),
                 };
                 st.symbol_rate = self.identification.as_ref().and_then(|i| i.symbol_rate);
-                // The carrier-locked symbols of the last identification; raw
-                // baseband only until there is one.
-                match self
-                    .identification
-                    .as_ref()
-                    .filter(|i| !i.symbols.is_empty())
-                {
-                    Some(id) => st.scatter = id.symbols.clone(),
-                    None if new_samples > 0 => {
-                        let stride = (self.bb.len() / 2000).max(1);
-                        st.scatter = self.bb.iter().step_by(stride).copied().collect();
+                // Live carrier-locked symbols once the live view has some;
+                // before that the last identification's; raw baseband only
+                // until there is one.
+                let live = live.as_ref().filter(|l| l.demod.symbols() >= 500);
+                if let Some(l) = live {
+                    st.scatter = l.demod.recent();
+                    st.carrier = Some(CarrierState {
+                        locked: l.demod.locked(),
+                        mer_db: l.demod.mer_db(),
+                        offset_hz: l.demod.carrier_offset_hz(),
+                        modulation: l.demod.modulation(),
+                    });
+                } else {
+                    match self
+                        .identification
+                        .as_ref()
+                        .filter(|i| !i.symbols.is_empty())
+                    {
+                        Some(id) => st.scatter = id.symbols.clone(),
+                        None if new_samples > 0 => {
+                            let stride = (self.bb.len() / 2000).max(1);
+                            st.scatter = self.bb.iter().step_by(stride).copied().collect();
+                        }
+                        None => {}
                     }
-                    None => {}
                 }
             }
             Decoder::Spectrum => {
@@ -724,7 +768,7 @@ impl Worker {
                     format!("cannot write {}", path.display())
                 };
             }
-            Decoder::Dvbs2 { buf, demod } => match demod {
+            Decoder::Dvbs2 { buf, demod, fec } => match demod {
                 None => {
                     st.progress = buf.len() as f32 / first_look(out_rate) as f32;
                     st.message = match &self.identification {
@@ -749,20 +793,24 @@ impl Worker {
                             modulation: m,
                         });
                     }
-                    st.message = match d.lock_state() {
-                        LockState::Searching => "searching for PLHEADERs".into(),
-                        LockState::Found => "found a PLHEADER, confirming".into(),
-                        LockState::Locked => format!(
-                            "locked, {} frames, MER {:.1} dB — FEC and {} output arrive in M2–M4",
-                            d.frames(),
-                            d.mer_db(),
-                            if self.settings.decoder == DecoderKind::Dvbs2Ts {
-                                "TS"
-                            } else {
-                                "GSE/IP"
-                            }
-                        ),
+                    let fec = fec.as_ref().map(|w| w.stats());
+                    let output = if self.settings.decoder == DecoderKind::Dvbs2Ts {
+                        "TS"
+                    } else {
+                        "GSE/IP"
                     };
+                    st.message = match (d.lock_state(), &fec) {
+                        (LockState::Searching, _) => "searching for PLHEADERs".into(),
+                        (LockState::Found, _) => "found a PLHEADER, confirming".into(),
+                        (LockState::Locked, Some(f)) if f.frames > 0 => format!(
+                            "locked · {} of {} BBFRAMEs good · {output} output arrives in M4",
+                            f.ok, f.frames
+                        ),
+                        (LockState::Locked, _) => {
+                            format!("locked, {} frames, MER {:.1} dB", d.frames(), d.mer_db())
+                        }
+                    };
+                    st.fec = fec;
                 }
             },
             Decoder::Psk {
@@ -811,6 +859,81 @@ impl Worker {
                 }
             },
         }
+    }
+}
+
+/// Identify's live view: the last identification's symbol rate,
+/// constellation and carrier offset driving a generic demodulator between
+/// identifications, so the constellation stays live instead of freezing on
+/// the last snapshot. Identify does not retune the VFO, so the view mixes
+/// the carrier to DC itself.
+struct LiveView {
+    demod: Box<PskDemod>,
+    rs: f64,
+    modulation: decdvb_core::Modulation,
+    center_hz: f64,
+    /// Mixer phase and step, radians (per sample).
+    phase: f64,
+    step: f64,
+    mixed: Vec<Iq>,
+}
+
+impl LiveView {
+    /// A view for `id`, if it found a carrier with a usable symbol rate.
+    fn new(id: &Identification, rate: f64) -> Option<Self> {
+        if matches!(id.verdict, Verdict::NoSignal) {
+            return None;
+        }
+        let rs = id.symbol_rate.filter(|&r| rate / r >= 2.0)?;
+        let alpha = id.roll_off.map_or(0.35, |r| r.as_f64());
+        let modulation = live_modulation(id);
+        let seed = id.carrier_offset_hz.unwrap_or(0.0) / rs;
+        Some(LiveView {
+            demod: Box::new(PskDemod::new(rate, rs, alpha, modulation, seed)),
+            rs,
+            modulation,
+            center_hz: id.center_offset_hz,
+            phase: 0.0,
+            step: -std::f64::consts::TAU * id.center_offset_hz / rate,
+            mixed: Vec::new(),
+        })
+    }
+
+    /// The new identification describes the carrier this view already
+    /// follows (so it keeps running rather than re-acquiring).
+    fn same_carrier(&self, id: &Identification) -> bool {
+        id.symbol_rate
+            .is_some_and(|r| (r - self.rs).abs() < self.rs * 0.002)
+            && live_modulation(id) == self.modulation
+            && (id.center_offset_hz - self.center_hz).abs() < self.rs * 0.05
+    }
+
+    fn process(&mut self, bb: &[Iq], scratch: &mut Vec<(u8, Iq)>) {
+        self.mixed.clear();
+        self.mixed.extend(bb.iter().map(|&x| {
+            let v = x * Iq::new(self.phase.cos() as f32, self.phase.sin() as f32);
+            self.phase = (self.phase + self.step) % std::f64::consts::TAU;
+            v
+        }));
+        scratch.clear();
+        self.demod.process(&self.mixed, scratch);
+    }
+}
+
+/// The constellation to steer Identify's live view with: for DVB-S2 the most
+/// common MODCOD's (every S2 constellation shares QPSK's 90° symmetry, so
+/// even ACM stays locked), else Identify's estimate.
+fn live_modulation(id: &Identification) -> decdvb_core::Modulation {
+    match &id.verdict {
+        Verdict::DvbS2(d) => d
+            .modcods
+            .iter()
+            .max_by_key(|(_, n)| **n)
+            .and_then(|(&m, _)| decdvb_core::s2_modcod(m, decdvb_core::FecFrame::Normal))
+            .map_or(decdvb_core::Modulation::Qpsk, |mc| mc.modulation),
+        _ => id
+            .constellation
+            .map_or(decdvb_core::Modulation::Qpsk, |c| c.modulation()),
     }
 }
 
@@ -1006,7 +1129,12 @@ mod tests {
             VfoSettings::new("PSK arm", 40_000.0, 110_000.0, DecoderKind::PskSymbols);
         settings.record_dir = dir.clone();
         let status = Arc::new(Mutex::new(VfoStatus::default()));
-        let mut wk = Worker::new(500_000.0, settings.clone(), status.clone(), Arc::new(AtomicU64::new(0)));
+        let mut wk = Worker::new(
+            500_000.0,
+            settings.clone(),
+            status.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
         let third = x.len() / 3;
 
         // Locked and showing symbols, but no file.
@@ -1040,6 +1168,69 @@ mod tests {
         let len = std::fs::metadata(&path).unwrap().len();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(len, n);
+    }
+
+    #[test]
+    fn identify_keeps_a_live_constellation_between_identifications() {
+        let rs = 62_500.0;
+        let x = carrier(&Constellation::qpsk(), 150_000, 8, rs, 40_000.0, 0.0, 12);
+        let settings = VfoSettings::new("ID", 38_000.0, 110_000.0, DecoderKind::Identify);
+        let status = Arc::new(Mutex::new(VfoStatus::default()));
+        let mut wk = Worker::new(
+            500_000.0,
+            settings,
+            status.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let half = x.len() / 2;
+        feed(&mut wk, &x[..half], 65_536);
+        let first = status.lock().unwrap().clone();
+        assert!(first.identification.is_some(), "{}", first.message);
+        // Identify now rests for seconds; the live view must keep going.
+        feed(&mut wk, &x[half..], 65_536);
+        let later = status.lock().unwrap().clone();
+        let c = later.carrier.expect("no live view");
+        assert!(c.locked && c.mer_db > 15.0, "live view: {c:?}");
+        assert_ne!(first.scatter, later.scatter, "the constellation froze");
+    }
+
+    #[test]
+    fn dvbs2_vfo_decodes_bbframes() {
+        use decdvb_mod::{FrameSpec, PlFramer};
+        // QPSK 1/2 with pilots at 125 kBd, 40 kHz into a 500 kS/s band.
+        let syms = PlFramer::new(0, 5).build_schedule(&[FrameSpec::new(4, false, true)], 170_000);
+        let mut sh = Shaper::new(4, 0.35, 16);
+        let mut x = Vec::new();
+        sh.process(&syms, &mut x);
+        let w = std::f64::consts::TAU * 40_000.0 / 500_000.0;
+        for (n, v) in x.iter_mut().enumerate() {
+            let ph = w * n as f64;
+            *v *= Iq::new(ph.cos() as f32, ph.sin() as f32);
+        }
+        let settings = VfoSettings::new("S2", 40_000.0, 190_000.0, DecoderKind::Dvbs2Ip);
+        let status = Arc::new(Mutex::new(VfoStatus::default()));
+        let mut wk = Worker::new(
+            500_000.0,
+            settings,
+            status.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        feed(&mut wk, &x, 65_536);
+        // FEC runs on its own thread: give it time to drain its queue.
+        let t0 = Instant::now();
+        let fec = loop {
+            wk.publish(0);
+            let f = status.lock().unwrap().fec.clone().expect("no FEC");
+            if f.frames >= 3 || t0.elapsed().as_secs() > 20 {
+                break f;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert!(fec.frames >= 3, "{fec:?}");
+        assert_eq!(fec.ok, fec.frames, "{fec:?}");
+        let h = fec.last_header.expect("no BBHEADER");
+        assert_eq!(h.format, decdvb_frame::StreamFormat::Transport);
+        assert!(fec.es_n0_db.is_some_and(|e| e > 15.0), "{fec:?}");
     }
 
     #[test]

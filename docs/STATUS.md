@@ -189,3 +189,70 @@ CPU per VFO on the scene went from 45/3/30/38 % to 11/3/8/6 % (two-stage DDC,
 vectorisable FIR inner loop, Identify resting once sure). Measured and
 rejected: AVX2 run-time dispatch with a flat tap layout — slower on these
 window lengths (notes in `decdvb-dsp::dot`).
+
+## M2 — FEC core (done, 2026-10-08)
+
+PLFRAMEs now decode to BBFRAMEs, for all 21 DVB-S2 codes (normal and short).
+
+- **LDPC** (`decdvb-fec::ldpc`): the Annex B/C address tables (generated from
+  gr-dvbs2rx's copy of the standard's), an encoder, and a layered normalized
+  min-sum decoder over the codes' quasi-cyclic structure — q layers of 360
+  checks, each a block of lane-parallel arithmetic that vectorises. 8-bit
+  messages, 16-bit posteriors: with 8-bit posteriors a saturated value stops
+  being the sum of its messages and decoding can diverge outright (measured:
+  36 000 bit errors where 16-bit converges). Normalization 7/8 (3/4 left
+  rates 1/4 and 1/3 stuck a few bits short). A decode stuck on a couple of
+  parity checks — two adjacent accumulator bits both wrong, which min-sum
+  holds forever — stops early and leaves the verdict to BCH. ~0.5 ms per
+  iteration per normal frame (release); QPSK 1/2 at 1.5 dB Eb/N0 converges in
+  ~12 iterations.
+- **BCH** (`bch`): GF(2^16) / GF(2^14), generator built from the minimal
+  polynomials of α, α³, … (checked against Tables 6a/6b); a byte-wise
+  remainder says "clean" in one pass, else syndromes, Berlekamp–Massey and a
+  Chien search over the shortened positions.
+- **Demapping** (`demap`): the Table 8 interleaver (8PSK 3/5 reads columns
+  2,1,0), max-log LLRs, scaled by the gain and noise measured on each
+  frame's header and pilots.
+- **BBFRAMEs** (`decdvb-frame::bbframe`): BB descrambling (sequence checked
+  against Figure 5: `03 F6 08 34 …`), BBHEADER parse with CRC-8 (check value
+  0xBC), normal vs high-efficiency mode read from CRC vs CRC ⊕ 1.
+- **Transmit side** (`decdvb-mod`): TS-mode BBFRAMEs (CRC-8 replacing sync
+  bytes, SYNCD), BCH and LDPC encoders; `PlFramer` builds real FECFRAMEs, so
+  test signals and the `scene` capture decode end to end.
+- **VFOs**: each DVB-S2 VFO runs FEC on its own thread behind a bounded queue
+  (frames dropped and counted if it falls behind); the side bar shows good
+  BBFRAMEs, LDPC iterations, BCH corrections, Es/N0, the stream (TS/GS,
+  CCM/ACM, ISI, roll-off) and the payload rate.
+
+**What FEC exposed.** The first end-to-end run failed every QPSK frame below
+6 dB Es/N0, though LDPC alone works at 1 dB. Causes, in order of impact:
+
+1. The PLS code was read differentially with hard decisions — a QPSK 1/2
+   header read as 3/5 (same frame length, so the grid still held and FEC ran
+   the wrong code). Headers are now read coherently (phase anchored on the
+   SOF, soft decisions) once the carrier loop runs, and confirmed by coherent
+   correlation; acquisition reads both headers coherently from an SOF-only
+   frequency estimate.
+2. Cycle slips in the decision-directed carrier loop: the phase is now
+   re-anchored on every header and pilot block, and the loop bandwidth follows
+   the measured Es/N0 (0.01 → 0.002), seeded from the headers at acquisition.
+3. The timing loop narrows once frames are locked.
+
+Result: QPSK 1/2 with pilots decodes every frame at 2 dB Es/N0 (threshold
+~1 dB), Es/N0 read within 0.2 dB. Without pilots: clean at 5 dB, about one
+frame in seven lost to a slip at 4 dB — what pilots are for. An ACM sequence
+(QPSK 1/2, 8PSK 3/5, short 16APSK 2/3, short 32APSK 3/4) decodes bit-exact
+against the BBFRAMEs that were sent.
+
+Also in this round: the generic PSK decoder writes only while Record is on;
+Identify keeps a live constellation between identifications; middle/right
+drag moves the spectrum and, past the span's edge, tunes a live HackRF.
+
+### Next
+
+- M4: GSE → IP → PCAP (dontlookup's quirks), TS output — the FEC thread is
+  where they hook in.
+- M3: S2X codes and constellations.
+- FEC throughput for wide carriers: explicit SIMD, or a decoder pool.
+- Cycle-slip resistance without pilots (non-causal phase smoothing between
+  headers).

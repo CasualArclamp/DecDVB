@@ -32,7 +32,7 @@ and a CW tone. Every carrier was found and identified blind.*
 | IQ recorder and spectrum-only VFOs | ✅ |
 | IQ file replay (`cs8`, `cs16`, `cf32`), rate/centre from file names | ✅ |
 | **Live HackRF One**, 2–20 MS/s, pure Rust over USB (no DLLs), LNB LO | ✅ |
-| LDPC + BCH → BBFRAMEs | M2 |
+| **LDPC + BCH → BBFRAMEs**: all 21 S2 codes, BBHEADER, stream info, payload rate | ✅ |
 | All S2X MODCODs, VL-SNR | M3 |
 | GSE → IP → PCAP, MPEG-TS | M4 |
 | Modulator (HackRF TX / IQ file) | M6 |
@@ -70,8 +70,9 @@ residual offset), a carrier-locked constellation and a zoomed spectrum.
 
 ### Generic PSK → symbols
 
-For carriers that are not DVB-S2 — SCPC data, telemetry, DVB-S — a VFO can
-lock the carrier and write its hard-decided symbols to
+For carriers that are not DVB-S2 — SCPC data, telemetry, DVB-S — a VFO locks
+the carrier and shows its constellation; press **● Record** and it writes the
+hard-decided symbols to
 `decdvb-<VFO>-<freq>Hz-<rate>Bd-<modulation>-<time>.bin`, one byte per symbol:
 the symbol's bit label under the DVB-S2 mapping (BPSK: 0 = +1). The symbol rate
 and constellation come from Identify, or set them by hand. Without a preamble
@@ -88,7 +89,8 @@ Anything else gets measurements (symbol rate, roll-off, an estimated
 constellation) and a labelled guess: plain QPSK reads *"possibly DVB-S (not
 verified)"*, because confirming DVB-S needs a Viterbi decoder DecDVB does not
 have. A carrier too slow to show three frames in the first look is marked
-*provisional* while it listens longer.
+*provisional* while it listens longer. Between identifications it keeps
+demodulating with what it found, so the constellation and MER stay live.
 
 ### Command line
 

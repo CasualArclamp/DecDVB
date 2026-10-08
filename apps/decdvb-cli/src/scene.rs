@@ -10,13 +10,13 @@
 //! | +1.2 MHz | DVB-S2 **ACM**: QPSK 1/2 → 8PSK 3/5 → short 16APSK 2/3, 500 kS/s, α 0.25 |
 //! | +2.8 MHz | plain QPSK, no PLHEADERs, 250 kS/s, α 0.35       |
 //!
-//! The DVB-S2 carriers are real PLFRAMEs (headers, pilots, scrambling); their
-//! payload is random constellation points until the FEC encoder exists.
+//! The DVB-S2 carriers are real, fully coded signals: TS packets in BBFRAMEs,
+//! BCH and LDPC, PLFRAMEs with pilots and scrambling — they decode end to end.
 
 use std::path::Path;
 
 use anyhow::Result;
-use decdvb_core::{Iq, SampleFormat};
+use decdvb_core::{Iq, RollOff, SampleFormat};
 use decdvb_io::IqFileWriter;
 use decdvb_mod::{FrameSpec, PlFramer, Shaper};
 
@@ -67,9 +67,13 @@ pub fn write(out: &Path, seconds: f64) -> Result<()> {
     let n = (RATE * seconds) as usize;
     let mut rng = Rng(0x00DE_CD7B);
 
+    // The DVB-S2 carriers are fully coded (TS packets in BBFRAMEs, BCH,
+    // LDPC), so the scene decodes end to end; their BBHEADERs announce the
+    // roll-off each is shaped with.
     let a = {
-        let syms =
-            PlFramer::new(0, 1).build_schedule(&[FrameSpec::new(4, false, true)], n / 8 + 64);
+        let mut f = PlFramer::new(0, 1);
+        f.ts.roll_off = RollOff::R20;
+        let syms = f.build_schedule(&[FrameSpec::new(4, false, true)], n / 8 + 64);
         shaped(&syms, 8, 0.20)
     };
     let b = {
@@ -78,7 +82,9 @@ pub fn write(out: &Path, seconds: f64) -> Result<()> {
             FrameSpec::new(12, false, true),
             FrameSpec::new(18, true, true),
         ];
-        let syms = PlFramer::new(0, 2).build_schedule(&sched, n / 16 + 64);
+        let mut f = PlFramer::new(0, 2);
+        f.ts.roll_off = RollOff::R25;
+        let syms = f.build_schedule(&sched, n / 16 + 64);
         shaped(&syms, 16, 0.25)
     };
     let c = shaped(&qpsk(n / 32 + 64, &mut rng), 32, 0.35);

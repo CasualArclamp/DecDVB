@@ -24,6 +24,11 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
+# The LDPC decoder's inner loops only vectorise when optimised; at opt-level 1
+# a single normal frame takes seconds and the FEC tests crawl.
+[profile.dev.package.decdvb-fec]
+opt-level = 3
+
 [profile.release]
 debug = "line-tables-only"
 lto = "thin"

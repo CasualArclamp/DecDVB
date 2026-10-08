@@ -136,7 +136,13 @@ pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
                     .and_then(|m| decdvb_core::s2_modcod(m, decdvb_core::FecFrame::Normal))
                     .map(|m| m.to_string())
                     .unwrap_or_else(|| "dummy".into());
-                format!("LOCK {mc}")
+                match &st.fec {
+                    Some(f) if f.ok > 0 && f.payload_bps > 0.0 => {
+                        format!("LOCK {mc} · {}", format::bitrate(f.payload_bps))
+                    }
+                    Some(f) if f.frames > 0 && f.ok == 0 => format!("LOCK {mc} · FEC fail"),
+                    _ => format!("LOCK {mc}"),
+                }
             }
             Some(LockState::Found) => "found".into(),
             Some(LockState::Searching) => "search".into(),
