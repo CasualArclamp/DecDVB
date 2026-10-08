@@ -303,6 +303,23 @@ impl App {
                     self.selected = None;
                 }
             }
+            Action::Retune(d) => {
+                if self.can_retune() {
+                    self.set_rf_center(self.rf_center() + d);
+                }
+            }
+        }
+    }
+
+    /// The source is a running HackRF, so the view can tune it.
+    fn can_retune(&self) -> bool {
+        #[cfg(feature = "hackrf")]
+        {
+            self.path.is_none() && self.hackrf.is_some()
+        }
+        #[cfg(not(feature = "hackrf"))]
+        {
+            false
         }
     }
 
@@ -656,6 +673,7 @@ impl eframe::App for App {
                     levels: self.history.levels(),
                     new_decoder: self.new_decoder,
                     next_name: self.next_name(),
+                    can_retune: self.can_retune(),
                 };
                 actions.extend(self.band.show(ui, &inp));
             });

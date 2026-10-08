@@ -35,6 +35,8 @@ pub enum Action {
     Update(VfoId, VfoSettings),
     Create(VfoSettings),
     Remove(VfoId),
+    /// Move the radio's centre frequency by this many Hz.
+    Retune(f64),
 }
 
 /// Everything the view draws from.
@@ -52,6 +54,8 @@ pub struct BandInput<'a> {
     pub new_decoder: DecoderKind,
     /// Name for the next VFO.
     pub next_name: String,
+    /// A live radio is the source: dragging past the span's edge tunes it.
+    pub can_retune: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -593,12 +597,19 @@ impl BandView {
             }
         }
 
-        // Pan.
+        // Pan: the spectrum follows the mouse. Within the span that moves
+        // the view; whatever the span's edge stops (all of it at full span)
+        // tunes a live radio instead, as dragging does in SDR++.
         if resp.dragged_by(PointerButton::Secondary) || resp.dragged_by(PointerButton::Middle) {
             let d = resp.drag_delta().x as f64 / w as f64 * (hi - lo);
+            let want = self.lo - d;
             self.lo -= d;
             self.hi -= d;
             self.clamp_view();
+            let rest = want - self.lo;
+            if inp.can_retune && rest != 0.0 {
+                actions.push(Action::Retune(rest));
+            }
             self.drag = Drag::Pan;
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
         }
