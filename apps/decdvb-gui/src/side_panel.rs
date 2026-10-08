@@ -255,13 +255,24 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                 ui.end_row();
             }
 
-            if matches!(
-                s.decoder,
-                DecoderKind::Dvbs2Ip
-                    | DecoderKind::Dvbs2Ts
-                    | DecoderKind::DvbsTs
-                    | DecoderKind::PskSymbols
-            ) {
+            if s.decoder == DecoderKind::Tpc2964 {
+                ui.label("Modulation");
+                let txt = match s.psk_modulation {
+                    Some(Modulation::Bpsk) => "BPSK",
+                    Some(_) => "QPSK",
+                    None => "auto (from Identify)",
+                };
+                egui::ComboBox::from_id_salt("tpc_modulation")
+                    .selected_text(txt)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut s.psk_modulation, None, "auto (from Identify)");
+                        ui.selectable_value(&mut s.psk_modulation, Some(Modulation::Bpsk), "BPSK");
+                        ui.selectable_value(&mut s.psk_modulation, Some(Modulation::Qpsk), "QPSK");
+                    });
+                ui.end_row();
+            }
+
+            if s.decoder.demodulates() {
                 ui.label("Symbol rate");
                 ui.horizontal(|ui| {
                     let mut auto = s.symbol_rate.is_none();
@@ -308,12 +319,18 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
 
             if s.decoder.outputs_ts() {
                 let ts = st.fec.as_ref().and_then(|f| f.ts.as_ref());
-                ui.label("TS file");
+                let tpc = s.decoder == DecoderKind::Tpc2964;
+                ui.label(if tpc { "Record" } else { "TS file" });
                 ui.horizontal(|ui| {
-                    let (label, tip) = if s.record {
-                        ("⏹ Stop", "Close the .ts file")
-                    } else {
-                        ("● Record", "Write the transport stream to a .ts file")
+                    let (label, tip) = match (s.record, tpc) {
+                        (true, false) => ("⏹ Stop", "Close the .ts file"),
+                        (false, false) => ("● Record", "Write the transport stream to a .ts file"),
+                        (true, true) => ("⏹ Stop", "Close the files"),
+                        (false, true) => (
+                            "● Record",
+                            "Write the decoded data to a .bin file, and what it carries: \
+                             IP packets to a .pcap, an MPEG-TS to a .ts",
+                        ),
                     };
                     if ui
                         .add(egui::Button::new(label).selected(s.record))
@@ -449,10 +466,7 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
     }
     // A demodulating VFO leads with its own state and constellation; how it
     // acquired (Identify's view) folds away below.
-    let demodulates = matches!(
-        v.settings.decoder,
-        DecoderKind::Dvbs2Ip | DecoderKind::Dvbs2Ts | DecoderKind::DvbsTs | DecoderKind::PskSymbols
-    );
+    let demodulates = v.settings.decoder.demodulates();
     if !demodulates && let Some(id) = &st.identification {
         ui.add_space(6.0);
         identification_card(
@@ -552,6 +566,20 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
         }
     }
 
+    if v.settings.decoder == DecoderKind::Tpc2964
+        && let Some(c) = &st.carrier
+    {
+        tpc_card(ui, c, &st);
+        if let Some(f) = &st.fec {
+            if let Some(g) = &f.gse {
+                gse_card(ui, g);
+            }
+            if let Some(t) = &f.ts {
+                ts_card(ui, t, v.id, &mut actions);
+            }
+        }
+    }
+
     if v.settings.decoder == DecoderKind::PskSymbols
         && let Some(c) = &st.carrier
     {
@@ -614,6 +642,119 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
     }
 
     actions
+}
+
+/// A TPC 2964 VFO: the carrier, the frame sync and structure found, the
+/// turbo decoder, and what the data carry.
+fn tpc_card(ui: &mut Ui, c: &CarrierState, st: &VfoStatus) {
+    let good = Color32::from_rgb(110, 220, 110);
+    let wait = Color32::from_rgb(240, 200, 80);
+    ui.add_space(6.0);
+    ui.label(RichText::new("TPC 2964 (IESS-315)").strong());
+    let f = st.fec.as_ref();
+    let t = f.and_then(|f| f.tpc.as_ref());
+    let p = f.and_then(|f| f.payload.as_ref());
+    egui::Grid::new("tpc").num_columns(2).show(ui, |ui| {
+        carrier_rows(ui, c);
+        if let Some(rs) = st.symbol_rate {
+            ui.label("Symbol rate");
+            ui.label(format::rate(rs));
+            ui.end_row();
+        }
+        ui.label("Unique word");
+        match t {
+            Some(t) if t.uw_locked => ui.colored_label(
+                good,
+                format!(
+                    "F50B8h every 2964 bits · {}{}",
+                    t.orientation.as_deref().unwrap_or("?"),
+                    if t.uw_misses > 0 {
+                        format!(" · {} missed", t.uw_misses)
+                    } else {
+                        String::new()
+                    }
+                ),
+            ),
+            _ => ui.colored_label(wait, "searching…"),
+        };
+        ui.end_row();
+        ui.label("Structure");
+        match t {
+            Some(t) if t.structure.is_some() => {
+                ui.label(t.structure.as_deref().unwrap_or_default())
+                    .on_hover_text(format!(
+                        "Found from the signal: {:.0}% of rows and columns were codewords \
+                         as received. IESS-315 leaves the code's layout to the modem.",
+                        t.fit * 100.0
+                    ));
+            }
+            Some(t) if t.uw_locked => {
+                ui.colored_label(
+                    wait,
+                    format!("identifying… (best fit {:.0}%)", t.fit * 100.0),
+                );
+            }
+            _ => {
+                ui.label("—");
+            }
+        }
+        ui.end_row();
+        if let Some(t) = t.filter(|t| t.structure.is_some()) {
+            ui.label("Decoding");
+            ui.colored_label(
+                if t.failed == 0 { good } else { wait },
+                format!(
+                    "{} frames · {} failed · channel BER {:.1e}",
+                    t.decoded + t.failed,
+                    t.failed,
+                    t.channel_ber()
+                ),
+            );
+            ui.end_row();
+        }
+        if let Some(p) = p {
+            ui.label("Payload");
+            match &p.found {
+                Some(how) => {
+                    ui.label(how);
+                }
+                None => {
+                    ui.colored_label(
+                        wait,
+                        format!("not recognised yet ({} frames looked at)", p.probed),
+                    )
+                    .on_hover_text(
+                        "HDLC (IP) and MPEG-TS are tried under each descrambler. \
+                         Recording writes the data as they are meanwhile.",
+                    );
+                }
+            }
+            ui.end_row();
+            if p.hdlc_good + p.hdlc_bad > 0 {
+                ui.label("HDLC");
+                ui.label(format!("{} frames · {} bad FCS", p.hdlc_good, p.hdlc_bad));
+                ui.end_row();
+            }
+        }
+        if let Some(f) = f
+            && f.payload_bps > 0.0
+        {
+            ui.label("Data rate");
+            ui.label(format::bitrate(f.payload_bps));
+            ui.end_row();
+        }
+        if let Some((path, bytes)) = f.and_then(|f| f.raw_file.as_ref()) {
+            ui.label("Data file");
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            let txt = format!("{} ({})", name.unwrap_or_default(), format::bytes(*bytes));
+            if f.is_some_and(|f| f.raw_active) {
+                ui.colored_label(Color32::from_rgb(230, 90, 90), format!("● {txt}"));
+            } else {
+                ui.label(format!("{txt}, stopped"));
+            }
+            ui.end_row();
+        }
+    });
 }
 
 /// What FEC made of a DVB-S2 VFO's frames, and the stream the BBHEADERs
@@ -1072,7 +1213,7 @@ fn gse_card(ui: &mut Ui, g: &GseView) {
                 let pids: Vec<String> = m.pids.keys().map(|p| format!("{p:#06x}")).collect();
                 format!("MPE on PID {} · {} datagrams", pids.join(", "), m.datagrams)
             }
-            (None, None) => "no IP found yet".into(),
+            (None, None) => g.link.clone().unwrap_or_else(|| "no IP found yet".into()),
         };
         ui.label(txt);
         ui.end_row();

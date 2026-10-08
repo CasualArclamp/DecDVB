@@ -708,11 +708,20 @@ pub fn identify_in(x: &[Iq], rate: f64, bandwidth: Option<f64>) -> Identificatio
     id.coherence = Some(lock.coherence);
     id.carrier_locked = lock.coherence > decdvb_dsp::LOCK_COHERENCE;
 
+    // 8. Not DVB-S2: the unique word of an Intelsat TPC 2964 carrier, every
+    //    2964 bits, is quick to look for on BPSK and QPSK.
+    let tpc = !is_s2
+        && matches!(cst, ConstellationGuess::Bpsk | ConstellationGuess::Qpsk)
+        && decdvb_modem::tpc2964::detect(&lock.symbols, cst == ConstellationGuess::Qpsk);
     id.verdict = if is_s2 {
         Verdict::DvbS2(s2)
     } else {
         Verdict::NotDvbS2 {
             hint: match cst {
+                _ if tpc => format!(
+                    "{}, TPC 2964 unique word every 2964 bits — Intelsat IESS-315 turbo code",
+                    cst.label()
+                ),
                 ConstellationGuess::Qpsk => {
                     "QPSK, no DVB-S2 PLHEADER — possibly DVB-S (not verified)".into()
                 }

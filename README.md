@@ -13,8 +13,8 @@ a media player, multicast radio played in the app.
 
 *A synthetic 8 MS/s test scene (`decdvb scene`): a DVB-S2 CCM carrier, an
 ACM carrier mixing S2 and S2X MODCODs (QPSK 1/2 → 8PSK 25/36 → 16APSK 26/45 →
-32APSK 32/45), a DVB-S carrier and a CW tone. Every carrier was found and
-identified blind.*
+32APSK 32/45), a DVB-S carrier and a CW tone (the scene has since gained a
+TPC 2964 carrier). Every carrier was found and identified blind.*
 
 > Early development. [`docs/DESIGN.md`](docs/DESIGN.md) holds the scope and the
 > milestone plan, [`docs/STATUS.md`](docs/STATUS.md) what is done.
@@ -30,6 +30,7 @@ identified blind.*
 | DVB-S2/S2X PL demodulation: frame lock, MODCOD per frame (ACM) | ✅ |
 | Carrier recovery: a locked constellation and MER, for Identify and DVB-S2 VFOs | ✅ |
 | **DVB-S → MPEG-TS** (EN 300 421): code rate, rotation and inversion found blind; Viterbi, RS, the same TS outputs | ✅ |
+| **TPC 2964 → IP / TS** (Intelsat IESS-315 turbo product code, BPSK/QPSK): frame structure, scrambling and payload found from the signal; HDLC → IP, or MPEG-TS | ✅ (synthetic signals; awaiting a real carrier) |
 | **Generic PSK/APSK/QAM → symbols** (`.bin`, one byte per symbol), BPSK…32APSK and 8/16/64QAM, for non-DVB carriers | ✅ |
 | Narrow carriers: VFOs down to 500 Hz, ~10 kBd SCPC carriers lock | ✅ |
 | IQ recorder and spectrum-only VFOs | ✅ |
@@ -157,6 +158,35 @@ received. Then Viterbi (K = 7, soft), the sync bytes, the convolutional
 deinterleaver, Reed–Solomon (204,188) and energy dispersal — and the stream
 goes to the same TS outputs and analyser as DVB-S2's.
 
+### TPC 2964 → IP / MPEG-TS
+
+The rate-3/4 turbo product code of Intelsat IESS-315 VSAT carriers, as the
+CTCOM RCV-20x manual describes it: frames of 2964 bits, a 20-bit unique word
+F50B8h and a (64,57) × (46,39) extended-Hamming product codeword holding 2223
+data bits, with a (2, 3, 9, 12) / 475h scrambler. IESS-315 itself sets only
+performance and leaves the code to "compatible turbo modems", so the VFO
+finds the rest from the signal:
+
+1. **Unique word** every 2964 bits, under each carrier phase ambiguity; a
+   carrier slip or a lost symbol is repaired at the next frame.
+2. **Frame structure**: row or column order, either way round, the Hamming
+   generator (all six degree-6 primitive polynomials), whether and how the
+   code bits are scrambled — 432 combinations, judged by how many rows *and*
+   columns are codewords as received (near all under the right one, 1 in
+   128 under any other); close calls are settled by decoding.
+3. **Decoding**: iterative Chase–Pyndiah soft decoding.
+4. **Payload**: HDLC (FCS-16/32) or MPEG-TS, under each candidate
+   descrambler — the (2, 3, 9, 12) polynomial self-synchronising or additive,
+   ITU-T V.35's and V.29's — whichever yields frames that check.
+
+IP found in the HDLC frames (Cisco HDLC, PPP, or anything with the packet
+after a short header) gets the same statistics, PCAP and multicast audio as
+GSE; a transport stream gets the TS outputs. **● Record** also writes the
+decoded data to a `.bin`. Identify recognises the carrier by its unique
+word. What each search found is shown, so you can tell a finding from a
+default. It is confirmed on synthetic carriers; a recording of a real one
+would settle the details the documents leave open.
+
 ### Generic PSK → symbols
 
 For carriers that are not DVB-S2 — SCPC data, telemetry, DVB-S — a VFO locks
@@ -176,8 +206,8 @@ fact — PLHEADERs found repeating exactly where their own PLS codes predict the
 next frame — with the MODCODs in use, pilots, frame lengths, and CCM vs ACM.
 Anything else gets measurements (symbol rate, roll-off, an estimated
 constellation) and a labelled guess: plain QPSK reads *"possibly DVB-S (not
-verified)"*, because confirming DVB-S needs a Viterbi decoder DecDVB does not
-have. A carrier too slow to show three frames in the first look is marked
+verified)"* (the DVB-S decoder confirms it), and a BPSK or QPSK carrier with
+the TPC 2964 unique word every 2964 bits is named as such. A carrier too slow to show three frames in the first look is marked
 *provisional* while it listens longer. Between identifications it keeps
 demodulating with what it found, so the constellation and MER stay live.
 

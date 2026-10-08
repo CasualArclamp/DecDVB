@@ -8,12 +8,14 @@
 //! | −2.5 MHz | DVB-S2 CCM, QPSK 1/2 + pilots, 1 MS/s, α 0.20 — IP over GSE |
 //! | −0.8 MHz | an unmodulated CW tone                           |
 //! | +1.2 MHz | DVB-S2/**S2X ACM**: QPSK 1/2 → 8PSK 25/36 → short 16APSK 26/45 → 32APSK 32/45 (4+8+4+16), 500 kS/s, α 0.25 — MPEG-TS |
+//! | +0.25 MHz | TPC 2964 (IESS-315 turbo product code), QPSK, 125 kS/s, α 0.35 — IP over HDLC |
 //! | +2.8 MHz | DVB-S (EN 300 421), QPSK 3/4, 250 kS/s, α 0.35 — MPEG-TS |
 //!
 //! The carriers are real, fully coded signals — TS packets in BBFRAMEs, BCH
 //! and LDPC, PLFRAMEs with pilots and scrambling for DVB-S2; Reed–Solomon,
-//! interleaving and the punctured convolutional code for DVB-S — and decode
-//! end to end.
+//! interleaving and the punctured convolutional code for DVB-S; HDLC,
+//! scrambling and the (64,57) × (46,39) product code for TPC 2964 — and
+//! decode end to end.
 
 use std::path::Path;
 
@@ -24,6 +26,7 @@ use decdvb_io::IqFileWriter;
 use decdvb_mod::{FrameSpec, GseBbFramer, PlFramer, Shaper, TsBbFramer};
 use decdvb_modem::conv::Rate;
 use decdvb_modem::dvbs::DvbsTx;
+use decdvb_modem::tpc2964::{Structure, TpcHdlcTx, modulate};
 
 pub const RATE: f64 = 8e6;
 
@@ -95,9 +98,56 @@ pub fn write(out: &Path, seconds: f64) -> Result<()> {
         shaped(&syms[20_000..], 32, 0.35)
     };
 
+    // TPC 2964: a multicast radio and some unicast traffic over Cisco HDLC,
+    // the radio paced to real time (a 24 ms MPEG audio frame per packet),
+    // idle flags between.
+    let d = {
+        use decdvb_ip::packet::udp_v4;
+        use decdvb_mod::fec::TestRadio;
+        const BAUD: f64 = 125e3;
+        let mut tx = TpcHdlcTx::new(Structure::TEST);
+        let mut radio = TestRadio::new([239, 10, 20, 30], "DecDVB TPC radio");
+        let mut bits = Vec::new();
+        let need = 2 * (n / 64 + 64);
+        let (mut t, mut next_radio, mut next_data) = (0.0, 0.0, 0.0);
+        let mut seq = 0u32;
+        while bits.len() < need {
+            let cisco = |p: Vec<u8>| {
+                let mut f = vec![0x0F, 0x00, 0x08, 0x00];
+                f.extend(p);
+                f
+            };
+            if t >= next_radio {
+                tx.send(&cisco(radio.next_packet()));
+                next_radio += 0.024;
+            }
+            if t >= next_data {
+                seq += 1;
+                let payload = format!("DecDVB TPC 2964 test traffic {seq:08}");
+                tx.send(&cisco(udp_v4(
+                    [10, 1, 1, 2],
+                    [10, 1, 1, 1],
+                    40000,
+                    5001,
+                    payload.as_bytes(),
+                )));
+                next_data += 0.05;
+            }
+            tx.frame(&mut bits);
+            t += decdvb_modem::tpc2964::FRAME as f64 / (2.0 * BAUD);
+        }
+        let mut syms = Vec::new();
+        modulate(&bits, true, &mut syms);
+        shaped(&syms, 64, 0.35)
+    };
+
     // Mix: each carrier rotated to its offset and scaled to its level.
-    let carriers: [(&[Iq], f64, f32); 3] =
-        [(&a, -2.5e6, 0.20), (&b, 1.2e6, 0.16), (&c, 2.8e6, 0.12)];
+    let carriers: [(&[Iq], f64, f32); 4] = [
+        (&a, -2.5e6, 0.20),
+        (&b, 1.2e6, 0.16),
+        (&c, 2.8e6, 0.12),
+        (&d, 0.25e6, 0.10),
+    ];
     let cw_hz = -0.8e6;
     let noise = 0.035f32;
 

@@ -596,6 +596,7 @@ dependencies = [
  "decdvb-engine",
  "decdvb-gse",
  "decdvb-io",
+ "decdvb-ip",
  "decdvb-mod",
  "decdvb-modem",
 ]

@@ -24,5 +24,6 @@ decdvb-engine = { path = "../../crates/decdvb-engine" }
 decdvb-mod = { path = "../../crates/decdvb-mod" }
 decdvb-modem = { path = "../../crates/decdvb-modem" }
 decdvb-gse = { path = "../../crates/decdvb-gse" }
+decdvb-ip = { path = "../../crates/decdvb-ip" }
 anyhow.workspace = true
 clap = { version = "4.6", features = ["derive"] }

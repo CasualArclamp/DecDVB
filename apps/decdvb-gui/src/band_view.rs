@@ -179,6 +179,23 @@ pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
             (Some(c), _) => format!("{} · rate?", if c.locked { "LOCK" } else { "no lock" }),
             (None, _) => format!("acq {:.0} %", st.progress * 100.0),
         },
+        DecoderKind::Tpc2964 => {
+            let t = st.fec.as_ref().and_then(|f| f.tpc.as_ref().map(|t| (f, t)));
+            match (&st.carrier, t) {
+                (Some(c), Some((f, t))) if t.structure.is_some() => format!(
+                    "{} TPC · {}{}",
+                    if c.locked { "LOCK" } else { "no lock" },
+                    format::bitrate(f.payload_bps),
+                    if f.raw_active { " ● REC" } else { "" }
+                ),
+                (Some(c), Some((_, t))) if t.uw_locked => format!(
+                    "{} · UW · structure?",
+                    if c.locked { "LOCK" } else { "no lock" }
+                ),
+                (Some(c), _) => format!("{} · UW?", if c.locked { "LOCK" } else { "no lock" }),
+                (None, _) => format!("acq {:.0} %", st.progress * 100.0),
+            }
+        }
         DecoderKind::PskSymbols => match &st.carrier {
             Some(c) => {
                 let lock = if c.locked { "LOCK" } else { "no lock" };

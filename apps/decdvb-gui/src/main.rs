@@ -44,7 +44,7 @@ fn main() -> eframe::Result {
         Err(e) => {
             eprintln!("decdvb-gui: {e}");
             eprintln!(
-                "usage: decdvb-gui [capture] [--claim-carriers] [--decoder id|ip|ts|psk|rec|spec] \
+                "usage: decdvb-gui [capture] [--claim-carriers] [--decoder id|ip|ts|dvbs|tpc|psk|rec|spec] \
                  [--select N] [--after SECS] [--screenshot OUT.png]"
             );
             std::process::exit(2);

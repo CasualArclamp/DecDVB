@@ -577,3 +577,48 @@ multi-ring "locked" needs 0.6. 16QAM: MER 34 dB on a clean carrier.
 
 Left out: OS8QAM, the RCV's 8APSK and 32QAM (ring ratios / geometry not in
 the figures), OQPSK and pi/4-DQPSK (they need demodulator changes).
+
+## RCV-20x modes, part 4 — TPC 2964 (2026-10-09)
+
+Rory: "download IESS-315 and do TPC 2964". IESS-315 (rev. E, 2005) turned
+out to be a performance document — EIRP, link budgets, a spectrum mask, a
+data scrambler given only as figures — that leaves the turbo code to
+"compatible turbo modems", and it carries an Intelsat confidentiality notice:
+nothing from it is in the repo, and nothing was needed from it. What is
+used comes from the RCV-20x manual (Table 3.2) and the signal.
+
+- **`decdvb-modem::tpc2964`**: UW F50B8h every 2964 bits found under each
+  phase ambiguity (2 for BPSK, 8 for QPSK), three frames running. The frame
+  structure is searched: send order (rows or columns), either direction in
+  each, the Hamming generator (six primitive polynomials), the code bits
+  unscrambled or scrambled by the (2,3,9,12)/475h sequence wired four ways
+  and started at the block or the UW — 432 hypotheses. Each is scored by
+  min(rows, columns) that are codewords as received; a column-major block is
+  the transpose of a row-major one, so only the 46 × (64,57) orientation is
+  kept (the first version counted each layout twice and could not choose).
+  Near-equivalents (a reversed Hamming word is a word of the reciprocal
+  polynomial's code, so some fit a quarter as well) are settled by soft
+  decoding. Slips: when the UW is missing where due, the other orientations
+  and ±2 symbols are tried there and taken if this UW and the next agree.
+  Frames that missed their UW and do not decode are dropped.
+- **`decdvb-modem::payload`**: HDLC deframing (flags, zero-bit stuffing,
+  FCS-16/32), TS alignment at any bit offset (three syncs to lock), and the
+  descrambler search: none, self-synchronising (2,3,9,12), its reciprocal,
+  V.35 (3,20), V.29 (18,23), and additive (2,3,9,12) per frame four ways.
+  Random data never passes (tested).
+- **Engine/GUI**: decoder "TPC 2964 (IESS-315) → IP / TS" (`--decoder tpc`),
+  BPSK/QPSK (or Identify's), a TPC card (UW, orientation, structure and fit,
+  decoding, payload, data file); IP from HDLC goes to the IP stage (PCAP,
+  flows, multicast audio), TS to the TS stage; Record writes the data `.bin`
+  as well. Identify names the carrier from its UW.
+- **Scene**: carrier D, TPC 2964 QPSK at 125 kBd, +250 kHz, a multicast radio
+  and unicast traffic over Cisco HDLC, self-synchronising (2,3,9,12)
+  scrambling. Found, decoded and the radio listed in the GUI.
+- **Not covered**: 8PSK and 16QAM tpc_2964 (labels and soft demapping still to
+  do), OQPSK (IESS-315 allows it; needs the demodulator), a scrambler running
+  across frames, the V.35 run counter. A real TPC 2964 recording would
+  confirm which hypotheses are real; until then it is checked on synthetic
+  signals only.
+- Also this session: **v0.1.0 released** — `release.yml` (DecDRM's pattern)
+  builds the static-CRT exes on a tag, checks versions and the C runtime,
+  smoke-tests the CLI and drafts the release; `decdvb-gui --version`.

@@ -156,7 +156,9 @@ crates/
                   resampling, sound output (cpal), recording as broadcast
   decdvb-modem    other satellite modem formats: DVB-S (Viterbi K = 7 with
                   puncturing, RS(204,188), Forney interleaving, energy dispersal),
-                  generic RS over GF(256); the Intelsat / TPC modes next
+                  generic RS over GF(256); turbo product codes and IESS-315
+                  tpc_2964 (structure found blind); modem payloads (HDLC,
+                  MPEG-TS, descramblers found blind)
   decdvb-io       HackRF source (libhackrf FFI / soapy), IQ file reader/writer
                   (cs8/cs16/cf32), HackRF TX sink, ring buffers
   decdvb-engine   orchestrates RX (and TX) chain; ACM state; multistream/ISI

@@ -38,6 +38,9 @@ pub enum DecoderKind {
     Dvbs2Ts,
     /// DVB-S (EN 300 421) → MPEG-TS: QPSK, Viterbi, Reed–Solomon.
     DvbsTs,
+    /// Intelsat IESS-315 turbo product code `tpc_2964` (BPSK/QPSK): frame
+    /// structure, scrambling and payload (HDLC/IP or MPEG-TS) found blind.
+    Tpc2964,
     /// Generic PSK/APSK: lock any linearly modulated carrier and write its
     /// hard-decided symbols to a `.bin` file, one byte per symbol.
     PskSymbols,
@@ -48,11 +51,12 @@ pub enum DecoderKind {
 }
 
 impl DecoderKind {
-    pub const ALL: [DecoderKind; 7] = [
+    pub const ALL: [DecoderKind; 8] = [
         DecoderKind::Identify,
         DecoderKind::Dvbs2Ip,
         DecoderKind::Dvbs2Ts,
         DecoderKind::DvbsTs,
+        DecoderKind::Tpc2964,
         DecoderKind::PskSymbols,
         DecoderKind::IqRecord,
         DecoderKind::Spectrum,
@@ -64,15 +68,33 @@ impl DecoderKind {
             DecoderKind::Dvbs2Ip => "DVB-S2/S2X → GSE/IP (PCAP)",
             DecoderKind::Dvbs2Ts => "DVB-S2/S2X → MPEG-TS",
             DecoderKind::DvbsTs => "DVB-S → MPEG-TS",
+            DecoderKind::Tpc2964 => "TPC 2964 (IESS-315) → IP / TS",
             DecoderKind::PskSymbols => "Generic PSK → symbols (.bin)",
             DecoderKind::IqRecord => "IQ recorder",
             DecoderKind::Spectrum => "Spectrum only",
         }
     }
 
-    /// The decoder ends in an MPEG-TS (with its outputs and analyser).
+    /// The decoder ends in an MPEG-TS (with its outputs and analyser), or
+    /// may (TPC 2964, when its data carry one).
     pub fn outputs_ts(self) -> bool {
-        matches!(self, DecoderKind::Dvbs2Ts | DecoderKind::DvbsTs)
+        matches!(
+            self,
+            DecoderKind::Dvbs2Ts | DecoderKind::DvbsTs | DecoderKind::Tpc2964
+        )
+    }
+
+    /// The decoder locks a carrier and decodes it: its own state leads the
+    /// side panel, and Identify's view folds away.
+    pub fn demodulates(self) -> bool {
+        matches!(
+            self,
+            DecoderKind::Dvbs2Ip
+                | DecoderKind::Dvbs2Ts
+                | DecoderKind::DvbsTs
+                | DecoderKind::Tpc2964
+                | DecoderKind::PskSymbols
+        )
     }
 
     pub fn short(self) -> &'static str {
@@ -81,6 +103,7 @@ impl DecoderKind {
             DecoderKind::Dvbs2Ip => "S2→IP",
             DecoderKind::Dvbs2Ts => "S2→TS",
             DecoderKind::DvbsTs => "S→TS",
+            DecoderKind::Tpc2964 => "TPC",
             DecoderKind::PskSymbols => "PSK",
             DecoderKind::IqRecord => "REC",
             DecoderKind::Spectrum => "SPEC",
@@ -334,10 +357,13 @@ enum Decoder {
         /// LDPC/BCH on its own thread, started with the demodulator.
         fec: Option<FecWorker>,
     },
-    Dvbs {
+    /// A coded single-carrier modem: DVB-S or TPC 2964 (`kind`).
+    Modem {
+        kind: DecoderKind,
         buf: Vec<Iq>,
         demod: Option<Box<PskDemod>>,
-        /// Viterbi, Reed–Solomon and the TS stage on the FEC thread.
+        /// The FEC (Viterbi and Reed–Solomon, or the turbo product code),
+        /// the payload and its outputs on the FEC thread.
         fec: Option<FecWorker>,
     },
     Psk {
@@ -436,7 +462,8 @@ impl Worker {
                 demod: None,
                 fec: None,
             },
-            DecoderKind::DvbsTs => Decoder::Dvbs {
+            DecoderKind::DvbsTs | DecoderKind::Tpc2964 => Decoder::Modem {
+                kind: s.decoder,
                 buf: Vec::new(),
                 demod: None,
                 fec: None,
@@ -476,7 +503,7 @@ impl Worker {
         let signal_changed = rebuild_ddc || retuned || new_decoder;
         self.settings = new;
         // Record / GSE variant changes reach a running FEC thread directly.
-        if let Decoder::Dvbs2 { fec: Some(w), .. } | Decoder::Dvbs { fec: Some(w), .. } =
+        if let Decoder::Dvbs2 { fec: Some(w), .. } | Decoder::Modem { fec: Some(w), .. } =
             &self.decoder
         {
             w.set_output(fec_output(&self.settings, &self.ddc));
@@ -654,12 +681,17 @@ impl Worker {
                     }
                 }
             },
-            Decoder::Dvbs { buf, demod, fec } => match demod {
+            Decoder::Modem {
+                kind,
+                buf,
+                demod,
+                fec,
+            } => match demod {
                 Some(d) => {
                     self.syms.clear();
                     d.process(&self.bb, &mut self.syms);
                     if let Some(w) = fec {
-                        w.offer_dvbs(self.syms.iter().map(|s| s.1).collect());
+                        offer_symbols(w, *kind, d.modulation(), &self.syms);
                     }
                 }
                 None => {
@@ -671,14 +703,24 @@ impl Worker {
                         let usable = !matches!(id.verdict, Verdict::NoSignal);
                         if let Some(rs) = rs.filter(|&r| usable && out_rate / r >= 2.0) {
                             let seed = id.carrier_offset_hz.unwrap_or(0.0) / rs;
-                            // DVB-S is always QPSK.
-                            let mut d = Box::new(PskDemod::new(
-                                out_rate,
-                                rs,
-                                alpha,
-                                decdvb_core::Modulation::Qpsk,
-                                seed,
-                            ));
+                            // DVB-S is always QPSK; TPC 2964 is BPSK or QPSK
+                            // (as set, or as Identify saw it).
+                            let modulation = match *kind {
+                                DecoderKind::Tpc2964 => match self
+                                    .settings
+                                    .psk_modulation
+                                    .or(id.constellation.map(|c| c.modulation()))
+                                {
+                                    Some(
+                                        decdvb_core::Modulation::Bpsk
+                                        | decdvb_core::Modulation::Pi2Bpsk,
+                                    ) => decdvb_core::Modulation::Bpsk,
+                                    _ => decdvb_core::Modulation::Qpsk,
+                                },
+                                _ => decdvb_core::Modulation::Qpsk,
+                            };
+                            let mut d =
+                                Box::new(PskDemod::new(out_rate, rs, alpha, modulation, seed));
                             let mut shifted = std::mem::take(buf);
                             shift(&mut shifted, out_rate, id.center_offset_hz);
                             self.ddc
@@ -686,7 +728,7 @@ impl Worker {
                             let w = FecWorker::spawn(rs, fec_output(&self.settings, &self.ddc));
                             self.syms.clear();
                             d.process(&shifted, &mut self.syms);
-                            w.offer_dvbs(self.syms.iter().map(|s| s.1).collect());
+                            offer_symbols(&w, *kind, modulation, &self.syms);
                             *fec = Some(w);
                             *demod = Some(d);
                         } else {
@@ -920,7 +962,12 @@ impl Worker {
                     st.fec = fec;
                 }
             },
-            Decoder::Dvbs { buf, demod, fec } => match demod {
+            Decoder::Modem {
+                kind,
+                buf,
+                demod,
+                fec,
+            } => match demod {
                 None => {
                     st.progress = buf.len() as f32 / first_look(out_rate) as f32;
                     st.message = match &self.identification {
@@ -942,24 +989,33 @@ impl Worker {
                     });
                     let f = fec.as_ref().map(|w| w.stats());
                     let lock = format!(
-                        "QPSK {}, MER {:.1} dB",
+                        "{} {}, MER {:.1} dB",
+                        d.modulation().name(),
                         if d.locked() { "locked" } else { "not locked" },
                         d.mer_db()
                     );
-                    st.message = match f.as_ref().and_then(|f| f.dvbs.as_ref().map(|v| (v, &f.ts)))
-                    {
-                        Some((v, ts)) if v.rate.is_some() => {
-                            let rate = v.rate.map_or("?", |r| r.name());
-                            match ts.as_ref().and_then(|t| {
-                                t.report.programmes.iter().find_map(|p| p.name.clone())
-                            }) {
-                                Some(n) => {
-                                    format!("{lock} · rate {rate} · {} TS packets · {n}", v.packets)
+                    st.message = if *kind == DecoderKind::Tpc2964 {
+                        tpc_message(&lock, f.as_ref())
+                    } else {
+                        match f.as_ref().and_then(|f| f.dvbs.as_ref().map(|v| (v, &f.ts))) {
+                            Some((v, ts)) if v.rate.is_some() => {
+                                let rate = v.rate.map_or("?", |r| r.name());
+                                match ts.as_ref().and_then(|t| {
+                                    t.report.programmes.iter().find_map(|p| p.name.clone())
+                                }) {
+                                    Some(n) => {
+                                        format!(
+                                            "{lock} · rate {rate} · {} TS packets · {n}",
+                                            v.packets
+                                        )
+                                    }
+                                    None => {
+                                        format!("{lock} · rate {rate} · {} TS packets", v.packets)
+                                    }
                                 }
-                                None => format!("{lock} · rate {rate} · {} TS packets", v.packets),
                             }
+                            _ => format!("{lock} · finding the code rate"),
                         }
-                        _ => format!("{lock} · finding the code rate"),
                     };
                     st.fec = f;
                 }
@@ -1015,9 +1071,51 @@ impl Worker {
 
 /// What a DVB-S2 VFO's FEC thread should write. The DDC is tuned onto the
 /// carrier by then, so its offset names the file.
+/// Hand a coded modem's symbols to its FEC thread.
+fn offer_symbols(
+    w: &FecWorker,
+    kind: DecoderKind,
+    modulation: decdvb_core::Modulation,
+    syms: &[(u8, Iq)],
+) {
+    let s = syms.iter().map(|s| s.1).collect();
+    match kind {
+        DecoderKind::Tpc2964 => w.offer_tpc(s, modulation != decdvb_core::Modulation::Bpsk),
+        _ => w.offer_dvbs(s),
+    }
+}
+
+/// A TPC 2964 VFO's status line.
+fn tpc_message(lock: &str, f: Option<&crate::fec::FecStats>) -> String {
+    let Some(t) = f.and_then(|f| f.tpc.as_ref()) else {
+        return format!("{lock} · looking for the unique word");
+    };
+    if !t.uw_locked {
+        return format!("{lock} · looking for the unique word");
+    }
+    if t.structure.is_none() {
+        return format!(
+            "{lock} · UW found · identifying the frame structure (best fit {:.0}%)",
+            t.fit * 100.0
+        );
+    }
+    let payload = f
+        .and_then(|f| f.payload.as_ref())
+        .and_then(|p| p.found.as_deref())
+        .map_or("payload not recognised yet".to_string(), |p| {
+            p.split(',').next().unwrap_or(p).to_string()
+        });
+    format!(
+        "{lock} · {} frames ({} failed) · BER {:.1e} · {payload}",
+        t.frames,
+        t.failed,
+        t.channel_ber()
+    )
+}
+
 fn fec_output(s: &VfoSettings, ddc: &Ddc) -> FecOutput {
     FecOutput {
-        record: s.record && s.decoder == DecoderKind::Dvbs2Ip,
+        record: s.record && matches!(s.decoder, DecoderKind::Dvbs2Ip | DecoderKind::Tpc2964),
         dir: s.record_dir.clone(),
         name: s.name.clone(),
         carrier_hz: ddc.offset_hz(),
@@ -1729,6 +1827,84 @@ mod tests {
         assert_eq!(t.cc_errors, 0);
         let p = &t.report.programmes[0];
         assert_eq!(p.name.as_deref(), Some("DecDVB test signal"));
+    }
+
+    #[test]
+    fn tpc2964_vfo_finds_the_code_and_the_ip_in_it() {
+        use decdvb_mod::Shaper;
+        use decdvb_mod::fec::TestRadio;
+        use decdvb_modem::tpc2964::{Structure, TpcHdlcTx, modulate};
+        // A TPC 2964 QPSK carrier, 125 kBd at 40 kHz in a 500 kS/s band,
+        // carrying a multicast radio over Cisco HDLC.
+        let mut tx = TpcHdlcTx::new(Structure::TEST);
+        let mut radio = TestRadio::new([239, 1, 2, 3], "TPC radio");
+        let mut bits = Vec::new();
+        while bits.len() < 600_000 {
+            if tx.backlog() < 4000 {
+                let mut f = vec![0x0F, 0x00, 0x08, 0x00];
+                f.extend(radio.next_packet());
+                tx.send(&f);
+            }
+            tx.frame(&mut bits);
+        }
+        // Tune in mid-frame.
+        let mut syms = Vec::new();
+        modulate(&bits[1000..], true, &mut syms);
+        let mut sh = Shaper::new(4, 0.35, 16);
+        let mut x = Vec::new();
+        sh.process(&syms, &mut x);
+        let w = std::f64::consts::TAU * 40_000.0 / 500_000.0;
+        for (n, v) in x.iter_mut().enumerate() {
+            let ph = w * n as f64 + 0.7;
+            *v *= Iq::new(ph.cos() as f32, ph.sin() as f32);
+        }
+        let settings = VfoSettings::new("T", 40_000.0, 190_000.0, DecoderKind::Tpc2964);
+        let status = Arc::new(Mutex::new(VfoStatus::default()));
+        let mut wk = Worker::new(
+            500_000.0,
+            settings,
+            status.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        feed(&mut wk, &x, 65_536);
+        let t0 = Instant::now();
+        let f = loop {
+            wk.publish(0);
+            let f = status.lock().unwrap().fec.clone();
+            if let Some(f) = f.filter(|f| {
+                f.gse
+                    .as_ref()
+                    .is_some_and(|g| g.packets > 50 && g.audio.iter().any(|a| a.sdp.is_some()))
+            }) {
+                break f;
+            }
+            if t0.elapsed().as_secs() >= 30 {
+                let st = status.lock().unwrap();
+                panic!(
+                    "no IP: {:?} / {:?} / {:?}",
+                    st.message,
+                    st.fec.as_ref().and_then(|f| f.tpc.clone()),
+                    st.fec.as_ref().and_then(|f| f.payload.clone())
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let t = f.tpc.expect("no TPC stats");
+        assert_eq!(t.structure, Some(Structure::TEST.describe()));
+        // A frame a slip falls in is lost (the receiver re-finds the UW at
+        // once); none other.
+        assert!(t.failed <= t.slips, "{t:?}");
+        assert_eq!(t.uw_misses, 0, "{t:?}");
+        let p = f.payload.expect("no payload stats");
+        let found = p.found.expect("payload not found");
+        assert!(found.starts_with("HDLC (FCS-16)"), "{found}");
+        assert!(found.contains("taps 2, 3, 9, 12"), "{found}");
+        let g = f.gse.unwrap();
+        assert!(
+            g.audio
+                .iter()
+                .any(|a| a.group == "239.1.2.3".parse::<std::net::IpAddr>().unwrap())
+        );
     }
 
     #[test]

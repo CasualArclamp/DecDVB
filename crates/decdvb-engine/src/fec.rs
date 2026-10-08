@@ -11,6 +11,11 @@
 //! while recording, a PCAP file. Good TS-mode BBFRAMEs become MPEG-TS
 //! (`decdvb_ts`): analysed (programmes, PIDs, continuity) and sent to a
 //! `.ts` file, UDP, and/or a TCP/HTTP server for VLC or PotPlayer.
+//!
+//! The thread also serves the other coded modems: DVB-S symbols (Viterbi,
+//! Reed–Solomon, then the TS stage) and TPC 2964 symbols (the turbo product
+//! code, then the payload — HDLC frames to IP, or MPEG-TS — and, while
+//! recording, the raw data to a `.bin` file).
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -45,6 +50,11 @@ pub(crate) enum FecInput {
     Frame(PlFrame),
     /// Carrier-locked QPSK symbols of a DVB-S carrier.
     Dvbs(Vec<Iq>),
+    /// Carrier-locked symbols of a TPC 2964 carrier: QPSK, else BPSK.
+    Tpc {
+        symbols: Vec<Iq>,
+        qpsk: bool,
+    },
 }
 
 /// LLR quantization: steps per LLR unit (the decoder is happy from 2 to 8).
@@ -318,6 +328,13 @@ pub struct FecStats {
     pub ts: Option<TsView>,
     /// DVB-S: the code rate found, Viterbi and Reed–Solomon.
     pub dvbs: Option<decdvb_modem::dvbs::DvbsStats>,
+    /// TPC 2964: frame sync, the structure found, decoding.
+    pub tpc: Option<decdvb_modem::tpc2964::TpcStats>,
+    /// What a modem's data carry (TPC 2964).
+    pub payload: Option<decdvb_modem::payload::PayloadStats>,
+    /// The raw data file (TPC 2964, while recording) and its bytes.
+    pub raw_file: Option<(PathBuf, u64)>,
+    pub raw_active: bool,
 }
 
 /// The transport stream and its outputs, for display.
@@ -372,6 +389,8 @@ pub struct GseView {
     pub pcap_error: Option<String>,
     /// IP that came by MPE from a transport stream rather than GSE.
     pub mpe: Option<MpeStats>,
+    /// IP that came in link-layer frames (HDLC), and how: for display.
+    pub link: Option<String>,
     /// Multicast audio streams found, by address.
     pub audio: Vec<AudioStream>,
     pub sap_packets: u64,
@@ -459,6 +478,11 @@ impl FecWorker {
         self.send(FecInput::Dvbs(symbols));
     }
 
+    /// Queue a block of TPC 2964 symbols.
+    pub fn offer_tpc(&self, symbols: Vec<Iq>, qpsk: bool) {
+        self.send(FecInput::Tpc { symbols, qpsk });
+    }
+
     fn send(&self, input: FecInput) {
         if let Some(tx) = &self.tx
             && let Err(TrySendError::Full(_)) = tx.try_send(input)
@@ -516,6 +540,8 @@ struct IpStage {
     /// The stream asked for (it may not have been heard yet).
     audio_want: Option<SocketAddr>,
     mpe: Option<MpeStats>,
+    /// IP from HDLC frames: the frames and their FCS, for display.
+    hdlc: Option<(u64, decdvb_modem::payload::Fcs)>,
 }
 
 impl IpStage {
@@ -533,6 +559,7 @@ impl IpStage {
             record_last: None,
             audio_want: None,
             mpe: None,
+            hdlc: None,
             gse: GseIp::new(),
             stats: IpStats::default(),
             packets: Vec::new(),
@@ -731,6 +758,13 @@ impl IpStage {
             pcap_active: self.pcap.is_some(),
             pcap_error: self.error.clone(),
             mpe: self.mpe.clone(),
+            link: self.hdlc.map(|(n, fcs)| {
+                let fcs = match fcs {
+                    decdvb_modem::payload::Fcs::Crc16 => "FCS-16",
+                    decdvb_modem::payload::Fcs::Crc32 => "FCS-32",
+                };
+                format!("HDLC ({fcs}) · {n} frames with IP")
+            }),
             audio: self.audio.clone(),
             sap_packets: self.mcast.sap_packets,
             audio_playing: self.audio_want,
@@ -969,6 +1003,95 @@ impl Drop for TsStage {
     }
 }
 
+/// A modem's data as they come, to a `.bin` file while recording.
+#[derive(Default)]
+struct RawFile {
+    file: Option<std::io::BufWriter<std::fs::File>>,
+    path: Option<PathBuf>,
+    bytes: u64,
+    error: Option<String>,
+}
+
+impl RawFile {
+    fn follow(&mut self, o: &FecOutput, what: &str) {
+        use std::io::Write;
+        match (o.record, self.file.is_some()) {
+            (true, false) if self.error.is_none() => {
+                let stamp = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let path = o.dir.join(format!(
+                    "decdvb-{}-{:+.0}Hz-{what}-{stamp}.bin",
+                    o.name.replace(' ', "_"),
+                    o.carrier_hz
+                ));
+                let _ = std::fs::create_dir_all(&o.dir);
+                match std::fs::File::create(&path) {
+                    Ok(f) => self.file = Some(std::io::BufWriter::new(f)),
+                    Err(e) => self.error = Some(format!("{}: {e}", path.display())),
+                }
+                self.path = Some(path);
+                self.bytes = 0;
+            }
+            (false, true) => {
+                if let Some(mut f) = self.file.take() {
+                    let _ = f.flush();
+                }
+            }
+            (false, false) => self.error = None,
+            _ => {}
+        }
+    }
+
+    fn write(&mut self, data: &[u8]) {
+        use std::io::Write;
+        if let Some(f) = &mut self.file {
+            match f.write_all(data) {
+                Ok(()) => self.bytes += data.len() as u64,
+                Err(e) => {
+                    self.error = Some(e.to_string());
+                    self.file = None;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RawFile {
+    fn drop(&mut self) {
+        use std::io::Write;
+        if let Some(f) = &mut self.file {
+            let _ = f.flush();
+        }
+    }
+}
+
+/// The IP packet in an HDLC frame: after whatever header the link puts
+/// first (Cisco HDLC's 4 bytes, PPP's 4 or fewer, an Ethernet header…),
+/// found by trying each offset for a packet that validates and fills the
+/// rest of the frame exactly — or, IPv4 only (its header has a checksum),
+/// that fits in it.
+fn hdlc_ip(frame: &[u8]) -> Option<(&[u8], IpInfo)> {
+    const MAX_HEADER: usize = 24;
+    let offsets = 0..=MAX_HEADER.min(frame.len());
+    for off in offsets.clone() {
+        if let Some(info) = decdvb_ip::parse(&frame[off..])
+            && info.len == frame.len() - off
+        {
+            return Some((&frame[off..], info));
+        }
+    }
+    for off in offsets {
+        if frame[off..].first().is_some_and(|b| b >> 4 == 4)
+            && let Some(info) = decdvb_ip::parse(&frame[off..])
+        {
+            return Some((&frame[off..off + info.len], info));
+        }
+    }
+    None
+}
+
 fn run(
     rx: Receiver<FecInput>,
     stats: Arc<Mutex<FecStats>>,
@@ -984,10 +1107,83 @@ fn run(
     let mut busy = 0f64;
     let mut dvbs: Option<decdvb_modem::dvbs::DvbsRx> = None;
     let mut dvbs_out = Vec::new();
+    let mut tpc: Option<decdvb_modem::tpc2964::TpcRx> = None;
+    let mut tpc_frames = Vec::new();
+    let mut payload: Option<decdvb_modem::payload::PayloadRx> = None;
+    let mut payload_out = decdvb_modem::payload::PayloadOut::default();
+    let mut raw = RawFile::default();
     while let Ok(input) = rx.recv() {
         let t0 = Instant::now();
         let f = match input {
             FecInput::Frame(f) => f,
+            FecInput::Tpc { symbols, qpsk } => {
+                // TPC 2964: frame sync and the code's structure found blind,
+                // turbo decoding, then the payload's format and scrambling.
+                use decdvb_modem::payload::PayloadRx;
+                use decdvb_modem::tpc2964::{DATA, TpcRx};
+                let secs = symbols.len() as f64 / symbol_rate;
+                let rx = tpc.get_or_insert_with(|| TpcRx::new(qpsk));
+                tpc_frames.clear();
+                rx.push(&symbols, &mut tpc_frames);
+                let pay = payload.get_or_insert_with(|| PayloadRx::new(DATA));
+                let o = output.lock().unwrap().clone();
+                raw.follow(&o, "tpc2964");
+                for data in &tpc_frames {
+                    payload_out.clear();
+                    pay.push(data, &mut payload_out);
+                    raw.write(&payload_out.raw);
+                    if !payload_out.ts.is_empty() {
+                        let stage = ts.get_or_insert_with(TsStage::new);
+                        stage.follow(&o);
+                        stage.packets_in(&payload_out.ts);
+                        if !stage.datagrams.is_empty() || ip.is_some() {
+                            let ipst = ip.get_or_insert_with(IpStage::new);
+                            ipst.follow(&o);
+                            ipst.mpe(&stage.datagrams, &stage.mpe.stats);
+                        }
+                    }
+                    for (frame, fcs) in &payload_out.frames {
+                        if let Some((pkt, info)) = hdlc_ip(frame) {
+                            let ipst = ip.get_or_insert_with(IpStage::new);
+                            ipst.follow(&o);
+                            let n = ipst.hdlc.map_or(0, |h| h.0);
+                            ipst.hdlc = Some((n + 1, *fcs));
+                            ipst.ip(pkt, &info);
+                        }
+                    }
+                }
+                if let Some(stage) = &mut ts {
+                    stage.follow(&o);
+                    stage.tick(secs);
+                }
+                if let Some(stage) = &mut ip {
+                    stage.follow(&o);
+                    stage.tick(secs);
+                }
+                let used = t0.elapsed().as_secs_f64();
+                busy = 0.95 * busy + 0.05 * (used / secs.max(1e-9));
+                win_secs += secs;
+                win_bits += (tpc_frames.len() * DATA) as f64;
+                let mut s = stats.lock().unwrap();
+                s.load = busy as f32;
+                if win_secs >= 2.0 {
+                    s.payload_bps = win_bits / win_secs;
+                    (win_bits, win_secs) = (0.0, 0.0);
+                } else if s.payload_bps == 0.0 && win_secs > 0.2 {
+                    s.payload_bps = win_bits / win_secs;
+                }
+                s.tpc = Some(rx.stats.clone());
+                s.payload = Some(pay.stats.clone());
+                s.raw_file = raw.path.clone().map(|p| (p, raw.bytes));
+                s.raw_active = raw.file.is_some();
+                if let Some(stage) = &mut ts {
+                    s.ts = Some(stage.view());
+                }
+                if let Some(stage) = &mut ip {
+                    s.gse = Some(stage.view());
+                }
+                continue;
+            }
             FecInput::Dvbs(sym) => {
                 // DVB-S: blind Viterbi/RS decoding, then the TS stage as for
                 // a DVB-S2 TS carrier (and IP from MPE).
