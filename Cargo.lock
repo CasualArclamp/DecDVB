@@ -542,6 +542,7 @@ dependencies = [
  "decdvb-gse",
  "decdvb-io",
  "decdvb-ip",
+ "decdvb-mod",
  "decdvb-ts",
  "num-complex",
  "rustfft",
@@ -554,6 +555,7 @@ name = "decdvb-fec"
 version = "0.0.0"
 dependencies = [
  "decdvb-core",
+ "num-complex",
  "thiserror 2.0.21",
 ]
 
@@ -612,6 +614,10 @@ name = "decdvb-mod"
 version = "0.0.0"
 dependencies = [
  "decdvb-core",
+ "decdvb-dsp",
+ "decdvb-fec",
+ "decdvb-frame",
+ "num-complex",
  "thiserror 2.0.21",
 ]
 

@@ -1,11 +1,20 @@
 //! DSP building blocks for DecDVB.
 //!
-//! M0 provides the root-raised-cosine filter and a streaming FIR, which the
-//! modulator and the receive matched filter both need. Timing recovery, carrier
-//! recovery and the resampler land in M1 — see `docs/DESIGN.md`.
+//! - [`rrc`] / [`fir`]: pulse shaping and the matched filter.
+//! - [`ddc`]: the digital down-converter at the front of every VFO.
+//! - [`agc`]: block AGC to unit power.
+//! - [`timing`]: Gardner symbol synchroniser with a cubic interpolator.
+//!
+//! Carrier recovery lands with the rest of M1 — see `docs/DESIGN.md`.
 
+pub mod agc;
+pub mod ddc;
 pub mod fir;
 pub mod rrc;
+pub mod timing;
 
+pub use agc::Agc;
+pub use ddc::{Ddc, lowpass};
 pub use fir::Fir;
 pub use rrc::rrc_taps;
+pub use timing::SymbolSync;

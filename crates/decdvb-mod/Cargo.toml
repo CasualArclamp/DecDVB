@@ -1,6 +1,6 @@
 [package]
 name = "decdvb-mod"
-description = "Modulator (TX): BBFRAME to IQ for loopback and ACM test signals"
+description = "Modulator (TX): PLFRAMEs to IQ, for loopback and ACM test signals"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,4 +9,8 @@ rust-version.workspace = true
 
 [dependencies]
 decdvb-core = { path = "../decdvb-core" }
+decdvb-dsp = { path = "../decdvb-dsp" }
+decdvb-fec = { path = "../decdvb-fec" }
+decdvb-frame = { path = "../decdvb-frame" }
+num-complex.workspace = true
 thiserror.workspace = true

@@ -5,9 +5,11 @@
 //! in here from M1 onward — see `docs/DESIGN.md`.
 
 pub mod estimate;
+pub mod identify;
 pub mod spectrum;
 
 pub use estimate::{BandEstimate, estimate_band};
+pub use identify::{ConstellationGuess, Identification, RateSource, Verdict, identify};
 pub use spectrum::Spectrum;
 
 use decdvb_core::{Iq, Metrics, Result, RxConfig};

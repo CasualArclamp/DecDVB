@@ -1,0 +1,849 @@
+//! "What is this?" — blind identification of a carrier in a VFO.
+//!
+//! Given a block of VFO baseband, measure what can be measured without
+//! assuming a standard, then try to identify the standard. The split between
+//! the two is deliberate (see `docs/DESIGN.md` §3b): the DVB-S2 verdict rests on
+//! a strong signature and is reported as fact; everything else is reported as
+//! a measurement or a labelled guess.
+//!
+//! Pipeline:
+//! 1. Spectrum → band estimate: centre, occupied bandwidth, S/N, and a first
+//!    symbol rate from the equivalent noise bandwidth.
+//! 2. Mix the carrier to DC; refine the symbol rate from the **cyclic feature**
+//!    of the squared envelope (a linearly modulated signal with α > 0 has a
+//!    spectral line in `|x|²` at exactly the symbol rate).
+//! 3. Fit the roll-off by matching the measured spectrum to the raised-cosine
+//!    shape for each legal α.
+//! 4. Matched filter, Gardner timing recovery, AGC → symbols.
+//! 5. Classify the constellation from the symbols' amplitude rings and their
+//!    4th/8th-power spectral lines.
+//! 6. Look for DVB-S2 PLHEADERs on the predicted frame grid.
+
+use std::collections::BTreeMap;
+
+use decdvb_core::{Iq, RollOff};
+use decdvb_dsp::{Agc, Fir, SymbolSync, rrc_taps};
+use decdvb_frame::{PlHeaderCorrelator, PlsInfo, PlscDecoder, PlscDemap, SOF_LEN};
+use rustfft::FftPlanner;
+
+use crate::{Spectrum, estimate_band};
+
+/// Spectrum resolution for the band estimate and roll-off fit.
+const FFT_SIZE: usize = 4096;
+/// Below this peak-to-floor ratio (dB) there is nothing worth identifying.
+const MIN_SNR_DB: f32 = 4.0;
+/// A correlation above this is a PLHEADER candidate (1.0 = perfect match;
+/// random data sits around 0.1–0.4).
+const PLHEADER_THRESHOLD: f32 = 0.5;
+/// How far a confirming header may sit from where it was predicted, in
+/// symbols — allows for a timing slip without admitting coincidences.
+const GRID_TOLERANCE: usize = 2;
+
+/// Where a symbol-rate figure came from, best last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateSource {
+    /// Equivalent noise bandwidth of the spectrum (a few percent).
+    Enbw,
+    /// Cyclic spectral line of the squared envelope (well under 1 %).
+    Cyclic,
+    /// The locked timing loop's period estimate (best).
+    Timing,
+}
+
+/// Constellation estimate from the recovered symbols.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstellationGuess {
+    Qpsk,
+    Psk8,
+    Apsk16,
+    Apsk32,
+    /// Constant envelope, but neither the 4th- nor 8th-power line is clear.
+    PskUnclear,
+    /// More than one amplitude ring, but not a recognised APSK layout.
+    MultiRing(u8),
+    /// Too noisy to say.
+    Unclear,
+}
+
+impl ConstellationGuess {
+    pub fn label(self) -> String {
+        match self {
+            ConstellationGuess::Qpsk => "QPSK".into(),
+            ConstellationGuess::Psk8 => "8PSK".into(),
+            ConstellationGuess::Apsk16 => "16APSK".into(),
+            ConstellationGuess::Apsk32 => "32APSK".into(),
+            ConstellationGuess::PskUnclear => "PSK (order unclear)".into(),
+            ConstellationGuess::MultiRing(n) => format!("{n}-ring amplitude/phase"),
+            ConstellationGuess::Unclear => "unclear".into(),
+        }
+    }
+}
+
+/// What the DVB-S2 search found.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Dvbs2Info {
+    /// PLHEADERs that passed the correlation threshold.
+    pub headers_seen: usize,
+    /// Headers that sat exactly where the previous header's PLS code said the
+    /// next frame would start.
+    pub headers_confirmed: usize,
+    /// MODCOD index → frame count (confirmed frames only).
+    pub modcods: BTreeMap<u8, usize>,
+    pub with_pilots: usize,
+    pub short_frames: usize,
+    pub dummy_frames: usize,
+}
+
+impl Dvbs2Info {
+    /// True when more than one data MODCOD was seen — ACM or VCM in use.
+    pub fn variable_coding(&self) -> bool {
+        self.modcods.keys().filter(|&&m| m != 0).count() > 1
+    }
+
+    /// Reserved S2 MODCOD indexes (29–31) appear in S2X signalling.
+    pub fn uses_reserved_modcods(&self) -> bool {
+        self.modcods.keys().any(|&m| m >= 29)
+    }
+}
+
+/// The verdict.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Verdict {
+    /// Nothing above the noise floor.
+    NoSignal,
+    /// A narrow, unmodulated (or nearly so) carrier.
+    Carrier,
+    /// DVB-S2 PLFRAMEs found on a confirmed frame grid.
+    DvbS2(Dvbs2Info),
+    /// A modulated signal that is not DVB-S2; `hint` says what it might be and
+    /// is worded as a guess.
+    NotDvbS2 { hint: String },
+}
+
+/// Everything Identify measured.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Identification {
+    pub verdict: Verdict,
+    /// Carrier centre relative to the VFO centre, Hz.
+    pub center_offset_hz: f64,
+    /// Peak-to-floor of the spectrum, dB.
+    pub snr_db: f32,
+    /// 99 % occupied bandwidth, Hz.
+    pub occupied_bw_hz: f64,
+    pub symbol_rate: Option<f64>,
+    pub symbol_rate_source: Option<RateSource>,
+    pub roll_off: Option<RollOff>,
+    pub constellation: Option<ConstellationGuess>,
+    /// Residual carrier offset after centring, from the 4th/8th-power line, Hz.
+    pub carrier_offset_hz: Option<f64>,
+}
+
+impl Identification {
+    fn bare(verdict: Verdict, center: f64, snr: f32, bw: f64) -> Self {
+        Identification {
+            verdict,
+            center_offset_hz: center,
+            snr_db: snr,
+            occupied_bw_hz: bw,
+            symbol_rate: None,
+            symbol_rate_source: None,
+            roll_off: None,
+            constellation: None,
+            carrier_offset_hz: None,
+        }
+    }
+
+    /// One-line human summary for the CLI and the VFO panel.
+    pub fn summary(&self) -> String {
+        let rs = self
+            .symbol_rate
+            .map(|r| format!("{:.1} kS/s", r / 1e3))
+            .unwrap_or_else(|| "?".into());
+        let ro = self
+            .roll_off
+            .map(|r| format!("α {:.2}", r.as_f64()))
+            .unwrap_or_default();
+        match &self.verdict {
+            Verdict::NoSignal => "no signal".into(),
+            Verdict::Carrier => format!(
+                "narrow carrier at {:+.0} Hz (unmodulated, or far narrower than this VFO)",
+                self.center_offset_hz
+            ),
+            Verdict::DvbS2(d) => {
+                let mods: Vec<String> = d
+                    .modcods
+                    .iter()
+                    .filter(|(m, _)| **m != 0)
+                    .map(|(m, n)| {
+                        decdvb_core::s2_modcod(*m, decdvb_core::FecFrame::Normal)
+                            .map(|mc| format!("{mc}×{n}"))
+                            .unwrap_or_else(|| format!("MODCOD {m}×{n}"))
+                    })
+                    .collect();
+                let kind = if d.uses_reserved_modcods() {
+                    "DVB-S2X"
+                } else {
+                    "DVB-S2"
+                };
+                let mode = if d.variable_coding() {
+                    "ACM/VCM"
+                } else {
+                    "CCM"
+                };
+                format!(
+                    "{kind} {mode}, {rs} {ro}, {}{}",
+                    if mods.is_empty() {
+                        "dummy frames only".into()
+                    } else {
+                        mods.join(", ")
+                    },
+                    if d.with_pilots > 0 { ", pilots" } else { "" }
+                )
+            }
+            Verdict::NotDvbS2 { hint } => format!("{hint}, {rs} {ro}"),
+        }
+    }
+}
+
+/// Rotate `x` in place by `-freq_hz` (bring a carrier at `freq_hz` to DC).
+fn mix_down(x: &mut [Iq], rate: f64, freq_hz: f64) {
+    let w = -std::f64::consts::TAU * freq_hz / rate;
+    let (sr, si) = (w.cos(), w.sin());
+    let (mut pr, mut pi) = (1.0f64, 0.0f64);
+    for (n, s) in x.iter_mut().enumerate() {
+        *s = Iq::new(
+            (s.re as f64 * pr - s.im as f64 * pi) as f32,
+            (s.re as f64 * pi + s.im as f64 * pr) as f32,
+        );
+        let t = pr * sr - pi * si;
+        pi = pr * si + pi * sr;
+        pr = t;
+        if n % 1024 == 1023 {
+            let m = (pr * pr + pi * pi).sqrt();
+            pr /= m;
+            pi /= m;
+        }
+    }
+}
+
+/// Largest power of two not above `n`, capped.
+fn pow2_floor(n: usize, cap: usize) -> usize {
+    let mut p = 1usize;
+    while p * 2 <= n && p * 2 <= cap {
+        p *= 2;
+    }
+    p
+}
+
+/// Find the strongest spectral line of `seq` (already a real-or-complex
+/// sequence) within `[lo_hz, hi_hz]`, by FFT. Returns (frequency, peak-to-median
+/// power ratio in dB). Frequencies may be negative; the FFT is complex.
+fn strongest_line(seq: &[Iq], rate: f64, lo_hz: f64, hi_hz: f64) -> Option<(f64, f32)> {
+    let n = pow2_floor(seq.len(), 1 << 20);
+    if n < 256 {
+        return None;
+    }
+    let mut buf: Vec<Iq> = seq[..n].to_vec();
+    let mean = buf.iter().sum::<Iq>() / n as f32;
+    // Hann window keeps the line from leaking over the search band.
+    for (k, s) in buf.iter_mut().enumerate() {
+        let w = 0.5 - 0.5 * (std::f32::consts::TAU * k as f32 / n as f32).cos();
+        *s = (*s - mean) * w;
+    }
+    FftPlanner::new().plan_fft_forward(n).process(&mut buf);
+    let pw: Vec<f32> = buf.iter().map(|c| c.norm_sqr()).collect();
+
+    let bin_hz = rate / n as f64;
+    let to_bin = |f: f64| -> i64 { (f / bin_hz).round() as i64 };
+    let (b_lo, b_hi) = (to_bin(lo_hz), to_bin(hi_hz));
+    if b_hi <= b_lo {
+        return None;
+    }
+    let idx = |b: i64| -> usize { b.rem_euclid(n as i64) as usize };
+
+    let mut best_b = b_lo;
+    let mut best = f32::MIN;
+    let mut band: Vec<f32> = Vec::with_capacity((b_hi - b_lo + 1) as usize);
+    for b in b_lo..=b_hi {
+        let p = pw[idx(b)];
+        band.push(p);
+        if p > best {
+            best = p;
+            best_b = b;
+        }
+    }
+    band.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = band[band.len() / 2].max(1e-30);
+
+    // Parabolic interpolation on the log power around the peak.
+    let ym = pw[idx(best_b - 1)].max(1e-30).ln();
+    let y0 = best.max(1e-30).ln();
+    let yp = pw[idx(best_b + 1)].max(1e-30).ln();
+    let denom = ym - 2.0 * y0 + yp;
+    let delta = if denom.abs() > 1e-12 {
+        0.5 * (ym - yp) / denom
+    } else {
+        0.0
+    };
+    let freq = (best_b as f64 + delta.clamp(-0.5, 0.5) as f64) * bin_hz;
+    Some((freq, 10.0 * (best / median).log10()))
+}
+
+/// Refine a symbol-rate guess from the cyclic feature of the squared envelope.
+/// Returns (rate, line strength dB) when a line stands out.
+pub fn cyclic_symbol_rate(x: &[Iq], rate: f64, guess: f64, search: f64) -> Option<(f64, f32)> {
+    let env: Vec<Iq> = x.iter().map(|s| Iq::new(s.norm_sqr(), 0.0)).collect();
+    let (f, strength) = strongest_line(&env, rate, guess * (1.0 - search), guess * (1.0 + search))?;
+    // A real line stands well clear of the envelope's noise-like background.
+    (strength > 12.0).then_some((f, strength))
+}
+
+/// Raised-cosine power-spectrum shape (0..1) at offset `f` from centre.
+fn rc_shape(f: f64, rs: f64, alpha: f64) -> f64 {
+    let a = f.abs();
+    let flat = (1.0 - alpha) * rs / 2.0;
+    let edge = (1.0 + alpha) * rs / 2.0;
+    if a <= flat {
+        1.0
+    } else if a <= edge {
+        0.5 * (1.0 + (std::f64::consts::PI / (alpha * rs) * (a - flat)).cos())
+    } else {
+        0.0
+    }
+}
+
+/// Pick the legal roll-off whose raised-cosine shape best matches the measured
+/// spectrum. Fits level and floor by linear least squares for each candidate,
+/// then scores in dB over the occupied region so the skirts — where the
+/// candidates actually differ — carry the decision.
+pub fn fit_roll_off(spectrum_db: &[f32], rate: f64, center_hz: f64, rs: f64) -> Option<RollOff> {
+    let n = spectrum_db.len();
+    let freq = |k: usize| (k as f64 / n as f64 - 0.5) * rate - center_hz;
+    let meas: Vec<f64> = spectrum_db
+        .iter()
+        .map(|&d| 10f64.powf(d as f64 / 10.0))
+        .collect();
+
+    let mut best: Option<(RollOff, f64)> = None;
+    for ro in RollOff::ALL {
+        let alpha = ro.as_f64();
+        let model: Vec<f64> = (0..n).map(|k| rc_shape(freq(k), rs, alpha)).collect();
+
+        // Least squares for meas ≈ a·model + b.
+        let (mut sm, mut sy, mut smm, mut smy) = (0.0, 0.0, 0.0, 0.0);
+        for (m, y) in model.iter().zip(&meas) {
+            sm += m;
+            sy += y;
+            smm += m * m;
+            smy += m * y;
+        }
+        let nn = n as f64;
+        let det = nn * smm - sm * sm;
+        if det.abs() < 1e-30 {
+            continue;
+        }
+        let a = (nn * smy - sm * sy) / det;
+        let b = ((sy - a * sm) / nn).max(1e-30);
+        if a <= 0.0 {
+            continue;
+        }
+
+        // Score in dB within ±(1+0.35)·Rs/2·1.2 of the centre: the region where
+        // any legal roll-off has its skirts.
+        let reach = 0.6 * 1.35 * rs;
+        let mut err = 0.0;
+        let mut cnt = 0usize;
+        for k in 0..n {
+            if freq(k).abs() <= reach {
+                let pred = 10.0 * (a * model[k] + b).log10();
+                let d = pred - spectrum_db[k] as f64;
+                err += d * d;
+                cnt += 1;
+            }
+        }
+        if cnt == 0 {
+            continue;
+        }
+        let err = err / cnt as f64;
+        if best.is_none_or(|(_, e)| err < e) {
+            best = Some((ro, err));
+        }
+    }
+    best.map(|(ro, _)| ro)
+}
+
+/// Classify the constellation from timing-recovered (not carrier-recovered)
+/// symbols, and estimate the residual carrier offset from the power line.
+pub fn classify_constellation(sym: &[Iq], rs: f64) -> (ConstellationGuess, Option<f64>) {
+    if sym.len() < 2048 {
+        return (ConstellationGuess::Unclear, None);
+    }
+    // Amplitudes normalised to unit RMS.
+    let rms = (sym.iter().map(|s| s.norm_sqr()).sum::<f32>() / sym.len() as f32).sqrt();
+    let amp: Vec<f32> = sym.iter().map(|s| s.norm() / rms.max(1e-12)).collect();
+
+    // 1-D k-means for k = 1, 2, 3 rings; seeds at the APSK radii keep it from
+    // wandering into a poor local minimum.
+    let kmeans = |seeds: &[f32]| -> (Vec<f32>, Vec<usize>, f32) {
+        let mut c = seeds.to_vec();
+        let mut counts = vec![0usize; c.len()];
+        let mut sse = 0.0f32;
+        for _ in 0..25 {
+            let mut sum = vec![0.0f32; c.len()];
+            counts.iter_mut().for_each(|n| *n = 0);
+            sse = 0.0;
+            for &a in &amp {
+                let (j, d) = c
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &cj)| (j, (a - cj) * (a - cj)))
+                    .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap())
+                    .unwrap();
+                sum[j] += a;
+                counts[j] += 1;
+                sse += d;
+            }
+            for j in 0..c.len() {
+                if counts[j] > 0 {
+                    c[j] = sum[j] / counts[j] as f32;
+                }
+            }
+        }
+        (c, counts, sse / amp.len() as f32)
+    };
+
+    let (_, _, sse1) = kmeans(&[1.0]);
+    let (c2, n2, sse2) = kmeans(&[0.4, 1.13]);
+    let (c3, n3, sse3) = kmeans(&[0.24, 0.69, 1.28]);
+    let frac = |n: &[usize]| -> Vec<f32> {
+        let t: usize = n.iter().sum();
+        n.iter().map(|&x| x as f32 / t.max(1) as f32).collect()
+    };
+
+    // A ring structure is real when adding it cuts the spread a lot AND the
+    // rings are populated in the standard's proportions.
+    let near = |a: f32, b: f32, tol: f32| (a - b).abs() < tol;
+    if sse1 > 0.0 {
+        let f3 = frac(&n3);
+        let gain3 = sse2 / sse3.max(1e-9);
+        if gain3 > 2.5
+            && near(f3[0], 0.125, 0.06)
+            && near(f3[1], 0.375, 0.08)
+            && near(f3[2], 0.5, 0.08)
+            && c3[2] / c3[0] > 3.0
+        {
+            return (ConstellationGuess::Apsk32, None);
+        }
+        let f2 = frac(&n2);
+        let gain2 = sse1 / sse2.max(1e-9);
+        if gain2 > 3.0 && near(f2[0], 0.25, 0.07) && near(f2[1], 0.75, 0.07) && c2[1] / c2[0] > 2.0
+        {
+            return (ConstellationGuess::Apsk16, None);
+        }
+        if gain2 > 3.0 {
+            let rings = if gain3 > 2.5 { 3 } else { 2 };
+            return (ConstellationGuess::MultiRing(rings), None);
+        }
+    }
+
+    // One ring: QPSK leaves a line in s⁴, 8PSK only in s⁸. The line sits at
+    // 4× (or 8×) the residual carrier offset, which this also measures.
+    let p4: Vec<Iq> = sym
+        .iter()
+        .map(|s| (s / rms) * (s / rms) * (s / rms) * (s / rms))
+        .collect();
+    let p8: Vec<Iq> = p4.iter().map(|s| s * s).collect();
+    let half = rs / 2.0;
+    let l4 = strongest_line(&p4, rs, -half, half);
+    let l8 = strongest_line(&p8, rs, -half, half);
+    match (l4, l8) {
+        (Some((f, s4)), _) if s4 > 20.0 => (ConstellationGuess::Qpsk, Some(f / 4.0)),
+        (_, Some((f, s8))) if s8 > 20.0 => (ConstellationGuess::Psk8, Some(f / 8.0)),
+        _ if sse1 < 0.05 => (ConstellationGuess::PskUnclear, None),
+        _ => (ConstellationGuess::Unclear, None),
+    }
+}
+
+/// Search recovered symbols for DVB-S2 PLHEADERs and confirm them on the frame
+/// grid their own PLS codes predict.
+pub fn detect_dvbs2(sym: &[Iq]) -> Dvbs2Info {
+    let mut corr = PlHeaderCorrelator::new();
+    let mut cands: Vec<(usize, f32)> = Vec::new();
+    for (i, &s) in sym.iter().enumerate() {
+        if let Some(m) = corr.push(s)
+            && m > PLHEADER_THRESHOLD
+        {
+            cands.push((i, m));
+        }
+    }
+    // Keep only local maxima: a header is one peak, its neighbours are lower.
+    let peaks: Vec<usize> = cands
+        .iter()
+        .filter(|&&(i, m)| {
+            cands
+                .iter()
+                .all(|&(j, n)| j == i || j.abs_diff(i) > 4 || n < m)
+        })
+        .map(|&(i, _)| i)
+        .collect();
+
+    let mut info = Dvbs2Info {
+        headers_seen: peaks.len(),
+        ..Default::default()
+    };
+    let mut dec = PlscDecoder::new();
+    let decode = |dec: &mut PlscDecoder, i: usize| -> Option<PlsInfo> {
+        // `i` is the header's last symbol; the PLS code needs the last SOF
+        // symbol first: 65 symbols ending at `i`.
+        (i >= 64).then(|| dec.decode(&sym[i - 64..=i], PlscDemap::Differential))
+    };
+
+    for (k, &i) in peaks.iter().enumerate() {
+        let Some(pls) = decode(&mut dec, i) else {
+            continue;
+        };
+        // Is the next header where this one says it should be?
+        let predicted = i + pls.plframe_len as usize;
+        let confirmed = peaks[k + 1..]
+            .iter()
+            .take_while(|&&j| j <= predicted + GRID_TOLERANCE)
+            .any(|&j| j.abs_diff(predicted) <= GRID_TOLERANCE);
+        if confirmed {
+            info.headers_confirmed += 1;
+            *info.modcods.entry(pls.modcod).or_default() += 1;
+            info.with_pilots += pls.has_pilots as usize;
+            info.short_frames += pls.short_fecframe as usize;
+            info.dummy_frames += pls.dummy_frame as usize;
+        }
+    }
+    info
+}
+
+/// Identify the carrier in `x`, a VFO's baseband at `rate`.
+pub fn identify(x: &[Iq], rate: f64) -> Identification {
+    // 1. Where is the energy?
+    let mut spec = Spectrum::new(FFT_SIZE);
+    let db = spec.compute(x);
+    let Some(band) = estimate_band(&db, rate, 0.99) else {
+        return Identification::bare(Verdict::NoSignal, 0.0, 0.0, 0.0);
+    };
+    if band.snr_db < MIN_SNR_DB || band.bandwidth_hz <= 0.0 {
+        return Identification::bare(Verdict::NoSignal, 0.0, band.snr_db, 0.0);
+    }
+    // A Hann-windowed tone that falls between bins spreads over ~5 bins, so
+    // "narrow" has to allow for that. Anything this narrow is either an
+    // unmodulated carrier or a carrier far too narrow for this VFO.
+    let bin_hz = rate / FFT_SIZE as f64;
+    if band.bandwidth_hz <= 8.0 * bin_hz || band.symbol_rate_hz <= 4.0 * bin_hz {
+        return Identification::bare(
+            Verdict::Carrier,
+            band.center_hz,
+            band.snr_db,
+            band.bandwidth_hz,
+        );
+    }
+
+    let mut id = Identification::bare(
+        Verdict::NotDvbS2 {
+            hint: "unidentified".into(),
+        },
+        band.center_hz,
+        band.snr_db,
+        band.bandwidth_hz,
+    );
+
+    // 2. Bring the carrier to DC; refine the symbol rate.
+    let mut bb = x.to_vec();
+    mix_down(&mut bb, rate, band.center_hz);
+
+    let mut rs = band.symbol_rate_hz;
+    id.symbol_rate_source = Some(RateSource::Enbw);
+    if let Some((r, _)) = cyclic_symbol_rate(&bb, rate, rs, 0.15) {
+        rs = r;
+        id.symbol_rate_source = Some(RateSource::Cyclic);
+    }
+    id.symbol_rate = Some(rs);
+
+    // 3. Roll-off, from the spectrum centred on the carrier.
+    id.roll_off = fit_roll_off(&db, rate, band.center_hz, rs);
+    let alpha = id.roll_off.map_or(0.35, |r| r.as_f64());
+
+    // 4. Matched filter + timing recovery. Below 2 samples per symbol the
+    // carrier fills the VFO and there is nothing more to do here.
+    let sps = rate / rs;
+    if sps < 2.0 {
+        id.verdict = Verdict::NotDvbS2 {
+            hint: "VFO too narrow for this carrier — widen it".into(),
+        };
+        return id;
+    }
+    let mut mf = Fir::new(rrc_taps(sps, alpha, 12));
+    let mut filtered = Vec::with_capacity(bb.len());
+    mf.process(&bb, &mut filtered);
+    let mut agc = Agc::new(1.0, 1.0);
+    agc.process(&mut filtered);
+
+    let mut ss = SymbolSync::new(sps, 0.01, 0.03);
+    let mut sym = Vec::with_capacity((bb.len() as f64 / sps) as usize + 16);
+    ss.process(&filtered, &mut sym);
+    // Drop the pull-in.
+    let settle = (sym.len() / 5).min(4000);
+    let sym = &sym[settle..];
+    let mut agc = Agc::new(1.0, 1.0);
+    let mut sym = sym.to_vec();
+    agc.process(&mut sym);
+
+    // The locked loop's period beats both spectral estimates.
+    if ss.error_level() < 0.25 {
+        rs = rate / ss.sps();
+        id.symbol_rate = Some(rs);
+        id.symbol_rate_source = Some(RateSource::Timing);
+    }
+
+    // 5. Constellation (a guess unless DVB-S2 overrides it below).
+    let (cst, cfo) = classify_constellation(&sym, rs);
+    id.constellation = Some(cst);
+    id.carrier_offset_hz = cfo;
+
+    // 6. DVB-S2?
+    let s2 = detect_dvbs2(&sym);
+    if s2.headers_confirmed >= 2 {
+        id.verdict = Verdict::DvbS2(s2);
+        return id;
+    }
+
+    id.verdict = Verdict::NotDvbS2 {
+        hint: match cst {
+            ConstellationGuess::Qpsk => {
+                "QPSK, no DVB-S2 PLHEADER — possibly DVB-S (not verified)".into()
+            }
+            ConstellationGuess::Unclear => "modulated, no DVB-S2 PLHEADER".into(),
+            other => format!("{}, no DVB-S2 PLHEADER", other.label()),
+        },
+    };
+    id
+}
+
+// Keep the SOF length import meaningful for readers of `detect_dvbs2`'s slice
+// arithmetic: the last SOF symbol sits 64 symbols before the header's end.
+const _: () = assert!(SOF_LEN + 64 == decdvb_frame::PLHEADER_LEN);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use decdvb_mod::{FrameSpec, PlFramer, Shaper};
+
+    /// Deterministic complex Gaussian noise.
+    struct Noise(u64);
+    impl Noise {
+        fn uniform(&mut self) -> f64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+        }
+        fn gauss(&mut self) -> Iq {
+            let u1 = self.uniform().max(1e-300);
+            let u2 = self.uniform();
+            let r = (-2.0 * u1.ln()).sqrt();
+            let t = std::f64::consts::TAU * u2;
+            Iq::new((r * t.cos()) as f32, (r * t.sin()) as f32) * std::f32::consts::FRAC_1_SQRT_2
+        }
+    }
+
+    /// A DVB-S2 carrier: frames per `schedule`, RRC-shaped at `sps`, offset by
+    /// `offset_frac` of the sample rate, at `esn0_db`.
+    fn dvbs2_signal(
+        schedule: &[FrameSpec],
+        n_sym: usize,
+        sps: usize,
+        alpha: f64,
+        offset_frac: f64,
+        esn0_db: f64,
+        seed: u64,
+    ) -> Vec<Iq> {
+        let syms = PlFramer::new(0, seed).build_schedule(schedule, n_sym);
+        let mut sh = Shaper::new(sps, alpha, 16);
+        let mut x = Vec::new();
+        sh.process(&syms, &mut x);
+        // Noise power per sample: Es is spread over sps samples.
+        let sigma = (10f64.powf(-esn0_db / 10.0) / sps as f64).sqrt() as f32 * (sps as f32).sqrt();
+        let mut nz = Noise(seed ^ 0xA5A5);
+        let w = std::f64::consts::TAU * offset_frac;
+        x.iter()
+            .enumerate()
+            .map(|(n, &s)| {
+                let ph = w * n as f64;
+                s * Iq::new(ph.cos() as f32, ph.sin() as f32) + nz.gauss() * sigma
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cyclic_rate_is_very_precise() {
+        // The squared-envelope line pins the symbol rate far more tightly than
+        // the spectrum's width ever could; measured at ~1e-8 here.
+        let x = dvbs2_signal(
+            &[FrameSpec::new(4, false, true)],
+            150_000,
+            4,
+            0.20,
+            0.0,
+            15.0,
+            1,
+        );
+        let (rs, strength) = cyclic_symbol_rate(&x, 4.0, 1.03, 0.15).expect("no cyclic line");
+        assert!((rs - 1.0).abs() < 1e-4, "Rs {rs}");
+        assert!(strength > 30.0, "line only {strength} dB");
+    }
+
+    #[test]
+    fn identifies_a_dvbs2_ccm_carrier() {
+        let x = dvbs2_signal(
+            &[FrameSpec::new(4, false, true)],
+            150_000,
+            4,
+            0.20,
+            0.03,
+            15.0,
+            1,
+        );
+        let id = identify(&x, 4.0);
+        match &id.verdict {
+            Verdict::DvbS2(d) => {
+                assert!(d.headers_confirmed >= 2, "{d:?}");
+                assert_eq!(d.modcods.keys().copied().collect::<Vec<_>>(), vec![4]);
+                assert!(!d.variable_coding());
+                assert!(d.with_pilots > 0);
+            }
+            v => panic!("expected DVB-S2, got {v:?}\n{}", id.summary()),
+        }
+        let rs = id.symbol_rate.unwrap();
+        assert!((rs - 1.0).abs() < 0.01, "Rs {rs}");
+        assert_eq!(id.roll_off, Some(RollOff::R20), "{}", id.summary());
+        assert!(
+            (id.center_offset_hz - 0.03 * 4.0).abs() < 0.01,
+            "centre {}",
+            id.center_offset_hz
+        );
+    }
+
+    #[test]
+    fn identifies_acm() {
+        let schedule = [
+            FrameSpec::new(4, false, true),
+            FrameSpec::new(13, false, true),
+            FrameSpec::new(6, true, true),
+        ];
+        let x = dvbs2_signal(&schedule, 200_000, 4, 0.25, -0.02, 14.0, 2);
+        let id = identify(&x, 4.0);
+        match &id.verdict {
+            Verdict::DvbS2(d) => {
+                assert!(d.variable_coding(), "{d:?}");
+                for m in [4u8, 13, 6] {
+                    assert!(d.modcods.contains_key(&m), "MODCOD {m} missing: {d:?}");
+                }
+                assert!(id.summary().contains("ACM"), "{}", id.summary());
+            }
+            v => panic!("expected DVB-S2, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn works_through_a_ddc_at_fractional_sps() {
+        // The real VFO path: a wideband capture at 10 samples/symbol, a VFO
+        // dropped on the carrier, and a DDC that decimates by 3 — leaving
+        // 3.33 samples per symbol, which nothing downstream may assume away.
+        let x = dvbs2_signal(
+            &[FrameSpec::new(12, false, true)],
+            100_000,
+            10,
+            0.35,
+            0.05,
+            16.0,
+            3,
+        );
+        let mut ddc = decdvb_dsp::Ddc::new(10.0, 0.5, 1.3);
+        assert_eq!(ddc.decimation(), 3);
+        let mut bb = Vec::new();
+        ddc.process(&x, &mut bb);
+
+        let id = identify(&bb, ddc.out_rate());
+        let rs = id.symbol_rate.unwrap();
+        assert!((rs - 1.0).abs() < 0.005, "Rs {rs} ({})", id.summary());
+        assert!(matches!(id.verdict, Verdict::DvbS2(_)), "{}", id.summary());
+        assert_eq!(id.roll_off, Some(RollOff::R35), "{}", id.summary());
+    }
+
+    #[test]
+    fn plain_qpsk_is_not_called_dvbs2() {
+        // Random QPSK with no PLHEADERs: must be measured, classified as QPSK,
+        // and explicitly NOT called DVB-S2.
+        let k = std::f32::consts::FRAC_1_SQRT_2;
+        let mut nz = Noise(77);
+        let syms: Vec<Iq> = (0..80_000)
+            .map(|_| {
+                let r = nz.uniform();
+                match (r * 4.0) as u32 {
+                    0 => Iq::new(k, k),
+                    1 => Iq::new(-k, k),
+                    2 => Iq::new(-k, -k),
+                    _ => Iq::new(k, -k),
+                }
+            })
+            .collect();
+        let mut sh = Shaper::new(4, 0.35, 16);
+        let mut x = Vec::new();
+        sh.process(&syms, &mut x);
+        let x: Vec<Iq> = x.iter().map(|&s| s + nz.gauss() * 0.1).collect();
+
+        let id = identify(&x, 4.0);
+        match &id.verdict {
+            Verdict::NotDvbS2 { hint } => {
+                assert!(hint.contains("QPSK"), "{hint}");
+                assert!(hint.contains("not verified"), "{hint}");
+            }
+            v => panic!("expected not-DVB-S2, got {v:?}"),
+        }
+        assert_eq!(id.constellation, Some(ConstellationGuess::Qpsk));
+    }
+
+    #[test]
+    fn empty_band_is_no_signal() {
+        let mut nz = Noise(5);
+        let x: Vec<Iq> = (0..100_000).map(|_| nz.gauss()).collect();
+        assert_eq!(identify(&x, 1.0).verdict, Verdict::NoSignal);
+    }
+
+    #[test]
+    fn cw_is_a_carrier() {
+        let mut nz = Noise(6);
+        let x: Vec<Iq> = (0..100_000)
+            .map(|n| {
+                let ph = std::f64::consts::TAU * 0.1 * n as f64;
+                Iq::new(ph.cos() as f32, ph.sin() as f32) + nz.gauss() * 0.01
+            })
+            .collect();
+        assert_eq!(identify(&x, 1.0).verdict, Verdict::Carrier);
+    }
+
+    #[test]
+    fn classifies_16apsk_and_32apsk_rings() {
+        use decdvb_fec::Constellation;
+        for (cst, want) in [
+            (Constellation::apsk16(2.85), ConstellationGuess::Apsk16),
+            (
+                Constellation::apsk32(2.84, 5.27),
+                ConstellationGuess::Apsk32,
+            ),
+        ] {
+            let mut nz = Noise(9);
+            let n = cst.points.len();
+            let sym: Vec<Iq> = (0..20_000)
+                .map(|_| cst.map((nz.uniform() * n as f64) as usize % n) + nz.gauss() * 0.03)
+                .collect();
+            let (got, _) = classify_constellation(&sym, 1.0);
+            assert_eq!(got, want);
+        }
+    }
+}

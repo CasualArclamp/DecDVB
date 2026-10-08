@@ -54,6 +54,81 @@ Mirror of RX: input bytes (TS, or GSE-encapsulated IP, or BBFRAME) → BBHEADER 
 
 ---
 
+## 3a. Application shape: wideband waterfall + VFOs
+
+Decided 2026-10-08, at Rory's request: the app works like **SDR++**, not like a
+single-carrier decoder. This shapes the engine, so it lands before the FEC work.
+
+```
+IqSource (HackRF 20 MS/s, or a wideband file)
+  │
+  ├─► wideband FFT ──► spectrum + scrolling waterfall (the whole span)
+  │
+  ├─► carrier detector ──► candidate carriers marked on the waterfall
+  │
+  └─► ring buffer ──┬─► VFO 1: DDC (NCO mix + decimate) ─► decoder ─► output
+                    ├─► VFO 2: DDC ─► decoder ─► output
+                    └─► VFO n: …                    (one worker thread each)
+```
+
+- A **VFO** is a centre frequency, a bandwidth and a chosen decoder. Drop one by
+  dragging on the waterfall, or by clicking a detected carrier (which sizes it
+  correctly for you). Several decode at once, one worker thread each, with a CPU
+  meter per VFO and an enable/disable that does not delete it.
+- **Carrier detection** sweeps the band estimator (§ `decdvb-engine::estimate`)
+  across the span and marks each candidate with its centre and estimated symbol
+  rate. The estimate is good to a few percent, which is close enough to seed a
+  VFO.
+- **Layout**: combined spectrum + waterfall filling the top of the window, a
+  side bar listing the VFOs, and the selected VFO's decoder settings,
+  constellation and statistics below it.
+
+### Decoders a VFO can run
+
+| Decoder | What it does | Needs |
+|---|---|---|
+| **Identify** ("what is this?") | Blind: measures symbol rate and roll-off, estimates constellation order, and identifies the standard. See §3b. | nothing beyond M1 |
+| **DVB-S2/S2X → GSE/IP** | Full ACM demod → LDPC/BCH → GSE → IP → PCAP + stream stats | M2–M4 |
+| **DVB-S2/S2X → MPEG-TS** | Same demod, TS-mode BBFRAMEs → `.ts` or UDP | M2, Appendix C |
+| **IQ recorder** | That VFO's narrowband IQ to a file | M1 |
+| **Spectrum only** | Zoomed spectrum, level, occupied bandwidth; no decode | done |
+
+## 3b. "What is this?" — the Identify decoder
+
+Drag a VFO over an unknown carrier and it reports what it can. Deliberately
+split into what can be known for certain and what can only be guessed, because
+over-claiming here would be worse than useless.
+
+**Measured (no standard assumed):**
+- **Symbol rate.** Seeded by the equivalent-noise-bandwidth estimate (exact for
+  a root-raised-cosine spectrum at any roll-off), then refined by *spectral
+  self-correlation*: a linearly modulated signal with excess bandwidth
+  (α > 0) has correlated spectral components exactly `Rs` apart, so
+  `C(ν) = Σ_f X(f)·conj(X(f−ν))` peaks at `ν = Rs`. Finally polished by
+  maximising a timing-error metric over candidate rates.
+- **Roll-off**, as occupied bandwidth / Rs − 1, snapped to the legal S2/S2X set
+  {0.35, 0.25, 0.20, 0.15, 0.10, 0.05}.
+- **Constellation order**, from the amplitude histogram: counting rings
+  separates QPSK / 8PSK / 16APSK / 32APSK without decoding anything.
+
+**Identified with certainty:**
+- **DVB-S2 / S2X.** Run [`PlHeaderCorrelator`]: a PLHEADER correlation peak
+  repeating at exactly the spacing the decoded PLS code predicts is a very
+  strong signature — a 90-symbol known pattern recurring on a predicted grid.
+  That also yields the MODCOD, FECFRAME length, pilots, and whether the frame
+  is a dummy. S2X-only features (VL-SNR header, superframing) separate S2X
+  from S2.
+
+**Reported as a guess, labelled as one:**
+- Anything with no PLHEADER. QPSK with no PLHEADER peak is *consistent with*
+  DVB-S, but confirming it needs Viterbi plus the 204-byte RS frame sync, which
+  DecDVB does not implement; the UI will say "QPSK, no DVB-S2 PLHEADER —
+  possibly DVB-S" and not pretend otherwise.
+- Unrecognised signals get their measured parameters and an explicit "does not
+  match DVB-S2/S2X", which is honest and still useful.
+- A CW tone or an empty band is called out from the band estimate alone (very
+  narrow with a high peak-to-floor, or nothing above the floor).
+
 ## 4. Workspace layout
 
 Cargo workspace `decdvb`, modelled on DecDRM.
@@ -116,7 +191,8 @@ After BBFRAMEs exist, GS-mode payload is GSE. Implement:
 ## 9. Milestones
 
 - **M0 — skeleton**: workspace builds; core types + MODCOD/FECFRAME tables; config; IQ-file + HackRF source; CLI prints samples; GUI shows raw IQ constellation + spectrum. CI green. *(local git; create public repo at end of M0/M1.)*
-- **M1 — acquisition & PL**: RRC + timing (Gardner) + carrier recovery; SOF/PLS correlation; PLHEADER decode (MODCOD, FECFRAME, pilots); PL descramble; pilot phase tracking. Output: locks on a signal, prints MODCOD per frame, clean constellation.
+- **M1 — acquisition & PL**: RRC + timing (Gardner) + carrier recovery; SOF/PLS correlation; PLHEADER decode (MODCOD, FECFRAME, pilots); PL descramble; pilot phase tracking. Output: locks on a signal, prints MODCOD per frame, clean constellation. *(PLHEADER, correlator and scrambler done.)*
+- **M1b — wideband + VFOs + Identify** *(added 2026-10-08, see §3a/§3b)*: DDC (NCO mix + decimating filter) and AGC; engine restructured into a wideband front end feeding N VFO worker threads behind a `Decoder` trait; carrier detection across the span; the **Identify** decoder (symbol rate, roll-off, constellation order, DVB-S2/S2X identification); an S2 PLFRAME generator in `synth` so all of it can be tested on realistic signals; GUI rebuilt around a big spectrum + waterfall with draggable VFOs and a side bar; live HackRF. Needs no FEC, so it lands first and is usable on its own as a carrier survey tool.
 - **M2 — FEC core**: demap→LLR + LDPC + BCH for the common MODCODs (QPSK/8PSK, normal+short); BBHEADER + CRC-8; emit valid BBFRAMEs. Verified vs reference vectors.
 - **M3 — full MODCOD coverage**: 16/32/64/128/256APSK, all S2 + S2X rates, medium frame, VL-SNR + pi/2-BPSK.
 - **M4 — GSE → IP → PCAP + TS**: standard + proprietary GSE variants, reassembly, PCAP + live stats; TS-mode extraction. (Headline.)

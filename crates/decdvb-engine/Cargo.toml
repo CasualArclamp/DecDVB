@@ -20,3 +20,7 @@ num-complex.workspace = true
 rustfft.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# Test signals: real DVB-S2 PLFRAMEs, pulse-shaped.
+decdvb-mod = { path = "../decdvb-mod" }
