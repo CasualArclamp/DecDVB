@@ -562,6 +562,7 @@ name = "decdvb-frame"
 version = "0.0.0"
 dependencies = [
  "decdvb-core",
+ "num-complex",
  "thiserror 2.0.21",
 ]
 

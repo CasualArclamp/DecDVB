@@ -1,3 +1,17 @@
-//! PL framing: PLHEADER/PLS, pilots, scrambler, BBFRAME/BBHEADER, superframe
+//! Physical-layer framing for DVB-S2/S2X.
 //!
-//! Stub crate (scaffolding). Implemented from milestone M1 onward; see docs/DESIGN.md.
+//! M1 covers the PLHEADER: the 26-symbol SOF, the 64-symbol PLS code and the
+//! pi/2-BPSK mapping both are carried in, plus the PLFRAME geometry (slots,
+//! pilot blocks) that the PLS code implies. BBFRAME/BBHEADER parsing and
+//! superframing follow in M2 and M5 — see `docs/DESIGN.md`.
+
+pub mod defs;
+pub mod pi2bpsk;
+pub mod plsc;
+pub mod rm;
+pub mod sync;
+
+pub use defs::*;
+pub use plsc::{PlsInfo, PlscDecoder, PlscDemap, PlscEncoder};
+pub use rm::ReedMuller;
+pub use sync::PlHeaderCorrelator;

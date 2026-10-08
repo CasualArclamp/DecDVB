@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "decdvb-mod"
 description = "Modulator (TX): BBFRAME to IQ for loopback and ACM test signals"
 version.workspace = true

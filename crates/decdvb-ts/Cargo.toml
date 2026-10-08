@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "decdvb-ts"
 description = "TS-mode BBFRAME to MPEG-TS extraction"
 version.workspace = true

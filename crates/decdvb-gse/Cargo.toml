@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "decdvb-gse"
 description = "GSE de-encapsulation and reassembly to IP (standard + proprietary variants)"
 version.workspace = true

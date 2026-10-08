@@ -28,12 +28,40 @@ Workspace builds clean, tests and clippy green.
 Verified by hand: `synth` then `analyse` recovers the carrier offset and symbol
 rate of signals at 125 kS/s–1 MS/s with roll-offs 0.05–0.35.
 
-## M1 — acquisition and PL sync (next)
+## M1 — acquisition and PL sync (in progress)
+
+### Done: the PLHEADER (`decdvb-frame`)
+
+The 90-symbol PLHEADER is fully implemented and tested — this is the part that
+makes ACM possible at all, since every PLFRAME announces its own MODCOD.
+
+- `defs` — PLFRAME geometry (SOF 26, PLSC 64, slot 90, pilot block 36 every
+  16 slots), the SOF pattern and the PLS scrambler.
+- `pi2bpsk` — pi/2-BPSK map, coherent hard/soft demap, and **differential**
+  demap for use before carrier lock.
+- `rm` — the interleaved **(64, 7, 32) Reed–Muller** code the PLS code is
+  protected by, with hard (Hamming) and soft (max-inner-product) decoding. The
+  soft path folds descrambling into the codeword table. Tests confirm minimum
+  distance 32 and correction of any 15-bit error pattern.
+- `plsc` — `PlsInfo`: MODCOD, FECFRAME length, pilots, and the frame geometry
+  they imply (slots, pilot blocks, XFECFRAME and PLFRAME lengths). A test
+  checks `slots × 90 × bits_per_symbol` equals the FECFRAME length for all 28
+  MODCODs in both frame lengths, so the geometry cannot silently drift.
+- `sync` — `PlHeaderCorrelator`, differential correlation against SOF (25 taps)
+  plus PLSC (32 taps). The PLSC taps come from the **scrambler alone**: the
+  interleaved Reed–Muller construction makes each consecutive codeword bit pair
+  either equal or opposite, so the pairwise differential is fixed up to a 180°
+  flip that `max(|SOF+PLSC|, |SOF-PLSC|)` resolves. So the correlator finds a
+  PLHEADER without knowing its PLS code, and — being differential — works at
+  frequency offsets up to at least 1 % of the symbol rate. Verified: correct
+  peak position for all 32 MODCODs, under noise, and under offset.
+
+### Still to do
 
 1. Live HackRF source (`libloading` over `libhackrf`), cs8 at up to ~20 MS/s.
 2. Fractional resampler, AGC, DC/IQ-imbalance correction.
 3. Gardner timing recovery; coarse (FFT) + fine (PLL) carrier recovery.
-4. SOF correlation (25 symbols) and PLS decode — the 64-bit PLS code is a
-   **Reed–Muller** code; see Appendix A for where to read.
+4. The lock state machine: searching → found → locked, predicting the next SOF
+   from `PlsInfo::plframe_len`.
 5. PL descrambling (gold code), pilot-aided phase tracking.
 6. Output: holds lock on a real signal and prints the MODCOD of every PLFRAME.

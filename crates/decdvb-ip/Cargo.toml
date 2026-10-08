@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "decdvb-ip"
 description = "IP parsing, PCAP writer, stream stats, blind IP search"
 version.workspace = true
