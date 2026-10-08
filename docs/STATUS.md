@@ -560,3 +560,20 @@ the 46 × 64 block, the Hamming polynomial (x⁶ + x + 1 is assumed only for
 the tests), the (2,3,9,12) descrambler with preset 475h and where it runs
 — is in IESS-315 (or could be found from a real carrier with the parity
 checks as the judge). Waiting on Rory for the spec or a capture.
+
+## RCV-20x modes, part 3 — QAM in the generic decoder (2026-10-09)
+
+8QAM, 16QAM and 64QAM join BPSK…32APSK in "Generic PSK → symbols", labelled
+as the RCV-20x manual's Figures 3.2/3.3 label its hard decisions (16QAM is
+natural binary per axis there; 64QAM Gray). Identify reads rings, not
+grids, so a QAM carrier is named in the VFO's modulation setting.
+
+Decision-directed carrier recovery false-locked 16QAM 27° off (MER 11 dB):
+the generic demodulator now normalises symbol power itself (the AGC levels
+samples, not symbols), acquires multi-ring constellations on the outer ring
+alone (the reduced-constellation algorithm), and takes full decisions only
+above 0.7 coherence (back below 0.4); a false lock still scores ~0.45, so
+multi-ring "locked" needs 0.6. 16QAM: MER 34 dB on a clean carrier.
+
+Left out: OS8QAM, the RCV's 8APSK and 32QAM (ring ratios / geometry not in
+the figures), OQPSK and pi/4-DQPSK (they need demodulator changes).

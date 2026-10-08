@@ -26,6 +26,10 @@ pub enum Modulation {
     Apsk64,
     Apsk128,
     Apsk256,
+    /// Square-ish QAMs of SCPC modems (not DVB-S2): for the generic decoder.
+    Qam8,
+    Qam16,
+    Qam64,
 }
 
 impl Modulation {
@@ -40,6 +44,9 @@ impl Modulation {
             Modulation::Apsk64 => 6,
             Modulation::Apsk128 => 7,
             Modulation::Apsk256 => 8,
+            Modulation::Qam8 => 3,
+            Modulation::Qam16 => 4,
+            Modulation::Qam64 => 6,
         }
     }
 
@@ -55,6 +62,9 @@ impl Modulation {
             Modulation::Apsk64 => "64APSK",
             Modulation::Apsk128 => "128APSK",
             Modulation::Apsk256 => "256APSK",
+            Modulation::Qam8 => "8QAM",
+            Modulation::Qam16 => "16QAM",
+            Modulation::Qam64 => "64QAM",
         }
     }
 }

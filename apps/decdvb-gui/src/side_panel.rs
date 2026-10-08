@@ -16,12 +16,15 @@ use crate::format;
 use crate::player::{self, Player};
 
 /// Constellations the generic PSK decoder can be told to use.
-const PSK_CHOICES: [Modulation; 5] = [
+const PSK_CHOICES: [Modulation; 8] = [
     Modulation::Bpsk,
     Modulation::Qpsk,
     Modulation::Psk8,
     Modulation::Apsk16,
     Modulation::Apsk32,
+    Modulation::Qam8,
+    Modulation::Qam16,
+    Modulation::Qam64,
 ];
 
 pub struct SideInput<'a> {

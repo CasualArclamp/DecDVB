@@ -34,6 +34,18 @@ pub struct PskDemod {
     symbols: u64,
     mer: f32,
     coherence: f32,
+    /// Mean symbol power, tracked: the AGC levels samples, not symbols, and
+    /// QAM and APSK decisions need the symbols at the constellation's scale.
+    power: Option<f32>,
+    /// The outermost ring's points, and the radius beyond which a symbol is
+    /// taken to be on it: until lock, a multi-ring constellation steers on
+    /// those alone (the reduced-constellation algorithm) — full decisions
+    /// on 16QAM can settle 26.6° off, where its inner and middle points
+    /// trade places.
+    outer: Vec<Iq>,
+    outer_from: f32,
+    /// Steering on full decisions (after the outer ring has locked).
+    full: bool,
 }
 
 impl PskDemod {
@@ -54,7 +66,29 @@ impl PskDemod {
             symbols: 0,
             mer: 0.0,
             coherence: 0.0,
+            power: None,
+            outer: Vec::new(),
+            outer_from: f32::INFINITY,
+            full: false,
         }
+        .with_outer_ring()
+    }
+
+    fn with_outer_ring(mut self) -> Self {
+        let mut radii: Vec<f32> = self.cst.points.iter().map(|p| p.norm()).collect();
+        radii.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        radii.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+        if radii.len() > 1 {
+            self.outer_from = 0.5 * (radii[0] + radii[1]);
+            self.outer = self
+                .cst
+                .points
+                .iter()
+                .copied()
+                .filter(|p| p.norm() > self.outer_from)
+                .collect();
+        }
+        self
     }
 
     pub fn modulation(&self) -> Modulation {
@@ -70,8 +104,21 @@ impl PskDemod {
         self.sync.process(&self.filtered, &mut self.raw);
 
         let start = out.len();
+        if self.power.is_none() && !self.raw.is_empty() {
+            let p = self.raw.iter().map(|s| s.norm_sqr()).sum::<f32>() / self.raw.len() as f32;
+            self.power = Some(p.max(1e-12));
+        }
         for &s in &self.raw {
-            let y = self.pll.step(s, &self.cst.points);
+            let p = self.power.get_or_insert(1.0);
+            *p += 0.0005 * (s.norm_sqr() - *p);
+            let s = s / p.sqrt().max(1e-6);
+            let y = if self.outer.is_empty() || self.full {
+                self.pll.step(s, &self.cst.points)
+            } else if s.norm() > self.outer_from {
+                self.pll.step(s, &self.outer)
+            } else {
+                self.pll.coast(s)
+            };
             out.push((self.cst.nearest(y) as u8, y));
             if self.recent.len() == RECENT {
                 self.recent.pop_front();
@@ -86,6 +133,13 @@ impl PskDemod {
             // Smooth over blocks so the readout does not flicker.
             self.mer += 0.3 * (mer - self.mer);
             self.coherence += 0.3 * (coh - self.coherence);
+            // Full decisions only once truly locked — a 16QAM false lock
+            // still scores ~0.45 — and back to the outer ring if it fades.
+            if !self.full && self.coherence > 0.7 {
+                self.full = true;
+            } else if self.full && self.coherence < 0.4 {
+                self.full = false;
+            }
         }
     }
 
@@ -106,7 +160,14 @@ impl PskDemod {
     }
 
     pub fn locked(&self) -> bool {
-        self.coherence > decdvb_dsp::LOCK_COHERENCE
+        // A multi-ring constellation's false locks score well above what
+        // a single ring's lock needs: ask more of it.
+        let need = if self.outer.is_empty() {
+            decdvb_dsp::LOCK_COHERENCE
+        } else {
+            0.6
+        };
+        self.coherence > need
     }
 
     /// Symbol rate as the timing loop tracks it.
@@ -124,6 +185,46 @@ impl PskDemod {
 mod tests {
     use super::*;
     use decdvb_mod::Shaper;
+
+    #[test]
+    fn locks_16qam_without_false_lock() {
+        // Full decisions on 16QAM settled 27° off (MER 11 dB); acquiring on
+        // the corners alone does not.
+        let cst = Constellation::qam16();
+        let mut s = 0x1234u64;
+        let mut next = move || {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            s.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        let syms: Vec<Iq> = (0..40_000)
+            .map(|_| cst.map((next() >> 60) as usize))
+            .collect();
+        let mut sh = Shaper::new(4, 0.25, 16);
+        let mut x = Vec::new();
+        sh.process(&syms, &mut x);
+        for (off, seed) in [(0.0, 0.0), (0.004, 0.0036)] {
+            let xx: Vec<Iq> = x
+                .iter()
+                .enumerate()
+                .map(|(n, &v)| {
+                    let ph = std::f64::consts::TAU * off * n as f64 / 4.0 + 1.1;
+                    v * Iq::new(ph.cos() as f32, ph.sin() as f32)
+                })
+                .collect();
+            let mut d = PskDemod::new(4.0, 1.0, 0.25, Modulation::Qam16, seed);
+            let mut out = Vec::new();
+            for c in xx.chunks(9_999) {
+                d.process(c, &mut out);
+            }
+            assert!(
+                d.locked() && d.mer_db() > 25.0,
+                "offset {off}: MER {}",
+                d.mer_db()
+            );
+        }
+    }
 
     #[test]
     fn recovers_8psk_symbols_through_offset_and_noise() {

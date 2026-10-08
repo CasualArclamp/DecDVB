@@ -391,8 +391,68 @@ impl Constellation {
             Modulation::Psk8 => Self::psk8(),
             Modulation::Apsk16 => Self::apsk16(2.75),
             Modulation::Apsk32 => Self::apsk32(2.72, 4.87),
+            Modulation::Qam8 => Self::qam8(),
+            Modulation::Qam16 => Self::qam16(),
+            Modulation::Qam64 => Self::qam64(),
             _ => Self::qpsk(),
         }
+    }
+
+    /// 8QAM: half of a 4×4 grid, labelled as the CTCOM RCV-20x manual's
+    /// Figure 3.2 shows it (the labels its hard decisions use).
+    pub fn qam8() -> Self {
+        // (label, x, y) on the ±1, ±3 grid.
+        const P: [(usize, f32, f32); 8] = [
+            (0b000, 3.0, 3.0),
+            (0b001, 3.0, -1.0),
+            (0b010, -1.0, 3.0),
+            (0b011, 1.0, 1.0),
+            (0b100, -3.0, -3.0),
+            (0b101, 1.0, -3.0),
+            (0b110, -3.0, 1.0),
+            (0b111, -1.0, -1.0),
+        ];
+        let mut points = vec![Iq::new(0.0, 0.0); 8];
+        for (l, x, y) in P {
+            points[l] = Iq::new(x, y);
+        }
+        Self::normalised(Modulation::Qam8, points)
+    }
+
+    /// 16QAM, labelled as the RCV-20x manual's Figure 3.2: per axis natural
+    /// binary, not Gray — the bits are (x < 0, y < 0, x's low bit, y's low
+    /// bit) with x and y counted from the right and from the top.
+    pub fn qam16() -> Self {
+        let lv = [3.0f32, 1.0, -1.0, -3.0];
+        let mut points = vec![Iq::new(0.0, 0.0); 16];
+        for (xi, &x) in lv.iter().enumerate() {
+            for (yi, &y) in lv.iter().enumerate() {
+                let label = ((xi >> 1) << 3) | ((yi >> 1) << 2) | ((xi & 1) << 1) | (yi & 1);
+                points[label] = Iq::new(x, y);
+            }
+        }
+        Self::normalised(Modulation::Qam16, points)
+    }
+
+    /// 64QAM, labelled as the RCV-20x manual's Figure 3.3: Gray per axis,
+    /// bits (y < 0, x < 0, |y| < 4, |x| < 4, |y| ∈ {3, 5}, |x| ∈ {3, 5}).
+    pub fn qam64() -> Self {
+        let mut points = vec![Iq::new(0.0, 0.0); 64];
+        for xi in 0..8 {
+            for yi in 0..8 {
+                let x = -7.0 + 2.0 * xi as f32;
+                let y = -7.0 + 2.0 * yi as f32;
+                let b = |c: bool| c as usize;
+                let label = b(y < 0.0) << 5
+                    | b(x < 0.0) << 4
+                    | b(y.abs() < 4.0) << 3
+                    | b(x.abs() < 4.0) << 2
+                    | b(y.abs() == 3.0 || y.abs() == 5.0) << 1
+                    | b(x.abs() == 3.0 || x.abs() == 5.0);
+                points[label] = Iq::new(x, y);
+            }
+        }
+        Self::normalised(Modulation::Qam64, points)
     }
 
     /// Bits per symbol.
@@ -516,6 +576,36 @@ mod tests {
             for i in 0..c.points.len() {
                 assert_eq!(c.nearest(c.map(i)), i, "{:?}", c.modulation);
             }
+        }
+    }
+
+    #[test]
+    fn qam_labels_follow_the_rcv_20x_figures() {
+        // Figure 3.2 corners and Figure 3.3 spot checks.
+        let q = Constellation::qam16();
+        let k = q.points[0b0000].re / 3.0; // the scale
+        let at = |x: f32, y: f32| q.nearest(Iq::new(x * k, y * k));
+        assert_eq!(at(3.0, 3.0), 0b0000);
+        assert_eq!(at(-3.0, 3.0), 0b1010);
+        assert_eq!(at(-1.0, -3.0), 0b1101);
+        assert_eq!(at(1.0, -1.0), 0b0110);
+        let q = Constellation::qam64();
+        let k = q.points[0b000000].re / 7.0;
+        let at = |x: f32, y: f32| q.nearest(Iq::new(x * k, y * k));
+        assert_eq!(at(-1.0, 7.0), 0b010100);
+        assert_eq!(at(5.0, -3.0), 0b101011);
+        assert_eq!(at(-7.0, -7.0), 0b110000);
+        let q = Constellation::qam8();
+        let k = q.points[0b000].re / 3.0;
+        assert_eq!(q.nearest(Iq::new(-k, -k)), 0b111);
+        for c in [
+            Constellation::qam8(),
+            Constellation::qam16(),
+            Constellation::qam64(),
+        ] {
+            let p: f32 = c.points.iter().map(|p| p.norm_sqr()).sum::<f32>() / c.points.len() as f32;
+            assert!((p - 1.0).abs() < 1e-5);
+            assert_eq!(c.points.len(), 1 << c.bits());
         }
     }
 

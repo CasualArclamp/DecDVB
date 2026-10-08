@@ -1263,6 +1263,29 @@ mod tests {
     }
 
     #[test]
+    fn psk_vfo_locks_16qam_when_told() {
+        // Identify reads rings, not grids: a QAM carrier is named by the
+        // user, as the RCV-20x's demodulator modes are.
+        let rs = 62_500.0;
+        let x = carrier(&Constellation::qam16(), 200_000, 8, rs, 40_310.0, 0.0, 9);
+        let mut settings = VfoSettings::new("QAM", 38_000.0, 110_000.0, DecoderKind::PskSymbols);
+        settings.psk_modulation = Some(decdvb_core::Modulation::Qam16);
+        let status = Arc::new(Mutex::new(VfoStatus::default()));
+        let mut wk = Worker::new(
+            500_000.0,
+            settings,
+            status.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        feed(&mut wk, &x, 65_536);
+        drop(wk);
+        let st = status.lock().unwrap().clone();
+        let c = st.carrier.expect("demodulator running");
+        assert_eq!(c.modulation, decdvb_core::Modulation::Qam16);
+        assert!(c.locked && c.mer_db > 20.0, "{}", st.message);
+    }
+
+    #[test]
     fn psk_vfo_locks_and_writes_one_byte_per_symbol() {
         // 8PSK at 62.5 kBd, 40 kHz off the band centre plus 310 Hz the VFO is
         // not told about, in a 500 kS/s band.

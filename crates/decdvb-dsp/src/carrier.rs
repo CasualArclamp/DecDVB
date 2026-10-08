@@ -151,6 +151,14 @@ impl CarrierPll {
         y
     }
 
+    /// De-rotate `x` and advance, without steering (a symbol not trusted to
+    /// say anything about the phase).
+    pub fn coast(&mut self, x: Iq) -> Iq {
+        let y = self.rotate(x);
+        self.update(0.0);
+        y
+    }
+
     /// De-rotate `x`, steer on a known `reference` symbol (data-aided).
     pub fn step_known(&mut self, x: Iq, reference: Iq) -> Iq {
         let y = self.rotate(x);
