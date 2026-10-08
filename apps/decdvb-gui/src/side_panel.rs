@@ -226,6 +226,25 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                         }
                     });
                 ui.end_row();
+
+                // Symbols go to a file only while this is on; until then the
+                // decoder just shows the locked constellation.
+                ui.label("Symbols");
+                ui.horizontal(|ui| {
+                    let (label, tip) = if s.record {
+                        ("⏹ Stop", "Close the .bin file")
+                    } else {
+                        ("● Record", "Write the hard-decided symbols to a .bin file, one byte each")
+                    };
+                    let b = egui::Button::new(label).selected(s.record);
+                    if ui.add(b).on_hover_text(tip).clicked() {
+                        s.record = !s.record;
+                    }
+                    if s.record && !st.recording_active {
+                        ui.label(RichText::new("starts once locked").weak().small());
+                    }
+                });
+                ui.end_row();
             }
 
             if matches!(
@@ -351,8 +370,13 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                 ui.end_row();
             }
             if let Some((_, n)) = &st.recording {
-                ui.label("Symbols");
-                ui.label(format!("{n} written ({:.1} MB)", *n as f64 / 1e6));
+                ui.label("Written");
+                let txt = format!("{n} symbols ({:.1} MB)", *n as f64 / 1e6);
+                if st.recording_active {
+                    ui.colored_label(Color32::from_rgb(230, 90, 90), format!("● {txt}"));
+                } else {
+                    ui.label(format!("{txt}, stopped"));
+                }
                 ui.end_row();
             }
         });
@@ -370,10 +394,10 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
     }
     if let Some((path, _)) = &st.recording {
         ui.add_space(4.0);
-        let what = if v.settings.decoder == DecoderKind::PskSymbols {
-            "Symbols to"
-        } else {
-            "Recording to"
+        let what = match (v.settings.decoder, st.recording_active) {
+            (DecoderKind::PskSymbols, true) => "Symbols to",
+            (DecoderKind::PskSymbols, false) => "Last file:",
+            _ => "Recording to",
         };
         ui.label(RichText::new(format!("{what} {}", path.display())).small());
     }

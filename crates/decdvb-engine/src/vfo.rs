@@ -92,6 +92,9 @@ pub struct VfoSettings {
     pub gold_code: u32,
     /// Generic PSK: the constellation to decide on; `None` takes Identify's.
     pub psk_modulation: Option<decdvb_core::Modulation>,
+    /// Generic PSK: write symbols to a file. Off by default — the decoder
+    /// shows the locked constellation until recording is asked for.
+    pub record: bool,
     /// Where the IQ recorder and the symbol writer write.
     pub record_dir: PathBuf,
 }
@@ -112,6 +115,7 @@ impl VfoSettings {
             symbol_rate: None,
             gold_code: 0,
             psk_modulation: None,
+            record: false,
             record_dir: std::env::temp_dir(),
         }
     }
@@ -147,6 +151,8 @@ pub struct VfoStatus {
     /// File being written and its size so far: bytes of IQ for the recorder,
     /// symbols (one byte each) for the generic PSK decoder.
     pub recording: Option<(PathBuf, u64)>,
+    /// `recording` is being written now (not just the last file).
+    pub recording_active: bool,
     /// Carrier loop of a running demodulator.
     pub carrier: Option<CarrierState>,
 }
@@ -286,9 +292,15 @@ enum Decoder {
     Psk {
         buf: Vec<Iq>,
         demod: Option<Box<PskDemod>>,
+        /// Open while recording.
         writer: Option<BufWriter<File>>,
+        /// The current or last file, and the symbols in it.
         path: Option<PathBuf>,
         written: u64,
+        /// Opening the file failed; shown until recording is turned off.
+        open_failed: bool,
+        /// The carrier's offset in the band, for file names.
+        carrier_hz: f64,
     },
 }
 
@@ -377,6 +389,8 @@ impl Worker {
                 writer: None,
                 path: None,
                 written: 0,
+                open_failed: false,
+                carrier_hz: s.offset_hz,
             },
         }
     }
@@ -561,10 +575,19 @@ impl Worker {
                 writer,
                 path,
                 written,
+                open_failed,
+                carrier_hz,
             } => match demod {
                 Some(d) => {
                     self.syms.clear();
                     d.process(&self.bb, &mut self.syms);
+                    let file = PskFile {
+                        writer,
+                        path,
+                        written,
+                        open_failed,
+                    };
+                    file.follow(&self.settings, d, *carrier_hz);
                     write_symbols(writer, written, &self.syms, &mut self.sym_bytes);
                 }
                 None => {
@@ -590,20 +613,18 @@ impl Worker {
                             self.ddc
                                 .set_offset(self.settings.offset_hz + id.center_offset_hz);
 
-                            let p = self.settings.record_dir.join(format!(
-                                "decdvb-{}-{:+.0}Hz-{:.0}Bd-{}-{}.bin",
-                                self.settings.name.replace(' ', "_"),
-                                self.settings.offset_hz + id.center_offset_hz,
-                                rs,
-                                d.modulation().name().replace('/', ""),
-                                unix_stamp()
-                            ));
-                            let _ = std::fs::create_dir_all(&self.settings.record_dir);
-                            *writer = File::create(&p).ok().map(BufWriter::new);
-                            *path = Some(p);
+                            *carrier_hz = self.settings.offset_hz + id.center_offset_hz;
 
                             self.syms.clear();
                             d.process(&shifted, &mut self.syms);
+                            // Recording armed before lock starts at once.
+                            let file = PskFile {
+                                writer,
+                                path,
+                                written,
+                                open_failed,
+                            };
+                            file.follow(&self.settings, &d, *carrier_hz);
                             write_symbols(writer, written, &self.syms, &mut self.sym_bytes);
                             *demod = Some(d);
                         } else {
@@ -647,6 +668,7 @@ impl Worker {
         st.progress = 0.0;
         st.lock = None;
         st.recording = None;
+        st.recording_active = false;
         st.carrier = None;
 
         match &self.decoder {
@@ -695,6 +717,7 @@ impl Worker {
                 bytes,
             } => {
                 st.recording = Some((path.clone(), *bytes));
+                st.recording_active = writer.is_some();
                 st.message = if writer.is_some() {
                     format!("recording {:.1} MB", *bytes as f64 / 1e6)
                 } else {
@@ -748,6 +771,8 @@ impl Worker {
                 writer,
                 path,
                 written,
+                open_failed,
+                ..
             } => match demod {
                 None => {
                     st.progress = buf.len() as f32 / first_look(out_rate) as f32;
@@ -771,18 +796,59 @@ impl Worker {
                     if let Some(p) = path {
                         st.recording = Some((p.clone(), *written));
                     }
-                    let lock = if d.locked() { "locked" } else { "not locked" };
-                    st.message = match (writer.is_some(), path) {
-                        (false, Some(p)) => format!("{lock} — cannot write {}", p.display()),
-                        _ => format!(
-                            "{} {lock}, MER {:.1} dB — {} symbols written",
-                            d.modulation().name(),
-                            d.mer_db(),
-                            written
-                        ),
+                    st.recording_active = writer.is_some();
+                    let lock = format!(
+                        "{} {}, MER {:.1} dB",
+                        d.modulation().name(),
+                        if d.locked() { "locked" } else { "not locked" },
+                        d.mer_db()
+                    );
+                    st.message = match (writer.is_some(), *open_failed, path) {
+                        (_, true, Some(p)) => format!("{lock} — cannot write {}", p.display()),
+                        (true, _, _) => format!("{lock} — recording, {written} symbols"),
+                        _ => format!("{lock} — press Record to write symbols"),
                     };
                 }
             },
+        }
+    }
+}
+
+/// The generic PSK decoder's output file, borrowed from its decoder state.
+struct PskFile<'a> {
+    writer: &'a mut Option<BufWriter<File>>,
+    path: &'a mut Option<PathBuf>,
+    written: &'a mut u64,
+    open_failed: &'a mut bool,
+}
+
+impl PskFile<'_> {
+    /// Open or close the file to match `settings.record`. A new recording is
+    /// a new file; stopping keeps the last path and count for display.
+    fn follow(self, settings: &VfoSettings, d: &PskDemod, carrier_hz: f64) {
+        match (settings.record, self.writer.is_some()) {
+            (true, false) if !*self.open_failed => {
+                let p = settings.record_dir.join(format!(
+                    "decdvb-{}-{:+.0}Hz-{:.0}Bd-{}-{}.bin",
+                    settings.name.replace(' ', "_"),
+                    carrier_hz,
+                    d.symbol_rate(),
+                    d.modulation().name().replace('/', ""),
+                    unix_stamp()
+                ));
+                let _ = std::fs::create_dir_all(&settings.record_dir);
+                *self.writer = File::create(&p).ok().map(BufWriter::new);
+                *self.open_failed = self.writer.is_none();
+                *self.written = 0;
+                *self.path = Some(p);
+            }
+            (false, true) => {
+                if let Some(mut w) = self.writer.take() {
+                    let _ = w.flush();
+                }
+            }
+            (false, false) => *self.open_failed = false,
+            _ => {}
         }
     }
 }
@@ -894,6 +960,7 @@ mod tests {
         let mut settings =
             VfoSettings::new("PSK test", offset_hz, bandwidth_hz, DecoderKind::PskSymbols);
         settings.record_dir = dir.clone();
+        settings.record = true;
         let status = Arc::new(Mutex::new(VfoStatus::default()));
         let mut wk = Worker::new(rate, settings, status.clone(), Arc::new(AtomicU64::new(0)));
         feed(&mut wk, x, 65_536);
@@ -928,6 +995,51 @@ mod tests {
         assert_eq!(bytes.len() as u64, written);
         assert!(bytes.iter().all(|&b| b < 8));
         assert!(path.to_string_lossy().ends_with(".bin"));
+    }
+
+    #[test]
+    fn psk_vfo_writes_nothing_until_record_is_pressed() {
+        let rs = 62_500.0;
+        let x = carrier(&Constellation::qpsk(), 150_000, 8, rs, 40_000.0, 0.0, 11);
+        let dir = std::env::temp_dir().join(format!("decdvb-psk-arm-{}", std::process::id()));
+        let mut settings =
+            VfoSettings::new("PSK arm", 40_000.0, 110_000.0, DecoderKind::PskSymbols);
+        settings.record_dir = dir.clone();
+        let status = Arc::new(Mutex::new(VfoStatus::default()));
+        let mut wk = Worker::new(500_000.0, settings.clone(), status.clone(), Arc::new(AtomicU64::new(0)));
+        let third = x.len() / 3;
+
+        // Locked and showing symbols, but no file.
+        feed(&mut wk, &x[..third], 65_536);
+        {
+            let st = status.lock().unwrap();
+            assert!(st.carrier.is_some_and(|c| c.locked), "{}", st.message);
+            assert!(!st.scatter.is_empty());
+            assert!(st.recording.is_none() && !st.recording_active);
+        }
+        assert!(!dir.exists(), "a file was written before Record");
+
+        // Record: a file grows, without restarting the demodulator.
+        settings.record = true;
+        wk.apply(settings.clone());
+        feed(&mut wk, &x[third..2 * third], 65_536);
+        let (path, n) = {
+            let st = status.lock().unwrap();
+            assert!(st.recording_active, "{}", st.message);
+            st.recording.clone().unwrap()
+        };
+        assert!(n > 10_000, "only {n} symbols");
+
+        // Stop: the file is closed; the last one stays on show.
+        settings.record = false;
+        wk.apply(settings);
+        feed(&mut wk, &x[2 * third..], 65_536);
+        let st = status.lock().unwrap().clone();
+        assert!(!st.recording_active);
+        assert_eq!(st.recording, Some((path.clone(), n)));
+        let len = std::fs::metadata(&path).unwrap().len();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(len, n);
     }
 
     #[test]

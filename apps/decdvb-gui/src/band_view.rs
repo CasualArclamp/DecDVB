@@ -146,7 +146,8 @@ pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
             Some(c) => {
                 let lock = if c.locked { "LOCK" } else { "no lock" };
                 let rs = st.symbol_rate.map(format::rate).unwrap_or_default();
-                format!("{} {lock} {rs}", c.modulation.name())
+                let rec = if st.recording_active { " ● REC" } else { "" };
+                format!("{} {lock} {rs}{rec}", c.modulation.name())
             }
             None => format!("acq {:.0} %", st.progress * 100.0),
         },
