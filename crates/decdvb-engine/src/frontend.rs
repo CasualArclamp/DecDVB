@@ -33,6 +33,9 @@ pub struct EngineOptions {
     pub loop_file: bool,
     /// How far above the floor a carrier must stand to be detected, dB.
     pub carrier_snr_db: f32,
+    /// Subtract the IQ mean before everything else: the spike a
+    /// direct-conversion receiver (the HackRF) leaves at the centre.
+    pub dc_removal: bool,
 }
 
 impl Default for EngineOptions {
@@ -43,6 +46,7 @@ impl Default for EngineOptions {
             realtime: true,
             loop_file: true,
             carrier_snr_db: 6.0,
+            dc_removal: true,
         }
     }
 }
@@ -92,6 +96,7 @@ struct Shared {
 
 enum Cmd {
     Pause(bool),
+    DcRemoval(bool),
     Stop,
 }
 
@@ -159,6 +164,11 @@ impl Engine {
 
     pub fn set_paused(&self, paused: bool) {
         let _ = self.cmd.send(Cmd::Pause(paused));
+    }
+
+    /// Turn DC-spike removal on or off without restarting the source.
+    pub fn set_dc_removal(&self, on: bool) {
+        let _ = self.cmd.send(Cmd::DcRemoval(on));
     }
 
     /// Add a VFO; it starts at once.
@@ -241,6 +251,8 @@ fn run(mut source: Box<dyn IqSource>, opts: EngineOptions, shared: Arc<Shared>, 
     let mut clock = Instant::now();
     let mut played = 0.0f64;
     let mut last_carriers = Instant::now() - Duration::from_secs(1);
+    let mut dc_removal = opts.dc_removal;
+    let mut dc = decdvb_dsp::DcBlocker::new();
 
     let set_state = |s: SourceState| shared.front.lock().unwrap().state = s;
 
@@ -271,6 +283,10 @@ fn run(mut source: Box<dyn IqSource>, opts: EngineOptions, shared: Arc<Shared>, 
                     });
                     clock = Instant::now();
                     played = 0.0;
+                }
+                Some(Cmd::DcRemoval(on)) => {
+                    dc_removal = on;
+                    dc.reset();
                 }
                 None if paused => continue,
                 None => break,
@@ -305,7 +321,11 @@ fn run(mut source: Box<dyn IqSource>, opts: EngineOptions, shared: Arc<Shared>, 
                 }
             }
         }
-        let block: Arc<Vec<Iq>> = Arc::new(acc.drain(..block_len).collect());
+        let mut block: Vec<Iq> = acc.drain(..block_len).collect();
+        if dc_removal {
+            dc.process(&mut block);
+        }
+        let block = Arc::new(block);
         samples += block_len as u64;
 
         // Pace files to real time so the waterfall scrolls at the true rate.

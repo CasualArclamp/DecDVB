@@ -61,8 +61,8 @@ On the waterfall:
 | **✕** on a VFO's label, or **Delete** | remove it |
 
 The big readout at the top is the centre frequency, as in SDR++: wheel over a
-digit or click its upper/lower half to step it, right-click to round. With the
-HackRF running it retunes the radio.
+digit or click its upper/lower half to step it, right-click to zero that digit
+and every one below it. With the HackRF running it retunes the radio.
 
 The side bar lists the VFOs with their CPU load (✕ removes one), and shows the
 selected one's settings, its Identify result or demodulator state (lock, MER,
@@ -119,6 +119,10 @@ on `nusb`): no libhackrf, no libusb, nothing to install beyond the WinUSB driver
 the HackRF already uses on Windows (Zadig, or the official tools). DecDVB only
 ever **receives**, and keeps the antenna-port power **off** — feed an LNB from
 an external inserter.
+
+**DC removal** (toolbar, on by default) subtracts the IQ mean before the
+waterfall and the VFOs, which removes the spike the HackRF leaves at the
+centre frequency. Its notch is a few hertz wide.
 
 ## Scope
 

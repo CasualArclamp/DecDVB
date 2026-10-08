@@ -364,17 +364,21 @@ impl App {
                         .weak(),
                     );
                     ui.label(
-                        RichText::new("scroll or click a digit to tune · right-click rounds")
-                            .small()
-                            .weak(),
+                        RichText::new(
+                            "scroll or click a digit to tune · right-click zeroes from that digit",
+                        )
+                        .small()
+                        .weak(),
                     );
                     return;
                 }
                 ui.label(RichText::new("centre of the recording (labels the axis)").weak());
                 ui.label(
-                    RichText::new("scroll or click a digit to change · right-click rounds")
-                        .small()
-                        .weak(),
+                    RichText::new(
+                        "scroll or click a digit to change · right-click zeroes from that digit",
+                    )
+                    .small()
+                    .weak(),
                 );
             });
         });
@@ -489,6 +493,16 @@ impl App {
                 self.band.reset_zoom();
             }
             ui.separator();
+            if ui
+                .checkbox(&mut self.opts.dc_removal, "DC removal")
+                .on_hover_text(
+                    "Subtract the IQ mean: removes the spike a HackRF leaves at the centre frequency",
+                )
+                .changed()
+                && let Some(e) = &self.engine
+            {
+                e.set_dc_removal(self.opts.dc_removal);
+            }
             ui.checkbox(&mut self.history.auto, "auto levels");
             if !self.history.auto {
                 ui.add(

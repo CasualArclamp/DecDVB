@@ -2,7 +2,8 @@
 //!
 //! - **scroll** over a digit steps it (carrying into the next);
 //! - **click** its upper half to step up, its lower half to step down;
-//! - **right-click** a digit to zero everything to its right (a quick round).
+//! - **right-click** a digit to zero it and every digit to its right, as SDR++
+//!   does (right-click the 100 kHz digit of 12.345.678 → 12.000.000).
 //!
 //! Leading zeros are dimmed; groups of three are separated by dots.
 
@@ -36,7 +37,7 @@ pub fn show(ui: &mut Ui, hz: &mut f64, min: f64, max: f64, height: f32) -> bool 
     let hover_bg = ui.visuals().widgets.hovered.weak_bg_fill;
 
     let mut delta: i64 = 0;
-    let mut zero_below: Option<u32> = None;
+    let mut zero_from: Option<u32> = None;
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
@@ -69,7 +70,7 @@ pub fn show(ui: &mut Ui, hz: &mut f64, min: f64, max: f64, height: f32) -> bool 
                 delta += if p.y < rect.center().y { step } else { -step };
             }
             if resp.clicked_by(PointerButton::Secondary) {
-                zero_below = Some(place);
+                zero_from = Some(place);
             }
 
             let color = if i < first_significant { dim } else { text };
@@ -95,9 +96,8 @@ pub fn show(ui: &mut Ui, hz: &mut f64, min: f64, max: f64, height: f32) -> bool 
     });
 
     let mut new = value as i64 + delta;
-    if let Some(place) = zero_below {
-        let unit = 10i64.pow(place);
-        new = (new / unit) * unit;
+    if let Some(place) = zero_from {
+        new = zeroed_from(new, place);
     }
     let new = (new as f64).clamp(min, max);
     if (new - *hz).abs() >= 0.5 {
@@ -108,8 +108,24 @@ pub fn show(ui: &mut Ui, hz: &mut f64, min: f64, max: f64, height: f32) -> bool 
     }
 }
 
+/// `value` with the digit at `place` (0 = units) and all below it set to 0.
+fn zeroed_from(value: i64, place: u32) -> i64 {
+    let unit = 10i64.pow(place + 1);
+    value / unit * unit
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn right_click_zeroes_the_digit_and_everything_below() {
+        // 12.345.678: right-click the 100 kHz digit (the 3, place 5).
+        assert_eq!(super::zeroed_from(12_345_678, 5), 12_000_000);
+        // The units digit: just that one.
+        assert_eq!(super::zeroed_from(12_345_678, 0), 12_345_670);
+        // The top digit: everything.
+        assert_eq!(super::zeroed_from(12_345_678, 7), 0);
+    }
+
     #[test]
     fn digit_extraction_matches_the_value() {
         let v: u64 = 12_331_370_000;
