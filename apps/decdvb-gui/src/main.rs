@@ -13,6 +13,7 @@ mod player;
 mod prefs;
 mod radio;
 mod side_panel;
+mod ts_viewer;
 mod waterfall;
 
 use std::collections::BTreeMap;
@@ -107,6 +108,7 @@ struct App {
     new_decoder: DecoderKind,
     names: u32,
     paused: bool,
+    ts_viewer: ts_viewer::TsViewer,
     /// A player to open once its VFO's TCP server is up.
     pending_player: Option<(VfoId, player::Player, std::time::Instant)>,
     note: String,
@@ -140,6 +142,7 @@ impl Default for App {
             names: 1,
             paused: false,
             pending_player: None,
+            ts_viewer: Default::default(),
             note: String::new(),
             automation: automation::Automation::new(&automation::Options::default()),
             #[cfg(feature = "hackrf")]
@@ -314,6 +317,7 @@ impl App {
                     self.set_rf_center(self.rf_center() + d);
                 }
             }
+            Action::OpenTsViewer(id) => self.ts_viewer.open(id),
             Action::Play(id, p) => {
                 // The server starts with the VFO's next TS frame; the player
                 // is launched once it is up (see `launch_pending_player`).
@@ -699,6 +703,11 @@ impl eframe::App for App {
             }
             let n = self.automation.select.unwrap_or(1).max(1);
             self.selected = self.vfos.get(n - 1).map(|v| v.id);
+            if self.automation.ts_viewer
+                && let Some(id) = self.selected
+            {
+                self.ts_viewer.open(id);
+            }
         }
         self.launch_pending_player();
         self.automation.handle_screenshot(ctx);
@@ -765,6 +774,26 @@ impl eframe::App for App {
                 };
                 actions.extend(self.band.show(ui, &inp));
             });
+
+        // The TS analyser floats over everything, following its VFO.
+        if let Some(id) = self.ts_viewer.vfo {
+            let name = self
+                .vfos
+                .iter()
+                .find(|v| v.id == id)
+                .map(|v| v.settings.name.clone());
+            match name {
+                Some(name) => {
+                    let ts = self
+                        .statuses
+                        .get(&id)
+                        .and_then(|st| st.fec.as_ref())
+                        .and_then(|f| f.ts.as_ref());
+                    self.ts_viewer.show(ui.ctx(), &name, ts);
+                }
+                None => self.ts_viewer.vfo = None, // the VFO was deleted
+            }
+        }
 
         for a in actions {
             self.apply(a);

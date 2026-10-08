@@ -39,6 +39,8 @@ pub enum Action {
     Retune(f64),
     /// Open a media player on a VFO's TS stream (starting its TCP server).
     Play(VfoId, crate::player::Player),
+    /// Open the TS analyser window on a VFO.
+    OpenTsViewer(VfoId),
 }
 
 /// Everything the view draws from.

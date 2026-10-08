@@ -8,7 +8,6 @@ use decdvb_engine::{
     RateSource, TsView, Verdict, VfoId, VfoStatus,
 };
 use decdvb_gse::{Source, Variant};
-use decdvb_ts::stream_type_name;
 use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, Ui, vec2};
 use egui_plot::{Line, Plot, PlotPoints, Points};
 
@@ -476,7 +475,7 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                 gse_card(ui, g);
             }
             if let Some(t) = &f.ts {
-                ts_card(ui, t);
+                ts_card(ui, t, v.id, &mut actions);
             }
         }
     }
@@ -651,7 +650,7 @@ fn udp_hint(addr: &str) -> String {
 }
 
 /// The transport stream: what it carries, its health, and where it goes.
-fn ts_card(ui: &mut Ui, t: &TsView) {
+fn ts_card(ui: &mut Ui, t: &TsView, id: VfoId, actions: &mut Vec<Action>) {
     ui.add_space(6.0);
     ui.label(RichText::new("MPEG-TS").strong());
     egui::Grid::new("ts").num_columns(2).show(ui, |ui| {
@@ -719,59 +718,35 @@ fn ts_card(ui: &mut Ui, t: &TsView) {
             ui.end_row();
         }
     });
-    let scrambled = |pid: u16| t.pids.iter().any(|(p, s)| *p == pid && s.scrambled > 0);
-    if !t.programmes.is_empty() {
+    let r = &t.report;
+    let scrambled = |pid: u16| r.pids.iter().any(|p| p.pid == pid && p.stats.scrambled > 0);
+    if !r.programmes.is_empty() {
         ui.add_space(4.0);
         ui.label(RichText::new("Services").small().strong());
-        for p in &t.programmes {
+        for p in &r.programmes {
             let name = p.name.as_deref().unwrap_or("(no name)");
-            let provider = p
-                .provider
-                .as_deref()
-                .map(|s| format!(" — {s}"))
-                .unwrap_or_default();
             let encrypted = p.streams.iter().any(|e| scrambled(e.pid));
             ui.label(
                 RichText::new(format!(
-                    "{} {name}{provider}{}",
+                    "{} {name}{}",
                     p.number,
-                    if encrypted { "  🔒 scrambled" } else { "" }
+                    if encrypted { "  🔒" } else { "" }
                 ))
                 .strong(),
             );
-            for e in &p.streams {
-                ui.label(
-                    RichText::new(format!(
-                        "    PID {:#06x}  {}",
-                        e.pid,
-                        stream_type_name(e.stream_type)
-                    ))
-                    .small()
-                    .monospace(),
-                );
+            if let Some(e) = &p.now {
+                ui.label(RichText::new(format!("    now: {}", e.name)).small());
             }
         }
     }
-    egui::CollapsingHeader::new(format!("PIDs ({})", t.pid_count))
-        .id_salt("ts_pids")
-        .show(ui, |ui| {
-            egui::Grid::new("pids")
-                .num_columns(4)
-                .striped(true)
-                .show(ui, |ui| {
-                    for h in ["PID", "packets", "CC errors", "scrambled"] {
-                        ui.label(RichText::new(h).small());
-                    }
-                    ui.end_row();
-                    for (pid, s) in &t.pids {
-                        ui.label(RichText::new(format!("{pid:#06x}")).small().monospace());
-                        ui.label(RichText::new(s.packets.to_string()).small());
-                        ui.label(RichText::new(s.cc_errors.to_string()).small());
-                        ui.label(RichText::new(if s.scrambled > 0 { "yes" } else { "" }).small());
-                        ui.end_row();
-                    }
-                });
-        });
+    ui.add_space(4.0);
+    if ui
+        .button(format!("🔍 TS analyser ({} PIDs)", r.pids.len()))
+        .on_hover_text("Every PID with its type, service and bitrate; services, network and tables")
+        .clicked()
+    {
+        actions.push(Action::OpenTsViewer(id));
+    }
 }
 
 /// IP out of GSE: where it comes from, how much, who is talking, and the

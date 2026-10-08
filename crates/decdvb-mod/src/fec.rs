@@ -66,10 +66,11 @@ const TS_SYNC: u8 = 0x47;
 pub struct TsBbFramer {
     rng: u64,
     cc: u8,
-    /// Packets made so far, and the PSI tables sent every 40 of them.
+    /// Packets made so far, and the PSI/SI tables sent every 40 of them
+    /// (PID, section), with each table PID's continuity counter.
     seq: u64,
-    tables: [Vec<u8>; 3],
-    table_cc: [u8; 3],
+    tables: Vec<(u16, Vec<u8>)>,
+    table_cc: std::collections::BTreeMap<u16, u8>,
     /// The rest of a packet that did not fit the previous frame.
     carry: Vec<u8>,
     /// CRC-8 of the last packet's 187 useful bytes.
@@ -94,14 +95,11 @@ impl TsBbFramer {
             tables: decdvb_ts::psi::test_tables(
                 1,
                 TEST_PMT_PID,
-                decdvb_ts::EsInfo {
-                    pid: TEST_PID,
-                    stream_type: 0x06,
-                },
+                decdvb_ts::EsInfo::new(TEST_PID, 0x06),
                 "DecDVB",
                 "DecDVB test signal",
             ),
-            table_cc: [0; 3],
+            table_cc: Default::default(),
             carry: Vec::new(),
             prev_crc: 0,
             roll_off: RollOff::R35,
@@ -118,20 +116,18 @@ impl TsBbFramer {
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
-    /// The next test packet, sync byte included: a PAT, PMT or SDT every
-    /// 40 packets, else data.
+    /// The next test packet, sync byte included: the tables (PAT, PMT,
+    /// SDT, EIT, NIT, TDT) every 40 packets, else data.
     fn packet(&mut self) -> [u8; TS_LEN] {
         let n = self.seq;
         self.seq += 1;
-        if let k @ 0..3 = (n % 40) as usize {
-            let pid = [
-                decdvb_ts::psi::PID_PAT,
-                TEST_PMT_PID,
-                decdvb_ts::psi::PID_SDT,
-            ][k];
-            let cc = self.table_cc[k];
-            self.table_cc[k] = cc.wrapping_add(1) & 0x0F;
-            return decdvb_ts::psi::section_packet(pid, cc, &self.tables[k]);
+        let k = (n % 40) as usize;
+        if k < self.tables.len() {
+            let (pid, ref sec) = self.tables[k];
+            let cc = self.table_cc.entry(pid).or_default();
+            let p = decdvb_ts::psi::section_packet(pid, *cc, sec);
+            *cc = cc.wrapping_add(1) & 0x0F;
+            return p;
         }
         let mut p = [0u8; TS_LEN];
         p[0] = TS_SYNC;

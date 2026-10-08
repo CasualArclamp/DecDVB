@@ -823,7 +823,7 @@ impl Worker {
                                     format!("{} IP packets", g.packets)
                                 }
                                 (_, Some(t), DecoderKind::Dvbs2Ts) => {
-                                    match t.programmes.iter().find_map(|p| p.name.clone()) {
+                                    match t.report.programmes.iter().find_map(|p| p.name.clone()) {
                                         Some(n) => format!("{} TS packets · {n}", t.packets),
                                         None => format!("{} TS packets", t.packets),
                                     }
@@ -1385,7 +1385,7 @@ mod tests {
             wk.publish(0);
             let t = status.lock().unwrap().fec.clone().and_then(|f| f.ts);
             if t.as_ref()
-                .is_some_and(|t| t.programmes.iter().any(|p| p.name.is_some()))
+                .is_some_and(|t| t.report.programmes.iter().any(|p| p.name.is_some()))
                 || t0.elapsed().as_secs() > 20
             {
                 break t.expect("no TS");
@@ -1395,6 +1395,7 @@ mod tests {
         assert_eq!(ts.crc_errors, 0, "{ts:?}");
         assert_eq!(ts.cc_errors, 0, "{ts:?}");
         let p = ts
+            .report
             .programmes
             .iter()
             .find(|p| p.number == 1)

@@ -26,6 +26,8 @@ pub struct Options {
     pub lo_mhz: Option<f64>,
     /// Decoder for claimed carriers (default Identify).
     pub decoder: Option<decdvb_engine::DecoderKind>,
+    /// Open the TS analyser on the selected VFO.
+    pub ts_viewer: bool,
 }
 
 impl Options {
@@ -47,6 +49,7 @@ impl Options {
                     );
                 }
                 Some("--claim-carriers") => o.claim_carriers = true,
+                Some("--ts-viewer") => o.ts_viewer = true,
                 Some("--decoder") => {
                     let v = args.next().ok_or("--decoder needs a name")?;
                     let v = v.to_str().unwrap_or_default().to_ascii_lowercase();
@@ -107,6 +110,7 @@ pub struct Automation {
     pub claim_carriers: bool,
     pub claimed: bool,
     pub select: Option<usize>,
+    pub ts_viewer: bool,
 }
 
 impl Automation {
@@ -119,6 +123,7 @@ impl Automation {
             claim_carriers: o.claim_carriers,
             claimed: false,
             select: o.select,
+            ts_viewer: o.ts_viewer,
         }
     }
 

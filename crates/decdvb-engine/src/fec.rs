@@ -27,7 +27,7 @@ use decdvb_fec::{Bch, BchError, Constellation, DecodeOutcome, FecParams, LdpcCod
 use decdvb_frame::{BBHEADER_LEN, BbHeader, BbHeaderError, PlsInfo, StreamFormat, bb_scramble};
 use decdvb_gse::{GseIp, IpPacket, Source, Variant, VariantReport};
 use decdvb_ip::{Flow, IpStats, PcapWriter};
-use decdvb_ts::{PidStats, Programme, TS_LEN, TcpSink, TsAnalyser, TsDeframer, TsFile, UdpSink};
+use decdvb_ts::{TS_LEN, TcpSink, TsAnalyser, TsDeframer, TsFile, TsReport, UdpSink};
 
 use crate::demod::{PILOT_AFTER, PILOT_PERIOD, PlFrame};
 
@@ -207,10 +207,8 @@ pub struct TsView {
     pub issy: bool,
     /// TS rate over the last couple of seconds of signal, bits per second.
     pub ts_bps: f64,
-    pub programmes: Vec<Programme>,
-    /// The busiest PIDs, most packets first.
-    pub pids: Vec<(u16, PidStats)>,
-    pub pid_count: usize,
+    /// Everything the analyser knows: services, PIDs, network, tables.
+    pub report: TsReport,
     pub file: Option<(PathBuf, u64)>,
     pub file_active: bool,
     /// UDP target and datagrams sent.
@@ -472,6 +470,9 @@ struct TsStage {
     win: (f64, f64),
     ts_bps: f64,
     issy: bool,
+    /// The analyser's last report, rebuilt at most every 250 ms.
+    report: TsReport,
+    report_at: Option<Instant>,
 }
 
 impl TsStage {
@@ -490,6 +491,8 @@ impl TsStage {
             win: (0.0, 0.0),
             ts_bps: 0.0,
             issy: false,
+            report: TsReport::default(),
+            report_at: None,
         }
     }
 
@@ -566,6 +569,7 @@ impl TsStage {
     }
 
     fn tick(&mut self, secs: f64) {
+        self.analyser.tick(secs);
         self.win.1 += secs;
         if self.win.1 >= 2.0 || (self.ts_bps == 0.0 && self.win.1 > 0.2) {
             self.ts_bps = self.win.0 * 8.0 / self.win.1;
@@ -575,14 +579,18 @@ impl TsStage {
         }
     }
 
-    fn view(&self) -> TsView {
+    fn view(&mut self) -> TsView {
+        // Classifying every PID costs more than a frame is worth on a busy
+        // multiplex: refresh the report four times a second.
+        if self
+            .report_at
+            .is_none_or(|t| t.elapsed().as_millis() >= 250)
+        {
+            self.report = self.analyser.report();
+            self.report_at = Some(Instant::now());
+        }
         let d = &self.deframer.stats;
-        let mut pids: Vec<(u16, PidStats)> =
-            self.analyser.pids.iter().map(|(&p, &s)| (p, s)).collect();
-        let cc_errors = pids.iter().map(|(_, s)| s.cc_errors).sum();
-        pids.sort_unstable_by_key(|(_, s)| std::cmp::Reverse(s.packets));
-        let pid_count = pids.len();
-        pids.truncate(12);
+        let cc_errors = self.analyser.pids.values().map(|s| s.cc_errors).sum();
         TsView {
             packets: d.packets,
             crc_errors: d.crc_errors,
@@ -591,9 +599,7 @@ impl TsStage {
             resyncs: d.resyncs,
             issy: self.issy,
             ts_bps: self.ts_bps,
-            programmes: self.analyser.programmes.values().cloned().collect(),
-            pids,
-            pid_count,
+            report: self.report.clone(),
             file: self
                 .file_path
                 .clone()
@@ -723,7 +729,7 @@ fn run(
         if let Some(stage) = &mut ip {
             s.gse = Some(stage.view());
         }
-        if let Some(t) = &ts {
+        if let Some(t) = &mut ts {
             s.ts = Some(t.view());
         }
     }

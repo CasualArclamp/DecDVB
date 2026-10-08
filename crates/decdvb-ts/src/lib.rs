@@ -11,5 +11,8 @@ pub mod psi;
 pub mod sink;
 
 pub use deframe::{DeframeStats, TS_LEN, TsDeframer, null_packet};
-pub use psi::{EsInfo, PidStats, Programme, TsAnalyser, stream_type_name};
+pub use psi::{
+    EsInfo, Event, NetworkInfo, PidRow, PidStats, Programme, Transponder, TsAnalyser, TsReport,
+    ca_system_name, service_type_name, stream_type_name,
+};
 pub use sink::{TcpSink, TsFile, UdpSink};

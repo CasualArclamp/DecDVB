@@ -103,6 +103,12 @@ continuity errors. Send it on with any of:
 | **TCP / HTTP** `127.0.0.1:8001` | VLC or PotPlayer: `http://127.0.0.1:8001/` (VLC also `tcp://…`) |
 | **▶ VLC / ▶ PotPlayer** | starts the TCP server and opens the stream in the player |
 
+**🔍 TS analyser** opens a window in the spirit of EBSPro's: every PID with
+what it is (PAT, PMT, H.264 video, AC-3 audio, ECM/EMM with the CA system,
+unlisted PES…), the service it belongs to, its bitrate and share, continuity
+and error counts, scrambling and PCR; the service tree with what is on now and
+next (EIT); the network's transponders (NIT); and every table seen.
+
 Both network outputs start on 127.0.0.1, this machine only; use 0.0.0.0 (TCP)
 or another host's address (UDP) to reach the network. Several players can
 connect to the TCP server at once; one that stalls loses data rather than
