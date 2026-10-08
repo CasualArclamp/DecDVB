@@ -35,9 +35,16 @@ use decdvb_ts::{
 };
 
 use crate::demod::{PILOT_AFTER, PILOT_PERIOD, PlFrame};
+use decdvb_audio::{AudioHandle, AudioPlayer, AudioRecorder, OutputKind};
 
 /// LLR quantization: steps per LLR unit (the decoder is happy from 2 to 8).
 const LLR_SCALE: f32 = 4.0;
+/// Where in-app audio plays: the sound card, except under test.
+const AUDIO_OUTPUT: OutputKind = if cfg!(test) {
+    OutputKind::Null
+} else {
+    OutputKind::Device
+};
 /// LDPC iteration budget per frame.
 const MAX_ITERATIONS: usize = 50;
 /// Frames queued for the FEC thread before new ones are dropped.
@@ -250,13 +257,20 @@ pub struct GseView {
     pub pcap_error: Option<String>,
     /// IP that came by MPE from a transport stream rather than GSE.
     pub mpe: Option<MpeStats>,
-    /// Multicast audio streams found, busiest first.
+    /// Multicast audio streams found, by address.
     pub audio: Vec<AudioStream>,
     pub sap_packets: u64,
     /// The stream being played, and what to open in the player.
     pub audio_playing: Option<SocketAddr>,
     pub audio_target: Option<PlayTarget>,
     pub audio_error: Option<String>,
+    /// The in-app player, while one is playing: status, level, pause.
+    pub audio_app: Option<AudioHandle>,
+    /// The stream being recorded, and the file (current or last) with
+    /// its bytes so far.
+    pub audio_recording: Option<SocketAddr>,
+    pub audio_record_file: Option<(PathBuf, u64)>,
+    pub audio_record_error: Option<String>,
     /// Packets passed to the player so far.
     pub audio_forwarded: u64,
 }
@@ -280,8 +294,12 @@ pub struct FecOutput {
     pub ts_udp: Option<SocketAddr>,
     /// Serve the MPEG-TS over TCP/HTTP here.
     pub ts_tcp: Option<SocketAddr>,
-    /// Play this multicast audio stream (group:port) in a local player.
+    /// Play this multicast audio stream (group:port): in the app, or
+    /// relayed to an external player when `audio_external`.
     pub audio_play: Option<SocketAddr>,
+    pub audio_external: bool,
+    /// Record this multicast audio stream to a file in `dir`.
+    pub audio_record: Option<SocketAddr>,
 }
 
 /// Runs a [`FecDecoder`] on its own thread.
@@ -362,7 +380,15 @@ struct IpStage {
     mcast: McastScanner,
     audio: Vec<AudioStream>,
     relay: Option<AudioRelay>,
+    player: Option<AudioPlayer>,
+    /// Why the asked-for stream is not playing.
     relay_error: Option<String>,
+    audio_external: bool,
+    recorder: Option<AudioRecorder>,
+    record_want: Option<SocketAddr>,
+    record_error: Option<String>,
+    /// The last recording's file and size, once it is closed.
+    record_last: Option<(PathBuf, u64)>,
     /// The stream asked for (it may not have been heard yet).
     audio_want: Option<SocketAddr>,
     mpe: Option<MpeStats>,
@@ -374,7 +400,13 @@ impl IpStage {
             mcast: McastScanner::new(),
             audio: Vec::new(),
             relay: None,
+            player: None,
             relay_error: None,
+            audio_external: false,
+            recorder: None,
+            record_want: None,
+            record_error: None,
+            record_last: None,
             audio_want: None,
             mpe: None,
             gse: GseIp::new(),
@@ -394,27 +426,65 @@ impl IpStage {
     /// recording), and start or stop playing audio to match `o.audio_play`.
     fn follow(&mut self, o: &FecOutput) {
         self.gse.forced = o.gse_variant;
-        if o.audio_play != self.audio_want {
+        if o.audio_play != self.audio_want || o.audio_external != self.audio_external {
             self.audio_want = o.audio_play;
+            self.audio_external = o.audio_external;
             self.relay = None;
+            self.player = None;
             self.relay_error = None;
         }
         // Start playing once the stream has been seen enough to tell RTP
-        // from raw and to know its codec: started early, it would be served
-        // the wrong way for good.
+        // from raw and to know its codec: started early, it would be taken
+        // apart the wrong way for good.
         if let Some(want) = self.audio_want
             && self.relay.is_none()
+            && self.player.is_none()
             && self.relay_error.is_none()
-            && let Some(st) = self
-                .mcast
-                .streams()
-                .into_iter()
-                .find(|a| a.group == want.ip() && a.port == want.port() && a.packets >= 8)
+            && let Some(st) = self.heard(want)
         {
-            let dir = std::env::temp_dir().join("DecDVB");
-            match AudioRelay::start(&st, &dir) {
-                Ok(r) => self.relay = Some(r),
-                Err(e) => self.relay_error = Some(format!("{}: {e}", st.name())),
+            if self.audio_external {
+                let dir = std::env::temp_dir().join("DecDVB");
+                match AudioRelay::start(&st, &dir) {
+                    Ok(r) => self.relay = Some(r),
+                    Err(e) => self.relay_error = Some(format!("{}: {e}", st.name())),
+                }
+            } else {
+                match AudioPlayer::start(&st, AUDIO_OUTPUT) {
+                    Ok(p) => self.player = Some(p),
+                    Err(e) => self.relay_error = Some(format!("{}: {e}", st.name())),
+                }
+            }
+        }
+        if o.audio_record != self.record_want {
+            self.record_want = o.audio_record;
+            self.stop_recording();
+            self.record_error = None;
+        }
+        if let Some(want) = self.record_want
+            && self.recorder.is_none()
+            && self.record_error.is_none()
+            && let Some(st) = self.heard(want)
+        {
+            let stamp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let name: String = st
+                .name()
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let stem =
+                format!("decdvb-{name}-{}_{}-{stamp}", st.group, st.port).replace([':', '.'], "_");
+            match AudioRecorder::start(&st, &o.dir, &stem) {
+                Ok(r) => self.recorder = Some(r),
+                Err(e) => self.record_error = Some(format!("{}: {e}", st.name())),
             }
         }
         match (o.record, self.pcap.is_some()) {
@@ -469,12 +539,23 @@ impl IpStage {
         self.stats.add(info);
         self.win.0 += data.len() as f64;
         self.mcast.packet(data, info);
-        if let Some(r) = &mut self.relay
-            && info.dst == r.group
+        if (self.audio_want.is_some() || self.record_want.is_some())
             && let Some((payload, _, dport)) = udp_payload(data, info)
-            && dport == r.port
         {
-            r.packet(payload);
+            let key = Some(SocketAddr::new(info.dst, dport));
+            if key == self.audio_want {
+                if let Some(r) = &mut self.relay {
+                    r.packet(payload);
+                }
+                if let Some(p) = &mut self.player {
+                    p.packet(payload);
+                }
+            }
+            if key == self.record_want
+                && let Some(r) = &mut self.recorder
+            {
+                r.packet(payload);
+            }
         }
         if let Some(w) = &mut self.pcap
             && let Err(e) = w.write(SystemTime::now(), data)
@@ -531,7 +612,38 @@ impl IpStage {
             audio_playing: self.audio_want,
             audio_target: self.relay.as_ref().map(|r| r.target.clone()),
             audio_error: self.relay_error.clone(),
-            audio_forwarded: self.relay.as_ref().map_or(0, |r| r.forwarded),
+            audio_forwarded: self
+                .relay
+                .as_ref()
+                .map(|r| r.forwarded)
+                .or(self.player.as_ref().map(|p| p.forwarded))
+                .unwrap_or(0),
+            audio_app: self.player.as_ref().map(|p| p.handle()),
+            audio_recording: self.record_want,
+            audio_record_file: match &self.recorder {
+                Some(r) => r.path().map(|p| (p.to_path_buf(), r.bytes)),
+                None => self.record_last.clone(),
+            },
+            audio_record_error: self
+                .record_error
+                .clone()
+                .or_else(|| self.recorder.as_ref().and_then(|r| r.error.clone())),
+        }
+    }
+
+    /// The stream at `want`, once it has been heard enough to know how it
+    /// is carried.
+    fn heard(&self, want: SocketAddr) -> Option<AudioStream> {
+        self.mcast
+            .streams()
+            .into_iter()
+            .find(|a| a.group == want.ip() && a.port == want.port() && a.packets >= 8)
+    }
+
+    /// Close the recording, keeping its name and size for display.
+    fn stop_recording(&mut self) {
+        if let Some(r) = self.recorder.take() {
+            self.record_last = r.path().map(|p| (p.to_path_buf(), r.bytes));
         }
     }
 }

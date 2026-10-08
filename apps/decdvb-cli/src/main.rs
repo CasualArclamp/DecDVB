@@ -215,9 +215,9 @@ fn scan(
             if c.narrow { "  (narrow)" } else { "" }
         );
         let bw = if c.narrow {
-            20e3
+            c.fit_among(20e3, &carriers)
         } else {
-            c.suggested_vfo_bandwidth()
+            c.vfo_bandwidth_among(&carriers)
         };
         ids.push(eng.add_vfo(VfoSettings::new(
             format!("#{i}"),

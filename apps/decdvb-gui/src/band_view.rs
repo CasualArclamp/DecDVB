@@ -41,10 +41,13 @@ pub enum Action {
     Play(VfoId, crate::player::Player),
     /// Open the TS analyser window on a VFO.
     OpenTsViewer(VfoId),
-    /// Play a VFO's multicast audio stream (group:port) in a player.
-    PlayAudio(VfoId, std::net::SocketAddr, crate::player::Player),
+    /// Play a VFO's multicast audio stream (group:port): in the app, or in
+    /// an external player.
+    PlayAudio(VfoId, std::net::SocketAddr, Option<crate::player::Player>),
     /// Stop playing a VFO's multicast audio.
     StopAudio(VfoId),
+    /// Record a VFO's multicast audio stream to a file, or stop (`None`).
+    RecordAudio(VfoId, Option<std::net::SocketAddr>),
 }
 
 /// Everything the view draws from.
@@ -735,12 +738,14 @@ impl BandView {
                 actions.push(Action::Remove(id));
             } else if let Some(i) = carrier_hit {
                 let c = inp.front.carriers[i];
-                // A narrow line gets room for a slow carrier and its drift.
-                let bw = if c.narrow {
+                // A narrow line gets room for a slow carrier and its drift;
+                // either way the VFO stops short of the next carrier.
+                let want = if c.narrow {
                     c.suggested_vfo_bandwidth().max(bin_hz * 8.0)
                 } else {
                     c.suggested_vfo_bandwidth()
                 };
+                let bw = c.fit_among(want, &inp.front.carriers);
                 let mut s = VfoSettings::new(
                     inp.next_name.clone(),
                     c.center_hz,

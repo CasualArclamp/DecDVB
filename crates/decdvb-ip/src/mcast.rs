@@ -125,6 +125,9 @@ pub struct SdpInfo {
     pub pt: Option<u8>,
     /// "MP4A-LATM/48000/2" and the like.
     pub encoding: Option<String>,
+    /// The format parameters for that payload type ("profile-level-id=…;
+    /// config=…"): where AAC carries its decoder configuration.
+    pub fmtp: Option<String>,
     /// The SDP itself.
     pub raw: String,
 }
@@ -166,6 +169,11 @@ impl SdpInfo {
                         && pt.parse::<u8>().ok() == s.pt
                     {
                         s.encoding = Some(enc.trim().to_string());
+                    } else if let Some(r) = v.strip_prefix("fmtp:")
+                        && let Some((pt, params)) = r.split_once(' ')
+                        && pt.parse::<u8>().ok() == s.pt
+                    {
+                        s.fmtp = Some(params.trim().to_string());
                     }
                 }
                 _ => {}
@@ -402,7 +410,7 @@ impl McastScanner {
     }
 
     /// The multicast streams that carry audio (or are announced as audio),
-    /// busiest first.
+    /// by group address and port.
     pub fn streams(&self) -> Vec<AudioStream> {
         let mut v: Vec<AudioStream> = self
             .flows
@@ -442,11 +450,8 @@ impl McastScanner {
                         .is_some_and(|d| d.media.as_deref() == Some("audio"))
             })
             .collect();
-        v.sort_by(|a, b| {
-            b.rate_bps
-                .partial_cmp(&a.rate_bps)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // By address, so the list stays put while rates move about.
+        v.sort_by_key(|a| (a.group, a.port));
         v
     }
 }

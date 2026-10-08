@@ -428,7 +428,7 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
     // Radio stations found in the IP come first: they are what one is
     // usually after on a carrier that has them.
     if let Some(g) = st.fec.as_ref().and_then(|f| f.gse.as_ref()) {
-        audio_card(ui, g, v.id, &mut actions);
+        audio_card(ui, g, v.id, v.settings.audio_external, &mut actions);
     }
     // A demodulating VFO leads with its own state and constellation; how it
     // acquired (Identify's view) folds away below.
@@ -634,20 +634,32 @@ fn fec_card(ui: &mut Ui, f: &FecStats) {
     });
 }
 
-/// Multicast audio found in the IP: name (from SAP), codec, rate, and
-/// buttons to play it in a player.
-fn audio_card(ui: &mut Ui, g: &GseView, id: VfoId, actions: &mut Vec<Action>) {
+/// Multicast audio found in the IP, by address: name (from SAP), codec and
+/// rate, with play (in the app, or in VLC/PotPlayer) and record buttons.
+/// `external` is whether the stream asked for plays in an external player.
+fn audio_card(ui: &mut Ui, g: &GseView, id: VfoId, external: bool, actions: &mut Vec<Action>) {
     if g.audio.is_empty() {
         return;
     }
     ui.add_space(6.0);
-    ui.label(RichText::new(format!("Multicast audio ({})", g.audio.len())).strong());
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("Multicast audio ({})", g.audio.len())).strong());
+        ui.with_layout(
+            egui::Layout::right_to_left(egui::Align::Center),
+            volume_control,
+        );
+    });
     for a in &g.audio {
         let key = std::net::SocketAddr::new(a.group, a.port);
         let playing = g.audio_playing == Some(key);
+        let recording = g.audio_recording == Some(key);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
+                if recording {
+                    ui.colored_label(Color32::from_rgb(230, 70, 70), "●")
+                        .on_hover_text("Recording");
+                }
                 let name = RichText::new(a.name()).strong();
                 ui.label(if playing {
                     name.color(Color32::from_rgb(110, 220, 110))
@@ -671,28 +683,96 @@ fn audio_card(ui: &mut Ui, g: &GseView, id: VfoId, actions: &mut Vec<Action>) {
                     .weak(),
                 );
             });
+            let app = g.audio_app.as_ref().filter(|_| playing && !external);
             ui.horizontal(|ui| {
-                for p in [Player::Vlc, Player::PotPlayer] {
-                    if ui.button(format!("▶ {}", p.name())).clicked() {
-                        actions.push(Action::PlayAudio(id, key, p));
+                if !playing {
+                    if ui.button("▶ Play").on_hover_text("Play it here").clicked() {
+                        actions.push(Action::PlayAudio(id, key, None));
                     }
-                }
-                if playing {
+                } else {
+                    if let Some(h) = app {
+                        let (label, tip) = if h.paused() {
+                            ("▶ Resume", "Carry on, live")
+                        } else {
+                            ("⏸ Pause", "Pause (resuming plays live)")
+                        };
+                        if ui.button(label).on_hover_text(tip).clicked() {
+                            h.set_paused(!h.paused());
+                        }
+                    }
                     if ui.button("⏹ Stop").clicked() {
                         actions.push(Action::StopAudio(id));
                     }
-                    let state = match (&g.audio_target, &g.audio_error) {
-                        (_, Some(e)) => e.clone(),
-                        (Some(_), None) => format!("relaying · {} packets", g.audio_forwarded),
-                        (None, None) => "waiting for the stream…".into(),
-                    };
-                    ui.label(RichText::new(state).small());
                 }
+                let rec = if recording {
+                    ui.button(
+                        RichText::new("⏹ Stop recording").color(Color32::from_rgb(230, 90, 90)),
+                    )
+                } else {
+                    ui.button("⏺ Record").on_hover_text(
+                        "Save the stream to a file in the output folder, as broadcast",
+                    )
+                };
+                if rec.clicked() {
+                    actions.push(Action::RecordAudio(id, (!recording).then_some(key)));
+                }
+                if let Some(h) = app {
+                    level_meter(ui, h.levels());
+                }
+                ui.menu_button("…", |ui| {
+                    for p in [Player::Vlc, Player::PotPlayer] {
+                        if ui.button(format!("▶ Open in {}", p.name())).clicked() {
+                            actions.push(Action::PlayAudio(id, key, Some(p)));
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Open in an external player");
             });
+            if playing {
+                let state = if let Some(e) = &g.audio_error {
+                    e.clone()
+                } else if let Some(h) = app {
+                    playback_state(&h.status())
+                } else if external && g.audio_target.is_some() {
+                    format!("relaying to the player · {} packets", g.audio_forwarded)
+                } else {
+                    "waiting for the stream…".into()
+                };
+                ui.label(RichText::new(state).small());
+            }
+            if recording {
+                let text = match (&g.audio_record_error, &g.audio_record_file) {
+                    (Some(e), _) => e.clone(),
+                    (None, Some((path, n))) => format!(
+                        "recording {} · {}",
+                        path.file_name()
+                            .map(|f| f.to_string_lossy())
+                            .unwrap_or_default(),
+                        format::bytes(*n)
+                    ),
+                    (None, None) => "recording starts with the next frame…".into(),
+                };
+                ui.label(
+                    RichText::new(text)
+                        .small()
+                        .color(Color32::from_rgb(230, 120, 120)),
+                );
+            }
             if let Some(info) = a.sdp.as_ref().and_then(|s| s.info.clone()) {
                 ui.label(RichText::new(info).small().weak());
             }
         });
+    }
+    if g.audio_recording.is_none()
+        && let Some((path, n)) = &g.audio_record_file
+    {
+        ui.label(
+            RichText::new(format!("Saved {} ({})", path.display(), format::bytes(*n)))
+                .small()
+                .weak(),
+        );
     }
     if g.sap_packets > 0 {
         ui.label(
@@ -701,6 +781,94 @@ fn audio_card(ui: &mut Ui, g: &GseView, id: VfoId, actions: &mut Vec<Action>) {
                 .weak(),
         );
     }
+}
+
+/// The app-wide mute button and volume slider (laid out right to left).
+fn volume_control(ui: &mut Ui) {
+    let mut v = decdvb_audio::volume();
+    ui.spacing_mut().slider_width = 90.0;
+    let r = ui
+        .add(egui::Slider::new(&mut v, 0.0..=1.0).show_value(false))
+        .on_hover_text(format!("Volume {:.0} %", v * 100.0));
+    if r.changed() {
+        decdvb_audio::set_volume(v);
+        if decdvb_audio::muted() {
+            decdvb_audio::set_muted(false);
+        }
+    }
+    if r.drag_stopped() || (r.changed() && !r.dragged()) {
+        crate::prefs::save_audio();
+    }
+    let muted = decdvb_audio::muted();
+    let (icon, tip) = if muted {
+        ("🔇", "Unmute")
+    } else {
+        ("🔊", "Mute")
+    };
+    if ui.button(icon).on_hover_text(tip).clicked() {
+        decdvb_audio::set_muted(!muted);
+        crate::prefs::save_audio();
+    }
+}
+
+/// Two thin bars, left over right: peak level on a 60 dB scale.
+fn level_meter(ui: &mut Ui, levels: [f32; 2]) {
+    let (rect, _) = ui.allocate_exact_size(vec2(70.0, 12.0), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::same(2), Color32::from_gray(40));
+    for (i, &l) in levels.iter().enumerate() {
+        let db = 20.0 * l.max(1e-6).log10();
+        let frac = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+        let top = rect.top() + 1.0 + i as f32 * 5.5;
+        let bar = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 1.0, top),
+            vec2((rect.width() - 2.0) * frac, 4.5),
+        );
+        let col = if db > -3.0 {
+            Color32::from_rgb(230, 80, 70)
+        } else if db > -12.0 {
+            Color32::from_rgb(230, 200, 80)
+        } else {
+            Color32::from_rgb(100, 210, 110)
+        };
+        p.rect_filled(bar, CornerRadius::same(1), col);
+    }
+}
+
+/// "playing · MPEG-1 Layer II · 128 kbit/s · 48 kHz · stereo · buffer 0.4 s".
+fn playback_state(s: &decdvb_audio::Status) -> String {
+    use decdvb_audio::PlayState;
+    if s.state == PlayState::Failed {
+        return s.error.clone().unwrap_or_else(|| "failed".into());
+    }
+    let mut parts = vec![
+        match s.state {
+            PlayState::Starting => "starting…",
+            PlayState::Buffering => "buffering…",
+            PlayState::Playing => "playing",
+            PlayState::Paused => "paused",
+            PlayState::Failed => "failed",
+        }
+        .to_string(),
+    ];
+    match (&s.codec, &s.error) {
+        (Some(c), _) => parts.push(c.clone()),
+        (None, Some(e)) => parts.push(e.clone()),
+        (None, None) => parts.push(s.carriage.clone()),
+    }
+    if s.state == PlayState::Playing || s.state == PlayState::Buffering {
+        parts.push(format!("buffer {:.1} s", s.buffer_ms as f32 / 1000.0));
+    }
+    if s.underruns > 0 {
+        parts.push(format!("{} dropouts", s.underruns));
+    }
+    if s.lost_packets > 0 {
+        parts.push(format!("{} packets lost", s.lost_packets));
+    }
+    if s.decode_errors > 0 {
+        parts.push(format!("{} bad frames", s.decode_errors));
+    }
+    parts.join(" · ")
 }
 
 /// A "host:port" text box, red while it does not parse.

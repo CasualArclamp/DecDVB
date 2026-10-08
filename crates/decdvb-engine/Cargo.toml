@@ -16,6 +16,7 @@ decdvb-frame = { path = "../decdvb-frame" }
 decdvb-gse = { path = "../decdvb-gse" }
 decdvb-ts = { path = "../decdvb-ts" }
 decdvb-ip = { path = "../decdvb-ip" }
+decdvb-audio = { path = "../decdvb-audio" }
 num-complex.workspace = true
 rustfft.workspace = true
 thiserror.workspace = true

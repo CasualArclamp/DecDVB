@@ -38,8 +38,10 @@ pub struct Carrier {
 }
 
 impl Carrier {
-    /// A VFO bandwidth that comfortably fits the carrier: its occupied width
-    /// plus margin for the skirts and some frequency error.
+    /// A VFO bandwidth that fits the carrier: its occupied width plus a
+    /// little room for the skirts and frequency error (the VFO's filter
+    /// passes everything inside it, and the demodulator's matched filter
+    /// does the rest, so more only lets neighbours in).
     pub fn suggested_vfo_bandwidth(&self) -> f64 {
         if self.rough {
             return self.bandwidth_hz * 1.1;
@@ -49,7 +51,24 @@ impl Carrier {
             // little, so leave generous room (callers add a floor in bins).
             return self.bandwidth_hz * 2.0;
         }
-        (self.bandwidth_hz * 1.25).max(self.symbol_rate_hz * 1.5)
+        (self.bandwidth_hz * 1.12).max(self.symbol_rate_hz * 1.3)
+    }
+
+    /// `want` narrowed so a VFO centred on this carrier stops short of every
+    /// other carrier in `all` (which may include this one), but never
+    /// narrower than this carrier's own occupied width.
+    pub fn fit_among(&self, want: f64, all: &[Carrier]) -> f64 {
+        let room = all
+            .iter()
+            .filter(|o| (o.center_hz - self.center_hz).abs() > 1.0)
+            .map(|o| (o.center_hz - self.center_hz).abs() - o.bandwidth_hz / 2.0)
+            .fold(f64::INFINITY, f64::min);
+        want.min(2.0 * room).max(self.bandwidth_hz)
+    }
+
+    /// [`Self::suggested_vfo_bandwidth`], kept clear of the neighbours.
+    pub fn vfo_bandwidth_among(&self, all: &[Carrier]) -> f64 {
+        self.fit_among(self.suggested_vfo_bandwidth(), all)
     }
 
     /// Looks like one clean carrier worth identifying.
@@ -645,6 +664,33 @@ mod tests {
             narrow: false,
             rough: false,
         };
-        assert!(c.suggested_vfo_bandwidth() >= 1.35e6);
+        // Room for the skirts, not much more.
+        let bw = c.suggested_vfo_bandwidth();
+        assert!((1.25e6..=1.4e6).contains(&bw), "{bw}");
+    }
+
+    #[test]
+    fn a_vfo_stops_short_of_a_close_neighbour() {
+        let c = |center_hz: f64, bandwidth_hz: f64| Carrier {
+            center_hz,
+            bandwidth_hz,
+            symbol_rate_hz: bandwidth_hz / 1.2,
+            snr_db: 20.0,
+            narrow: false,
+            rough: false,
+        };
+        // 1 MHz wide (1.12 MHz suggested), a 500 kHz one whose edge is
+        // 540 kHz from its centre.
+        let all = [c(0.0, 1.0e6), c(790e3, 500e3), c(-5e6, 1e6)];
+        let bw = all[0].vfo_bandwidth_among(&all);
+        assert!((bw - 1.08e6).abs() < 1.0, "{bw}");
+        // Alone, it gets its full suggestion.
+        assert_eq!(
+            all[0].vfo_bandwidth_among(&all[..1]),
+            all[0].suggested_vfo_bandwidth()
+        );
+        // Touching neighbours never squeeze it below its own width.
+        let tight = [c(0.0, 1.0e6), c(600e3, 400e3)];
+        assert_eq!(tight[0].vfo_bandwidth_among(&tight), 1.0e6);
     }
 }

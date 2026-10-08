@@ -105,8 +105,12 @@ pub struct VfoSettings {
     /// DVB-S2 → MPEG-TS: serve the TS over TCP/HTTP on `ts_tcp`.
     pub ts_tcp_on: bool,
     pub ts_tcp: String,
-    /// DVB-S2 → IP or TS: play this multicast audio stream (group:port).
+    /// DVB-S2 → IP or TS: play this multicast audio stream (group:port), in
+    /// the app or (`audio_external`) relayed to a media player.
     pub audio_play: Option<std::net::SocketAddr>,
+    pub audio_external: bool,
+    /// DVB-S2 → IP or TS: record this multicast audio stream to a file.
+    pub audio_record: Option<std::net::SocketAddr>,
     /// Where the IQ recorder and the symbol writer write.
     pub record_dir: PathBuf,
 }
@@ -136,6 +140,8 @@ impl VfoSettings {
             ts_tcp_on: false,
             ts_tcp: "127.0.0.1:8001".into(),
             audio_play: None,
+            audio_external: false,
+            audio_record: None,
             record_dir: std::env::temp_dir(),
         }
     }
@@ -908,6 +914,8 @@ fn fec_output(s: &VfoSettings, ddc: &Ddc) -> FecOutput {
         ts_udp: s.ts_udp_on.then(|| s.ts_udp.trim().parse().ok()).flatten(),
         ts_tcp: s.ts_tcp_on.then(|| s.ts_tcp.trim().parse().ok()).flatten(),
         audio_play: s.audio_play,
+        audio_external: s.audio_external,
+        audio_record: s.audio_record,
     }
 }
 
@@ -1454,12 +1462,48 @@ mod tests {
     }
 
     #[test]
-    fn finds_and_plays_multicast_radio_over_gse() {
+    fn plays_and_records_multicast_radio_in_the_app() {
+        use decdvb_gse::Variant;
+        use decdvb_mod::{GseBbFramer, PlFramer};
+        let group: std::net::SocketAddr = "239.255.1.1:5004".parse().unwrap();
+        let dir = std::env::temp_dir().join(format!("decdvb-radio-{}", std::process::id()));
+        let mut settings = VfoSettings::new("IP", 40_000.0, 190_000.0, DecoderKind::Dvbs2Ip);
+        settings.audio_play = Some(group);
+        settings.audio_record = Some(group);
+        settings.record_dir = dir.clone();
+        let framer =
+            PlFramer::new(0, 6).with_source(Box::new(GseBbFramer::new(9, Variant::STANDARD)));
+        let f = s2_vfo(framer, settings, |f| {
+            f.gse.as_ref().is_some_and(|g| {
+                g.audio_app
+                    .as_ref()
+                    .is_some_and(|h| h.status().decoded >= 5)
+                    && g.audio_record_file.as_ref().is_some_and(|(_, n)| *n > 0)
+            })
+        });
+        let g = f.gse.expect("no IP");
+        let h = g.audio_app.as_ref().expect("not playing");
+        let st = h.status();
+        assert!(st.decoded >= 5, "{st:?} ({:?})", g.audio_error);
+        assert!(
+            st.codec.as_deref().unwrap_or("").contains("Layer II"),
+            "{st:?}"
+        );
+        let (path, bytes) = g.audio_record_file.clone().expect("not recording");
+        assert_eq!(path.extension().unwrap(), "mp2");
+        assert!(bytes >= 384);
+        assert_eq!(g.audio_recording, Some(group));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finds_and_relays_multicast_radio_over_gse() {
         use decdvb_gse::Variant;
         use decdvb_mod::{GseBbFramer, PlFramer};
         let group: std::net::SocketAddr = "239.255.1.1:5004".parse().unwrap();
         let mut settings = VfoSettings::new("IP", 40_000.0, 190_000.0, DecoderKind::Dvbs2Ip);
         settings.audio_play = Some(group);
+        settings.audio_external = true;
         let framer =
             PlFramer::new(0, 6).with_source(Box::new(GseBbFramer::new(9, Variant::STANDARD)));
         let f = s2_vfo(framer, settings, |f| {

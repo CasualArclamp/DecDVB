@@ -28,6 +28,8 @@ pub struct Options {
     pub decoder: Option<decdvb_engine::DecoderKind>,
     /// Open the TS analyser on the selected VFO.
     pub ts_viewer: bool,
+    /// Play the selected VFO's first multicast audio stream in the app.
+    pub play_audio: bool,
 }
 
 impl Options {
@@ -50,6 +52,7 @@ impl Options {
                 }
                 Some("--claim-carriers") => o.claim_carriers = true,
                 Some("--ts-viewer") => o.ts_viewer = true,
+                Some("--play-audio") => o.play_audio = true,
                 Some("--decoder") => {
                     let v = args.next().ok_or("--decoder needs a name")?;
                     let v = v.to_str().unwrap_or_default().to_ascii_lowercase();
@@ -111,6 +114,8 @@ pub struct Automation {
     pub claimed: bool,
     pub select: Option<usize>,
     pub ts_viewer: bool,
+    pub play_audio: bool,
+    pub audio_started: bool,
 }
 
 impl Automation {
@@ -124,6 +129,8 @@ impl Automation {
             claimed: false,
             select: o.select,
             ts_viewer: o.ts_viewer,
+            play_audio: o.play_audio,
+            audio_started: false,
         }
     }
 

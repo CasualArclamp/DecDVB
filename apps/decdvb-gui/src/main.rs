@@ -330,8 +330,20 @@ impl App {
                 if let Some(v) = self.vfos.iter().find(|v| v.id == id) {
                     let mut s = v.settings.clone();
                     s.audio_play = Some(key);
+                    s.audio_external = p.is_some();
                     self.apply(Action::Update(id, s));
-                    self.pending_audio = Some((id, key, p, std::time::Instant::now()));
+                    // An external player is launched once the relay is up.
+                    self.pending_audio = p.map(|p| (id, key, p, std::time::Instant::now()));
+                }
+            }
+            Action::RecordAudio(id, key) => {
+                if let Some(v) = self.vfos.iter().find(|v| v.id == id) {
+                    let mut s = v.settings.clone();
+                    s.audio_record = key;
+                    if key.is_some() {
+                        let _ = std::fs::create_dir_all(&s.record_dir);
+                    }
+                    self.apply(Action::Update(id, s));
                 }
             }
             Action::StopAudio(id) => {
@@ -741,11 +753,12 @@ impl eframe::App for App {
                     .partial_cmp(&b.center_hz)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
+            let all = self.front.carriers.clone();
             for c in picks {
                 let bw = if c.narrow {
-                    20e3
+                    c.fit_among(20e3, &all)
                 } else {
-                    c.suggested_vfo_bandwidth()
+                    c.vfo_bandwidth_among(&all)
                 };
                 let s = decdvb_engine::VfoSettings::new(
                     self.next_name(),
@@ -762,6 +775,20 @@ impl eframe::App for App {
             {
                 self.ts_viewer.open(id);
             }
+        }
+        if self.automation.play_audio
+            && !self.automation.audio_started
+            && let Some(id) = self.selected
+            && let Some(a) = self
+                .statuses
+                .get(&id)
+                .and_then(|st| st.fec.as_ref())
+                .and_then(|f| f.gse.as_ref())
+                .and_then(|g| g.audio.first())
+        {
+            self.automation.audio_started = true;
+            let key = std::net::SocketAddr::new(a.group, a.port);
+            self.apply(Action::PlayAudio(id, key, None));
         }
         self.launch_pending_player();
         self.launch_pending_audio();

@@ -151,6 +151,9 @@ crates/
                   Generic/Newtec CRC variants
   decdvb-ip       IPv4/IPv6 parse, PCAP writer, stream classification + stats,
                   blind IP-header-checksum fallback search
+  decdvb-audio    multicast radio in the app: RTP/RFC 2250/3016/3640 and raw
+                  ES depacketising, MPEG audio + AAC-LC decode (Symphonia),
+                  resampling, sound output (cpal), recording as broadcast
   decdvb-io       HackRF source (libhackrf FFI / soapy), IQ file reader/writer
                   (cs8/cs16/cf32), HackRF TX sink, ring buffers
   decdvb-engine   orchestrates RX (and TX) chain; ACM state; multistream/ISI

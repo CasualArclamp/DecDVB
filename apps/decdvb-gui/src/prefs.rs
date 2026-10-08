@@ -62,6 +62,18 @@ pub fn load() {
         .map(|(_, v)| PathBuf::from(v))
         .filter(|p| !p.as_os_str().is_empty());
     *OUTPUT_DIR.lock().unwrap() = saved;
+    let all = read_all();
+    let get = |key: &str| all.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+    if let Some(v) = get("volume").and_then(|v| v.parse::<f32>().ok()) {
+        decdvb_audio::set_volume(v);
+    }
+    decdvb_audio::set_muted(get("muted") == Some("1"));
+}
+
+/// Remember the audio volume and mute as they are now.
+pub fn save_audio() {
+    let _ = write_key("volume", &format!("{:.3}", decdvb_audio::volume()));
+    let _ = write_key("muted", if decdvb_audio::muted() { "1" } else { "0" });
 }
 
 /// Where new output goes.

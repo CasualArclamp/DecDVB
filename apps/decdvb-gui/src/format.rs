@@ -33,6 +33,15 @@ pub fn bitrate(bps: f64) -> String {
     }
 }
 
+/// A size: `1.2 MB`, `350 kB`.
+pub fn bytes(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1} MB", n as f64 / 1e6)
+    } else {
+        format!("{:.0} kB", n as f64 / 1e3)
+    }
+}
+
 /// A short axis label for a frequency, at a precision suited to the tick step.
 pub fn tick(hz: f64, step: f64) -> String {
     // Unit from the larger of the value and the step, so a tick at 0 Hz uses

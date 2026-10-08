@@ -371,3 +371,40 @@ constellations (radii and bit labels), the S2X bit-interleaver permutations,
 VL-SNR headers and pi/2-BPSK spreading, or superframing. Those come from
 EN 302 307-2 itself (or gr-dtv's S2X modulator); they are tables where a
 guess would silently decode nothing, so they wait for the source.
+
+## M4, part 4 — multicast audio in the app (done, 2026-10-08)
+
+Rory asked for the multicast radio to decode in DecDVB itself, with a volume
+slider and playback controls, the list sorted by address, and a file output.
+
+- **`decdvb-audio`** (new crate). `depay`: UDP payloads to frames — MPEG audio,
+  ADTS and LOAS byte streams re-framed by sync word and length (trusted only
+  when the next header follows), RFC 2250's header dropped for payload type
+  14, MP4A-LATM in RTP (RFC 3016, config in band or from `config=`, fragments
+  joined on the marker bit), RFC 3640 AU headers, L16/L24/L8 and G.711.
+  `aac`: AudioSpecificConfig (explicit and backward-compatible SBR/PS
+  signalling), StreamMuxConfig, ADTS headers. `decode`: Symphonia 0.6
+  (MPL-2.0) for MPEG audio I–III and AAC-LC, everything to stereo. `resample`:
+  32-tap windowed sinc, ratio trimmable ±1 %. `player`: its own thread, a
+  ring buffer to cpal 0.18 (WASAPI/ALSA), 400 ms start level held by trimming
+  the ratio against clock drift, app-wide volume (cubed) and mute, per-player
+  pause that resumes live, peak meter. `record`: as broadcast — `.mp2/.mp3`,
+  ADTS `.aac` for any AAC carriage, `.wav`, `.ts`.
+- **HE-AAC** plays its AAC-LC core (Symphonia has no SBR): the decoder is
+  given an LC config for the core and ignores the SBR fill elements. Full
+  sound: "… → Open in VLC", or the recording.
+- **Engine**: `audio_play` + `audio_external` choose the in-app player or the
+  external relay; `audio_record` records to the output folder. Under test the
+  player uses a null output, so `cargo test` never makes a sound.
+- **GUI**: per stream ▶ Play / ⏸ Pause / ⏹ Stop / ⏺ Record, level meter, a
+  "…" menu for VLC/PotPlayer; volume slider and mute on the list header,
+  saved in prefs. `--play-audio` plays the selected VFO's first stream in
+  unattended runs. Streams are listed by group address and port.
+- The synthetic scene's test radio is silent and slower than real time, so
+  there it reads "buffering · dropouts"; a real stream does not.
+- CI installs `libasound2-dev` for cpal on Linux.
+
+**Also (2026-10-08):** a VFO dropped on a detected carrier is now sized to its
+occupied width plus about 12 % (was 25 %, or 1.5 Rs), and stops short of the
+nearest neighbouring carrier (`Carrier::vfo_bandwidth_among`), never narrower
+than the carrier itself: close carriers no longer end up inside each other's VFOs.

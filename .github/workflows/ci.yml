@@ -26,13 +26,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # eframe/glow needs the X11/Wayland and GL development headers on Linux.
+      # eframe/glow needs the X11/Wayland and GL development headers on Linux,
+      # and cpal (in-app audio) the ALSA ones.
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgl1-mesa-dev libxkbcommon-dev libxcb-render0-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev
+            libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libasound2-dev pkg-config
 
       - name: Build
         run: cargo build --workspace --all-targets
@@ -57,7 +58,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgl1-mesa-dev libxkbcommon-dev libxcb-render0-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev
+            libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libasound2-dev pkg-config
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   fmt:

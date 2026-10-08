@@ -1,0 +1,17 @@
+[package]
+name = "decdvb-audio"
+description = "DecDVB in-app audio: depacketise, decode and play multicast radio streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decdvb-ip = { path = "../decdvb-ip" }
+# Pure-Rust decoders (MPL-2.0, GPL-compatible): MPEG-1/2 layers I-III and AAC-LC.
+symphonia-core = "0.6.1"
+symphonia-bundle-mp3 = "0.6.1"
+symphonia-codec-aac = "0.6.1"
+# Sound output: WASAPI on Windows, ALSA on Linux (needs libasound2-dev to build).
+cpal = "0.18.2"

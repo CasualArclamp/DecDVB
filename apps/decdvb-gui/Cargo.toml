@@ -25,6 +25,7 @@ decdvb-ip = { path = "../../crates/decdvb-ip" }
 decdvb-ts = { path = "../../crates/decdvb-ts" }
 decdvb-io = { path = "../../crates/decdvb-io" }
 decdvb-engine = { path = "../../crates/decdvb-engine" }
+decdvb-audio = { path = "../../crates/decdvb-audio" }
 anyhow.workspace = true
 # The glow (OpenGL) renderer instead of eframe's default wgpu: plenty for 2-D
 # plots and a much smaller build. "x11"/"wayland" only matter on Linux.

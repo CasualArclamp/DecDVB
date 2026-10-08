@@ -37,7 +37,7 @@ and a CW tone. Every carrier was found and identified blind.*
 | **GSE → IP → PCAP** + live IP stats; GSE variant detected from the data | ✅ |
 | **MPEG-TS**: services, PIDs, errors; `.ts` file, UDP, TCP/HTTP to VLC or PotPlayer | ✅ |
 | **TS analyser** (EBSPro-style): PIDs, services, now/next, network, tables | ✅ |
-| **Multicast audio** from GSE or MPE: SAP/SDP names, codecs, play in VLC/PotPlayer | ✅ |
+| **Multicast audio** from GSE or MPE: SAP/SDP names, codecs; play in the app (volume, pause) or VLC/PotPlayer; record to file | ✅ |
 | Modulator (HackRF TX / IQ file) | M6 |
 
 ## Using it
@@ -122,10 +122,22 @@ Satellite links carry radio as IP multicast — in GSE, or in MPE inside a
 transport stream (both are read). Any DVB-S2 IP or TS VFO lists the audio
 streams it finds under **Multicast audio**: named from SAP/SDP announcements
 where there are any, with codec (AAC in ADTS, LATM/LOAS or RFC 3640, MPEG
-audio, PCM), bitrate and RTP payload type. **▶ VLC / ▶ PotPlayer** plays one:
-an RTP stream with a description is relayed to a local port and the player is
-given an SDP file (so it decodes HE-AAC, LATM and the rest itself); a bare
-elementary stream is served at a local HTTP address. After the
+audio, PCM), bitrate and RTP payload type, listed by address.
+
+- **▶ Play** decodes it in DecDVB: MPEG audio layers I–III, AAC-LC (from
+  ADTS, LATM/LOAS or RFC 3640) and PCM/G.711, with **⏸ Pause** (resumes
+  live), **⏹ Stop**, a level meter, and the volume slider and 🔊 mute at the
+  top of the list (app-wide, remembered). HE-AAC plays its AAC-LC core —
+  band-limited; open it in VLC for the full sound. Opus is not decoded here.
+- **⏺ Record** saves the stream to the output folder as broadcast, with no
+  re-encoding: `.mp2`/`.mp3`, `.aac` (ADTS, any AAC carriage, HE-AAC intact),
+  `.wav` for PCM, `.ts` for TS in UDP.
+- **… → Open in VLC / PotPlayer**: an RTP stream with a description is
+  relayed to a local port and the player is given an SDP file (so it decodes
+  HE-AAC, LATM and the rest itself); a bare elementary stream is served at a
+  local HTTP address.
+
+After the
 [VK2SWL DVB-S/S2 Multicast Audio Receiver](https://github.com/VK2SWL/DVB-S-S2-Multicast-Audio-Receiver).
 
 ### Generic PSK → symbols
