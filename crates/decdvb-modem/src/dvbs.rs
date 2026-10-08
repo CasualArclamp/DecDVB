@@ -1,0 +1,610 @@
+//! DVB-S (EN 300 421): QPSK carrying an MPEG-TS through energy dispersal,
+//! RS(204,188), a convolutional interleaver and the punctured K = 7 code.
+//!
+//! The receiver works blind: a QPSK carrier, locked by the generic
+//! demodulator to some multiple of 90° and possibly spectrally inverted,
+//! goes in; it finds the code rate, the puncturing phase and the rotation
+//! by decoding a block under every hypothesis and re-encoding it — the right
+//! one reproduces the received bits, any wrong one does not — then finds the
+//! packets by their sync bytes (0x47, and 0xB8 every eighth packet).
+//! Energy dispersal per §4.4.1 and the RS and interleaver per §4.4.2 match
+//! `gr-dtv`'s DVB-T blocks, which share them.
+
+use std::collections::VecDeque;
+
+use decdvb_core::Iq;
+
+use crate::conv::{self, Encoder, Rate, Viterbi};
+use crate::interleave::Interleaver;
+use crate::rs::ReedSolomon;
+
+pub const TS_LEN: usize = 188;
+const RS_LEN: usize = 204;
+const SYNC: u8 = 0x47;
+const NSYNC: u8 = 0xB8;
+
+/// The energy-dispersal PRBS, 1 + X¹⁴ + X¹⁵ (§4.4.1), restarted at
+/// "100101010000000" on every eighth packet (gr-dtv's register 0xA9).
+struct Prbs(u16);
+
+impl Prbs {
+    fn new() -> Self {
+        Prbs(0xA9)
+    }
+
+    fn byte(&mut self) -> u8 {
+        let mut b = 0u8;
+        for _ in 0..8 {
+            let fb = ((self.0 >> 13) ^ (self.0 >> 14)) & 1;
+            self.0 = ((self.0 << 1) | fb) & 0x7FFF;
+            b = (b << 1) | fb as u8;
+        }
+        b
+    }
+}
+
+/// Randomise (or derandomise — it is an XOR) a packet `index` of its group
+/// of eight, in place; the group's first sync byte is inverted.
+fn disperse(prbs: &mut Prbs, index: u64, p: &mut [u8; TS_LEN]) {
+    if index.is_multiple_of(8) {
+        *prbs = Prbs::new();
+    } else {
+        prbs.byte(); // clocked through the sync byte, not applied
+    }
+    for b in &mut p[1..] {
+        *b ^= prbs.byte();
+    }
+}
+
+/// DVB-S transmitter: TS packets in, QPSK symbols out (unit power).
+pub struct DvbsTx {
+    rate: Rate,
+    enc: Encoder,
+    rs: ReedSolomon,
+    il: Interleaver,
+    prbs: Prbs,
+    index: u64,
+    coded: Vec<u8>,
+    /// A coded bit waiting for its partner (I without Q).
+    odd: Option<u8>,
+}
+
+impl DvbsTx {
+    pub fn new(rate: Rate) -> Self {
+        DvbsTx {
+            rate,
+            enc: Encoder::new(rate),
+            rs: ReedSolomon::dvb(),
+            il: Interleaver::dvb(),
+            prbs: Prbs::new(),
+            index: 0,
+            coded: Vec::new(),
+            odd: None,
+        }
+    }
+
+    pub fn rate(&self) -> Rate {
+        self.rate
+    }
+
+    /// One TS packet (its sync byte is replaced); symbols go to `out`.
+    pub fn packet(&mut self, ts: &[u8; TS_LEN], out: &mut Vec<Iq>) {
+        let mut p = *ts;
+        disperse(&mut self.prbs, self.index, &mut p);
+        p[0] = if self.index.is_multiple_of(8) {
+            NSYNC
+        } else {
+            SYNC
+        };
+        self.index += 1;
+        let mut block = [0u8; RS_LEN];
+        block[..TS_LEN].copy_from_slice(&p);
+        self.rs.encode(&mut block);
+        self.coded.clear();
+        for &b in &block {
+            let b = self.il.push(b);
+            for i in (0..8).rev() {
+                self.enc.push((b >> i) & 1, &mut self.coded);
+            }
+        }
+        // QPSK: the coded bits alternate onto I and Q, 0 → +1 (§4.5).
+        let k = std::f32::consts::FRAC_1_SQRT_2;
+        let pm = |b: u8| if b == 0 { k } else { -k };
+        for &c in &self.coded {
+            match self.odd.take() {
+                None => self.odd = Some(c),
+                Some(i) => out.push(Iq::new(pm(i), pm(c))),
+            }
+        }
+    }
+}
+
+/// How the received symbols map onto the coded stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hypothesis {
+    pub rate: Rate,
+    /// Turned by 90° (the 180° cases come out as inverted data, which the
+    /// sync bytes catch).
+    pub rotated: bool,
+    /// Spectrally inverted (I and Q mirrored).
+    pub inverted: bool,
+    /// Coded bits to skip so a puncturing period starts.
+    pub offset: usize,
+}
+
+impl Hypothesis {
+    /// Soft coded bits from symbols: I then Q, positive for 0.
+    fn soft(&self, symbols: &[Iq], out: &mut Vec<f32>) {
+        for &s in symbols {
+            let mut y = if self.inverted { s.conj() } else { s };
+            if self.rotated {
+                y *= Iq::new(0.0, -1.0);
+            }
+            out.push(y.re);
+            out.push(y.im);
+        }
+    }
+
+    fn all() -> Vec<Hypothesis> {
+        let mut v = Vec::new();
+        for rate in Rate::ALL {
+            // The puncturing period can begin on any I bit.
+            let span = if rate.coded().is_multiple_of(2) {
+                rate.coded()
+            } else {
+                2 * rate.coded()
+            };
+            for offset in (0..span).step_by(2) {
+                for rotated in [false, true] {
+                    for inverted in [false, true] {
+                        v.push(Hypothesis {
+                            rate,
+                            rotated,
+                            inverted,
+                            offset,
+                        });
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    /// Re-encoding mismatch of a block decoded under this hypothesis: ~0
+    /// to the raw bit error rate when right, ~0.3–0.5 when not.
+    fn score(&self, symbols: &[Iq]) -> f32 {
+        let mut soft = Vec::with_capacity(2 * symbols.len());
+        self.soft(symbols, &mut soft);
+        let soft = &soft[self.offset..];
+        let n = soft.len() / self.rate.coded() * self.rate.coded();
+        let bits = conv::decode_block(self.rate, &soft[..n]);
+        let mut enc = Encoder::new(self.rate);
+        let mut coded = Vec::with_capacity(n);
+        for &b in &bits {
+            enc.push(b, &mut coded);
+        }
+        // Skip the start (the encoder's unknown history) and the end (the
+        // last decisions have no future to lean on).
+        let (a, b) = (40, coded.len().saturating_sub(40));
+        if b <= a {
+            return 1.0;
+        }
+        let wrong = (a..b)
+            .filter(|&i| (soft[i] < 0.0) != (coded[i] == 1))
+            .count();
+        wrong as f32 / (b - a) as f32
+    }
+}
+
+/// What the receiver has done, for display.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DvbsStats {
+    /// The code rate found, once locked.
+    pub rate: Option<Rate>,
+    /// Coded bits the decoder had to correct, fraction, over the last
+    /// search (a channel BER estimate).
+    pub channel_ber: f32,
+    pub packets: u64,
+    pub rs_corrected: u64,
+    pub rs_failed: u64,
+    /// Times the stream was found (again).
+    pub syncs: u64,
+}
+
+enum Stage {
+    /// Collecting symbols to try the hypotheses on.
+    Search,
+    /// Decoding; looking for packet sync in the bits.
+    Locked { hyp: Hypothesis },
+}
+
+/// Symbols per hypothesis search.
+const SEARCH: usize = 3000;
+/// A hypothesis must reproduce the bits this much better than its rate's
+/// typical (wrong) hypothesis to be taken.
+const RATIO_OK: f32 = 0.5;
+/// Packets in a row with a bad sync byte before starting over.
+const SYNC_LOST: u32 = 12;
+
+/// DVB-S receiver: carrier-locked QPSK symbols in, TS packets out.
+pub struct DvbsRx {
+    stage: Stage,
+    held: Vec<Iq>,
+    soft: Vec<f32>,
+    xy: Vec<(f32, f32)>,
+    viterbi: Viterbi,
+    bits: VecDeque<u8>,
+    decided: Vec<u8>,
+    /// Packet alignment in the decoded bits: found, and the stream inverted
+    /// (a 180° rotation).
+    aligned: Option<bool>,
+    deint: Interleaver,
+    /// Bytes through the deinterleaver since alignment.
+    deint_count: usize,
+    packet: Vec<u8>,
+    rs: ReedSolomon,
+    prbs: Prbs,
+    /// Packets since the last inverted sync byte, once one is seen.
+    group: Option<u64>,
+    bad_syncs: u32,
+    pub stats: DvbsStats,
+}
+
+impl Default for DvbsRx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DvbsRx {
+    pub fn new() -> Self {
+        DvbsRx {
+            stage: Stage::Search,
+            held: Vec::new(),
+            soft: Vec::new(),
+            xy: Vec::new(),
+            viterbi: Viterbi::new(),
+            bits: VecDeque::new(),
+            decided: Vec::new(),
+            aligned: None,
+            deint: Interleaver::dvb_deinterleaver(),
+            deint_count: 0,
+            packet: Vec::with_capacity(RS_LEN),
+            rs: ReedSolomon::dvb(),
+            prbs: Prbs::new(),
+            group: None,
+            bad_syncs: 0,
+            stats: DvbsStats::default(),
+        }
+    }
+
+    /// The hypothesis in use, if locked.
+    pub fn hypothesis(&self) -> Option<Hypothesis> {
+        match self.stage {
+            Stage::Locked { hyp } => Some(hyp),
+            Stage::Search => None,
+        }
+    }
+
+    fn restart(&mut self) {
+        self.stage = Stage::Search;
+        self.held.clear();
+        self.soft.clear();
+        self.viterbi.reset();
+        self.bits.clear();
+        self.aligned = None;
+        self.group = None;
+        self.bad_syncs = 0;
+        self.stats.rate = None;
+    }
+
+    /// Feed carrier-locked symbols; decoded TS packets go to `out`.
+    pub fn push(&mut self, symbols: &[Iq], out: &mut Vec<[u8; TS_LEN]>) {
+        match self.stage {
+            Stage::Search => {
+                self.held.extend_from_slice(symbols);
+                if self.held.len() < SEARCH {
+                    return;
+                }
+                let block = &self.held[..SEARCH];
+                let scored: Vec<(Hypothesis, f32)> = Hypothesis::all()
+                    .into_iter()
+                    .map(|h| (h, h.score(block)))
+                    .collect();
+                // A weak code (7/8) re-encodes noise nearly as well as the
+                // right hypothesis re-encodes a noisy signal, so each score
+                // is judged against its own rate's: the right one stands
+                // far below the median of its rate's wrong ones.
+                let best = scored
+                    .iter()
+                    .map(|&(h, sc)| {
+                        let mut same: Vec<f32> = scored
+                            .iter()
+                            .filter(|(o, _)| o.rate == h.rate)
+                            .map(|&(_, s)| s)
+                            .collect();
+                        same.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        let median = same[same.len() / 2].max(1e-3);
+                        (h, sc, sc / median)
+                    })
+                    .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap())
+                    .unwrap();
+                if best.2 > RATIO_OK {
+                    // Nothing fits: slide on.
+                    self.held.drain(..SEARCH / 2);
+                    return;
+                }
+                let hyp = best.0;
+                self.stats.rate = Some(hyp.rate);
+                self.stats.channel_ber = best.1;
+                self.stage = Stage::Locked { hyp };
+                let held = std::mem::take(&mut self.held);
+                hyp.soft(&held, &mut self.soft);
+                self.soft.drain(..hyp.offset);
+                self.decode(out);
+            }
+            Stage::Locked { hyp } => {
+                hyp.soft(symbols, &mut self.soft);
+                self.decode(out);
+            }
+        }
+    }
+
+    fn decode(&mut self, out: &mut Vec<[u8; TS_LEN]>) {
+        let Stage::Locked { hyp } = self.stage else {
+            return;
+        };
+        let c = hyp.rate.coded();
+        let whole = self.soft.len() / c * c;
+        self.xy.clear();
+        conv::depuncture(hyp.rate, &self.soft[..whole], &mut self.xy);
+        self.soft.drain(..whole);
+        self.decided.clear();
+        for &(x, y) in &self.xy {
+            self.viterbi.push(x, y, &mut self.decided);
+        }
+        self.bits.extend(self.decided.iter().copied());
+        self.packets(out);
+    }
+
+    /// The byte starting at bit `at` of the decoded bits.
+    fn byte_at(&self, at: usize) -> u8 {
+        (0..8).fold(0u8, |b, i| (b << 1) | self.bits[at + i])
+    }
+
+    fn packets(&mut self, out: &mut Vec<[u8; TS_LEN]>) {
+        let pkt_bits = RS_LEN * 8;
+        if self.aligned.is_none() {
+            // Eight packets' worth of sync bytes in a row, at some bit offset.
+            let need = pkt_bits * 8;
+            if self.bits.len() < need + pkt_bits {
+                return;
+            }
+            let found = (0..pkt_bits).find_map(|off| {
+                let mut normal = 0;
+                let mut inverse = 0;
+                for k in 0..8 {
+                    match self.byte_at(off + k * pkt_bits) {
+                        SYNC => normal += 1,
+                        NSYNC => inverse += 1,
+                        _ => return None,
+                    }
+                }
+                // 7 + 1 one way or the other: a 180° turn swaps them.
+                Some((off, inverse > normal))
+            });
+            match found {
+                Some((off, inv)) => {
+                    self.bits.drain(..off);
+                    self.aligned = Some(inv);
+                    self.deint = Interleaver::dvb_deinterleaver();
+                    self.deint_count = 0;
+                    self.packet.clear();
+                    self.group = None;
+                    self.stats.syncs += 1;
+                }
+                None => {
+                    // Wrong rotation or rate after all, or a slip: if a
+                    // long stretch holds no sync, search again.
+                    if self.bits.len() > need * 3 {
+                        self.restart();
+                    }
+                    return;
+                }
+            }
+        }
+        let inv = self.aligned.unwrap();
+        while self.bits.len() >= 8 {
+            let mut b = self.byte_at(0);
+            self.bits.drain(..8);
+            if inv {
+                b = !b;
+            }
+            // Watch the sync bytes on the way in (branch 0 keeps them).
+            if self.deint_count.is_multiple_of(RS_LEN) {
+                if b == SYNC || b == NSYNC {
+                    self.bad_syncs = 0;
+                } else {
+                    self.bad_syncs += 1;
+                    if self.bad_syncs >= SYNC_LOST {
+                        self.restart();
+                        return;
+                    }
+                }
+            }
+            let d = self.deint.push(b);
+            self.deint_count += 1;
+            // The deinterleaver's first 11 packets are its initial fill.
+            if self.deint_count <= 11 * RS_LEN {
+                continue;
+            }
+            self.packet.push(d);
+            if self.packet.len() == RS_LEN {
+                self.finish_packet(out);
+                self.packet.clear();
+            }
+        }
+    }
+
+    fn finish_packet(&mut self, out: &mut Vec<[u8; TS_LEN]>) {
+        let mut block = [0u8; RS_LEN];
+        block.copy_from_slice(&self.packet);
+        match self.rs.decode(&mut block) {
+            Ok(n) => self.stats.rs_corrected += n as u64,
+            Err(_) => {
+                self.stats.rs_failed += 1;
+                // Keep the dispersal count running; the packet is lost.
+                if let Some(g) = &mut self.group {
+                    *g += 1;
+                }
+                return;
+            }
+        }
+        let mut p = [0u8; TS_LEN];
+        p.copy_from_slice(&block[..TS_LEN]);
+        if p[0] == NSYNC {
+            self.group = Some(0);
+        }
+        let Some(g) = self.group else {
+            return; // until the first group starts, the PRBS is unknown
+        };
+        disperse(&mut self.prbs, g, &mut p);
+        self.group = Some(g + 1);
+        p[0] = SYNC;
+        self.stats.packets += 1;
+        out.push(p);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts_packets(n: usize) -> Vec<[u8; TS_LEN]> {
+        (0..n)
+            .map(|i| {
+                let mut p = [0u8; TS_LEN];
+                p[0] = SYNC;
+                p[1] = 0x01;
+                p[2] = 0x00;
+                p[3] = 0x10 | (i as u8 & 0x0F);
+                for (j, b) in p[4..].iter_mut().enumerate() {
+                    *b = (i * 31 + j * 7) as u8;
+                }
+                p
+            })
+            .collect()
+    }
+
+    fn noise(seed: u64) -> impl FnMut() -> f32 {
+        let mut s = seed | 1;
+        move || {
+            let mut u = || {
+                s ^= s >> 12;
+                s ^= s << 25;
+                s ^= s >> 27;
+                ((s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64)
+                    .max(1e-300)
+            };
+            let (a, b) = (u(), u());
+            ((-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()) as f32
+        }
+    }
+
+    #[test]
+    fn prbs_starts_as_the_standard_says() {
+        // EN 300 421 §4.4.1: the first PRBS bytes after initialisation —
+        // 0x03 0xF6 0x08 (the well-known start of the DVB sequence).
+        let mut p = Prbs::new();
+        assert_eq!([p.byte(), p.byte(), p.byte()], [0x03, 0xF6, 0x08]);
+    }
+
+    fn run(
+        rate: Rate,
+        turn: Iq,
+        conj: bool,
+        esn0_db: f32,
+        skip: usize,
+    ) -> (Vec<[u8; TS_LEN]>, DvbsRx) {
+        let pkts = ts_packets(260);
+        let mut tx = DvbsTx::new(rate);
+        let mut sym = Vec::new();
+        for p in &pkts {
+            tx.packet(p, &mut sym);
+        }
+        let sigma = (10f32.powf(-esn0_db / 10.0) / 2.0).sqrt();
+        let mut n = noise(7);
+        let rx_sym: Vec<Iq> = sym[skip..]
+            .iter()
+            .map(|&s| {
+                let y = if conj { s.conj() } else { s } * turn;
+                y + Iq::new(sigma * n(), sigma * n())
+            })
+            .collect();
+        let mut rx = DvbsRx::new();
+        let mut got = Vec::new();
+        for chunk in rx_sym.chunks(997) {
+            rx.push(chunk, &mut got);
+        }
+        // Every packet out must be one that went in, in order.
+        if let Some(first) = got.first() {
+            let at = pkts
+                .iter()
+                .position(|p| p == first)
+                .expect("first packet unknown");
+            for (k, g) in got.iter().enumerate() {
+                assert_eq!(*g, pkts[at + k], "packet {k}");
+            }
+        }
+        (got, rx)
+    }
+
+    #[test]
+    fn every_rate_decodes_clean() {
+        for rate in Rate::ALL {
+            let (got, rx) = run(rate, Iq::new(1.0, 0.0), false, 30.0, 0);
+            assert!(
+                got.len() > 150,
+                "rate {}: {} packets",
+                rate.name(),
+                got.len()
+            );
+            assert_eq!(rx.stats.rate, Some(rate));
+            assert_eq!(rx.stats.rs_failed, 0);
+        }
+    }
+
+    #[test]
+    fn any_rotation_inversion_and_start() {
+        let turns = [
+            Iq::new(1.0, 0.0),
+            Iq::new(0.0, 1.0),
+            Iq::new(-1.0, 0.0),
+            Iq::new(0.0, -1.0),
+        ];
+        for (k, &turn) in turns.iter().enumerate() {
+            for conj in [false, true] {
+                let (got, _) = run(Rate::R3_4, turn, conj, 30.0, 17 + k);
+                assert!(
+                    got.len() > 150,
+                    "turn {k} conj {conj}: {} packets",
+                    got.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_near_threshold() {
+        // Rate 1/2 needs about 2.5 dB Es/N0 for quasi-error-free output
+        // (EN 300 421 Table C.1: Eb/N0 4.5 dB with RS); at 3.5 dB RS mops
+        // up what Viterbi leaves.
+        let (got, rx) = run(Rate::R1_2, Iq::new(0.0, 1.0), false, 3.5, 5);
+        assert!(got.len() > 150, "{} packets, {:?}", got.len(), rx.stats);
+        assert!(
+            rx.stats.rs_corrected > 0,
+            "too clean to test: {:?}",
+            rx.stats
+        );
+    }
+}

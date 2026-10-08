@@ -13,7 +13,7 @@ a media player, multicast radio played in the app.
 
 *A synthetic 8 MS/s test scene (`decdvb scene`): a DVB-S2 CCM carrier, an
 ACM carrier mixing S2 and S2X MODCODs (QPSK 1/2 → 8PSK 25/36 → 16APSK 26/45 →
-32APSK 32/45), a plain QPSK carrier and a CW tone. Every carrier was found and
+32APSK 32/45), a DVB-S carrier and a CW tone. Every carrier was found and
 identified blind.*
 
 > Early development. [`docs/DESIGN.md`](docs/DESIGN.md) holds the scope and the
@@ -29,6 +29,7 @@ identified blind.*
 | **Identify** — blind symbol rate, roll-off, constellation, DVB-S2/S2X detection | ✅ |
 | DVB-S2/S2X PL demodulation: frame lock, MODCOD per frame (ACM) | ✅ |
 | Carrier recovery: a locked constellation and MER, for Identify and DVB-S2 VFOs | ✅ |
+| **DVB-S → MPEG-TS** (EN 300 421): code rate, rotation and inversion found blind; Viterbi, RS, the same TS outputs | ✅ |
 | **Generic PSK/APSK → symbols** (`.bin`, one byte per symbol), for non-DVB carriers | ✅ |
 | Narrow carriers: VFOs down to 500 Hz, ~10 kBd SCPC carriers lock | ✅ |
 | IQ recorder and spectrum-only VFOs | ✅ |
@@ -144,6 +145,17 @@ audio, PCM), bitrate and RTP payload type, listed by address.
 
 After the
 [VK2SWL DVB-S/S2 Multicast Audio Receiver](https://github.com/VK2SWL/DVB-S-S2-Multicast-Audio-Receiver).
+
+### DVB-S → MPEG-TS
+
+The older standard, still the norm for amateur DATV (QO-100) and some feeds.
+The VFO finds the symbol rate as usual, locks the QPSK, then works out the
+rest itself: the code rate (1/2 … 7/8), the puncturing phase, and the
+carrier's 90° rotation and spectral inversion, by decoding a block under
+each hypothesis and keeping the one whose re-encoding matches what was
+received. Then Viterbi (K = 7, soft), the sync bytes, the convolutional
+deinterleaver, Reed–Solomon (204,188) and energy dispersal — and the stream
+goes to the same TS outputs and analyser as DVB-S2's.
 
 ### Generic PSK → symbols
 

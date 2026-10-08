@@ -152,7 +152,7 @@ impl TsBbFramer {
 
     /// The next test packet, sync byte included: the tables (PAT, PMT,
     /// SDT, EIT, NIT, TDT) every 40 packets, else data.
-    fn packet(&mut self) -> [u8; TS_LEN] {
+    pub fn packet(&mut self) -> [u8; TS_LEN] {
         let n = self.seq;
         self.seq += 1;
         let k = (n % 40) as usize;

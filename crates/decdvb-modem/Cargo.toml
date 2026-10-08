@@ -1,0 +1,11 @@
+[package]
+name = "decdvb-modem"
+description = "DecDVB satellite modem formats: DVB-S (EN 300 421) and the Intelsat / turbo-code family"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decdvb-core = { path = "../decdvb-core" }

@@ -8,10 +8,12 @@
 //! | −2.5 MHz | DVB-S2 CCM, QPSK 1/2 + pilots, 1 MS/s, α 0.20 — IP over GSE |
 //! | −0.8 MHz | an unmodulated CW tone                           |
 //! | +1.2 MHz | DVB-S2/**S2X ACM**: QPSK 1/2 → 8PSK 25/36 → short 16APSK 26/45 → 32APSK 32/45 (4+8+4+16), 500 kS/s, α 0.25 — MPEG-TS |
-//! | +2.8 MHz | plain QPSK, no PLHEADERs, 250 kS/s, α 0.35       |
+//! | +2.8 MHz | DVB-S (EN 300 421), QPSK 3/4, 250 kS/s, α 0.35 — MPEG-TS |
 //!
-//! The DVB-S2 carriers are real, fully coded signals: TS packets in BBFRAMEs,
-//! BCH and LDPC, PLFRAMEs with pilots and scrambling — they decode end to end.
+//! The carriers are real, fully coded signals — TS packets in BBFRAMEs, BCH
+//! and LDPC, PLFRAMEs with pilots and scrambling for DVB-S2; Reed–Solomon,
+//! interleaving and the punctured convolutional code for DVB-S — and decode
+//! end to end.
 
 use std::path::Path;
 
@@ -19,7 +21,9 @@ use anyhow::Result;
 use decdvb_core::{Iq, RollOff, SampleFormat};
 use decdvb_gse::Variant;
 use decdvb_io::IqFileWriter;
-use decdvb_mod::{FrameSpec, GseBbFramer, PlFramer, Shaper};
+use decdvb_mod::{FrameSpec, GseBbFramer, PlFramer, Shaper, TsBbFramer};
+use decdvb_modem::conv::Rate;
+use decdvb_modem::dvbs::DvbsTx;
 
 pub const RATE: f64 = 8e6;
 
@@ -51,18 +55,6 @@ fn shaped(symbols: &[Iq], sps: usize, alpha: f64) -> Vec<Iq> {
     x
 }
 
-fn qpsk(n: usize, rng: &mut Rng) -> Vec<Iq> {
-    let k = std::f32::consts::FRAC_1_SQRT_2;
-    (0..n)
-        .map(|_| match rng.next() >> 62 {
-            0 => Iq::new(k, k),
-            1 => Iq::new(-k, k),
-            2 => Iq::new(-k, -k),
-            _ => Iq::new(k, -k),
-        })
-        .collect()
-}
-
 /// Write the scene, `seconds` long.
 pub fn write(out: &Path, seconds: f64) -> Result<()> {
     let n = (RATE * seconds) as usize;
@@ -91,7 +83,17 @@ pub fn write(out: &Path, seconds: f64) -> Result<()> {
         let syms = f.build_schedule(&sched, n / 16 + 64);
         shaped(&syms, 16, 0.25)
     };
-    let c = shaped(&qpsk(n / 32 + 64, &mut rng), 32, 0.35);
+    // DVB-S: the same test transport stream (tables, MPE radio), rate 3/4.
+    let c = {
+        let mut ts = TsBbFramer::new(3);
+        let mut tx = DvbsTx::new(Rate::R3_4);
+        let mut syms = Vec::new();
+        while syms.len() < n / 32 + 20_064 {
+            tx.packet(&ts.packet(), &mut syms);
+        }
+        // Mid-stream: skip the interleaver's start-up zeros.
+        shaped(&syms[20_000..], 32, 0.35)
+    };
 
     // Mix: each carrier rotated to its offset and scaled to its level.
     let carriers: [(&[Iq], f64, f32); 3] =

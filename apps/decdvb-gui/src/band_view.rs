@@ -164,6 +164,21 @@ pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
             Some(LockState::Searching) => "search".into(),
             None => format!("acq {:.0} %", st.progress * 100.0),
         },
+        DecoderKind::DvbsTs => match (&st.carrier, st.fec.as_ref()) {
+            (Some(c), Some(f)) if f.dvbs.as_ref().is_some_and(|d| d.rate.is_some()) => {
+                let d = f.dvbs.as_ref().unwrap();
+                let rec = f.ts.as_ref().is_some_and(|t| t.file_active);
+                format!(
+                    "{} {} · {}{}",
+                    if c.locked { "LOCK" } else { "no lock" },
+                    d.rate.map_or("?", |r| r.name()),
+                    format::bitrate(f.payload_bps),
+                    if rec { " ● REC" } else { "" }
+                )
+            }
+            (Some(c), _) => format!("{} · rate?", if c.locked { "LOCK" } else { "no lock" }),
+            (None, _) => format!("acq {:.0} %", st.progress * 100.0),
+        },
         DecoderKind::PskSymbols => match &st.carrier {
             Some(c) => {
                 let lock = if c.locked { "LOCK" } else { "no lock" };

@@ -40,6 +40,13 @@ use decdvb_ts::{
 use crate::demod::{PILOT_AFTER, PILOT_PERIOD, PlFrame};
 use decdvb_audio::{AudioHandle, AudioPlayer, AudioRecorder, OutputKind};
 
+/// What the FEC thread works on: DVB-S2 frames, or DVB-S symbols.
+pub(crate) enum FecInput {
+    Frame(PlFrame),
+    /// Carrier-locked QPSK symbols of a DVB-S carrier.
+    Dvbs(Vec<Iq>),
+}
+
 /// LLR quantization: steps per LLR unit (the decoder is happy from 2 to 8).
 const LLR_SCALE: f32 = 4.0;
 /// Where in-app audio plays: the sound card, except under test.
@@ -309,6 +316,8 @@ pub struct FecStats {
     pub gse: Option<GseView>,
     /// The MPEG-TS from the TS-mode frames (MPEG-TS decoders).
     pub ts: Option<TsView>,
+    /// DVB-S: the code rate found, Viterbi and Reed–Solomon.
+    pub dvbs: Option<decdvb_modem::dvbs::DvbsStats>,
 }
 
 /// The transport stream and its outputs, for display.
@@ -410,7 +419,7 @@ pub struct FecOutput {
 
 /// Runs a [`FecDecoder`] on its own thread.
 pub(crate) struct FecWorker {
-    tx: Option<SyncSender<PlFrame>>,
+    tx: Option<SyncSender<FecInput>>,
     stats: Arc<Mutex<FecStats>>,
     output: Arc<Mutex<FecOutput>>,
     /// A frame was dropped since the thread last looked: streams that span
@@ -442,8 +451,17 @@ impl FecWorker {
 
     /// Queue a frame; drop it (counted) if the thread is behind.
     pub fn offer(&self, f: PlFrame) {
+        self.send(FecInput::Frame(f));
+    }
+
+    /// Queue a block of DVB-S symbols.
+    pub fn offer_dvbs(&self, symbols: Vec<Iq>) {
+        self.send(FecInput::Dvbs(symbols));
+    }
+
+    fn send(&self, input: FecInput) {
         if let Some(tx) = &self.tx
-            && let Err(TrySendError::Full(_)) = tx.try_send(f)
+            && let Err(TrySendError::Full(_)) = tx.try_send(input)
         {
             self.stats.lock().unwrap().dropped += 1;
             self.gap.store(true, Ordering::Relaxed);
@@ -784,6 +802,8 @@ struct TsStage {
     /// IP in MPE sections, and the datagrams from the last field.
     mpe: MpeExtractor,
     datagrams: Vec<(Vec<u8>, IpInfo)>,
+    /// Packets that came whole (DVB-S) rather than through the deframer.
+    direct: u64,
 }
 
 impl TsStage {
@@ -806,6 +826,7 @@ impl TsStage {
             report_at: None,
             mpe: MpeExtractor::new(),
             datagrams: Vec::new(),
+            direct: 0,
         }
     }
 
@@ -863,6 +884,19 @@ impl TsStage {
         self.packets.clear();
         self.deframer
             .data_field(field, h.syncd, h.npd, h.issyi, &mut self.packets);
+        self.forward();
+    }
+
+    /// Whole packets (DVB-S).
+    fn packets_in(&mut self, pkts: &[[u8; TS_LEN]]) {
+        self.packets.clear();
+        self.packets.extend_from_slice(pkts);
+        self.direct += pkts.len() as u64;
+        self.forward();
+    }
+
+    /// The packets just taken to the analyser, MPE and the outputs.
+    fn forward(&mut self) {
         self.datagrams.clear();
         for p in &self.packets {
             self.analyser.packet(p);
@@ -907,7 +941,7 @@ impl TsStage {
         let d = &self.deframer.stats;
         let cc_errors = self.analyser.pids.values().map(|s| s.cc_errors).sum();
         TsView {
-            packets: d.packets,
+            packets: d.packets + self.direct,
             crc_errors: d.crc_errors,
             cc_errors,
             nulls_reinserted: d.nulls_reinserted,
@@ -936,7 +970,7 @@ impl Drop for TsStage {
 }
 
 fn run(
-    rx: Receiver<PlFrame>,
+    rx: Receiver<FecInput>,
     stats: Arc<Mutex<FecStats>>,
     output: Arc<Mutex<FecOutput>>,
     gap: Arc<AtomicBool>,
@@ -948,8 +982,49 @@ fn run(
     // Payload rate window: DFL bits and signal seconds.
     let (mut win_bits, mut win_secs) = (0f64, 0f64);
     let mut busy = 0f64;
-    while let Ok(f) = rx.recv() {
+    let mut dvbs: Option<decdvb_modem::dvbs::DvbsRx> = None;
+    let mut dvbs_out = Vec::new();
+    while let Ok(input) = rx.recv() {
         let t0 = Instant::now();
+        let f = match input {
+            FecInput::Frame(f) => f,
+            FecInput::Dvbs(sym) => {
+                // DVB-S: blind Viterbi/RS decoding, then the TS stage as for
+                // a DVB-S2 TS carrier (and IP from MPE).
+                let secs = sym.len() as f64 / symbol_rate;
+                let rx = dvbs.get_or_insert_with(decdvb_modem::dvbs::DvbsRx::new);
+                dvbs_out.clear();
+                rx.push(&sym, &mut dvbs_out);
+                let stage = ts.get_or_insert_with(TsStage::new);
+                stage.follow(&output.lock().unwrap());
+                stage.packets_in(&dvbs_out);
+                stage.tick(secs);
+                if !stage.datagrams.is_empty() || ip.is_some() {
+                    let ipst = ip.get_or_insert_with(IpStage::new);
+                    ipst.follow(&output.lock().unwrap());
+                    ipst.mpe(&stage.datagrams, &stage.mpe.stats);
+                    ipst.tick(secs);
+                }
+                let used = t0.elapsed().as_secs_f64();
+                busy = 0.95 * busy + 0.05 * (used / secs.max(1e-9));
+                win_secs += secs;
+                win_bits += (dvbs_out.len() * TS_LEN * 8) as f64;
+                let mut s = stats.lock().unwrap();
+                s.load = busy as f32;
+                if win_secs >= 2.0 {
+                    s.payload_bps = win_bits / win_secs;
+                    (win_bits, win_secs) = (0.0, 0.0);
+                } else if s.payload_bps == 0.0 && win_secs > 0.2 {
+                    s.payload_bps = win_bits / win_secs;
+                }
+                s.dvbs = Some(rx.stats.clone());
+                s.ts = Some(stage.view());
+                if let Some(stage) = &mut ip {
+                    s.gse = Some(stage.view());
+                }
+                continue;
+            }
+        };
         let secs = f.pls.plframe_len as f64 / symbol_rate;
         let out = dec.decode(&f);
 

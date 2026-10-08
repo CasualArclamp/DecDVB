@@ -516,3 +516,32 @@ add up coherently (~1) and with a wrong one do not (~0.05) — no carrier lock
 needed. When the given gold code does not fit, the demodulator tries the
 seven preferred ones (0 and k·10 949) and switches; the side panel shows
 "using … (found)".
+
+## RCV-20x modes, part 1 — DVB-S (done, 2026-10-09)
+
+Rory sent the CTCOM RCV-20x manual ("add this as a mod"): its decoder modes,
+after S2X, with TPC 2964 (IESS-315) the most important. IESS-315 has to be
+fetched first (asked for, not downloaded); DVB-S, also on the RCV-20x's
+list, needs nothing new and came first.
+
+- **`decdvb-modem`** (new crate). `conv`: K = 7, G1 = 171₈, G2 = 133₈,
+  puncturing for 1/2 … 7/8 (EN 300 421 Table 2), streaming soft Viterbi with
+  block traceback — conventions checked against gr-dtv's DVB-T inner coder.
+  `rs`: RS over GF(256) (0x11D, roots α⁰…), any shortened (n, k): DVB-S's
+  204/188 and the Intelsat sizes the RCV-20x lists. `interleave`: Forney
+  I = 12, M = 17. `dvbs`: transmitter, and a blind receiver — every
+  (rate, puncturing phase, 90° turn, inversion) is decoded and re-encoded
+  over 3000 symbols, each scored against the median of its own rate (a 7/8
+  code re-encodes noise almost as well as a right 1/2 does a noisy signal),
+  then packet sync on 0x47/0xB8, deinterleaving, RS, energy dispersal (PRBS
+  starts 03 F6 08, as it must).
+- **Engine**: the FEC thread takes DVB-S symbol blocks as well as DVB-S2
+  frames; the TS stage takes whole packets, so DVB-S gets the same outputs,
+  analyser, MPE/IP and multicast audio.
+- **GUI**: decoder "DVB-S → MPEG-TS" (`--decoder dvbs`), a DVB-S card (code
+  rate found, channel BER, RS), the TS card.
+- **Scene**: carrier C is now DVB-S, QPSK 3/4. A transmitter's first ~1100
+  bytes are its interleaver's zero fill, which made Identify read 6 kS/s:
+  the scene and test start mid-stream, as a real carrier is.
+- Tests: RS to t errors for five sizes, every rate round trip, every
+  rotation/inversion/start, rate 1/2 at 3.5 dB, and a DVB-S VFO end to end.

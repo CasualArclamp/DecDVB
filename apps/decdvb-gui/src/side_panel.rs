@@ -254,7 +254,10 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
 
             if matches!(
                 s.decoder,
-                DecoderKind::Dvbs2Ip | DecoderKind::Dvbs2Ts | DecoderKind::PskSymbols
+                DecoderKind::Dvbs2Ip
+                    | DecoderKind::Dvbs2Ts
+                    | DecoderKind::DvbsTs
+                    | DecoderKind::PskSymbols
             ) {
                 ui.label("Symbol rate");
                 ui.horizontal(|ui| {
@@ -300,7 +303,7 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                 ui.end_row();
             }
 
-            if s.decoder == DecoderKind::Dvbs2Ts {
+            if s.decoder.outputs_ts() {
                 let ts = st.fec.as_ref().and_then(|f| f.ts.as_ref());
                 ui.label("TS file");
                 ui.horizontal(|ui| {
@@ -445,7 +448,7 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
     // acquired (Identify's view) folds away below.
     let demodulates = matches!(
         v.settings.decoder,
-        DecoderKind::Dvbs2Ip | DecoderKind::Dvbs2Ts | DecoderKind::PskSymbols
+        DecoderKind::Dvbs2Ip | DecoderKind::Dvbs2Ts | DecoderKind::DvbsTs | DecoderKind::PskSymbols
     );
     if !demodulates && let Some(id) = &st.identification {
         ui.add_space(6.0);
@@ -487,6 +490,56 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
         });
         if let Some(f) = &st.fec {
             fec_card(ui, f);
+            if let Some(g) = &f.gse {
+                gse_card(ui, g);
+            }
+            if let Some(t) = &f.ts {
+                ts_card(ui, t, v.id, &mut actions);
+            }
+        }
+    }
+
+    if v.settings.decoder == DecoderKind::DvbsTs
+        && let Some(c) = &st.carrier
+    {
+        ui.add_space(6.0);
+        ui.label(RichText::new("DVB-S").strong());
+        let dv = st.fec.as_ref().and_then(|f| f.dvbs.as_ref());
+        egui::Grid::new("dvbs").num_columns(2).show(ui, |ui| {
+            carrier_rows(ui, c);
+            if let Some(rs) = st.symbol_rate {
+                ui.label("Symbol rate");
+                ui.label(format::rate(rs));
+                ui.end_row();
+            }
+            if let Some(d) = dv {
+                ui.label("Code rate");
+                match d.rate {
+                    Some(r) => ui.label(format!(
+                        "{} (found) · channel BER {:.1e}",
+                        r.name(),
+                        d.channel_ber
+                    )),
+                    None => ui.label("searching…"),
+                };
+                ui.end_row();
+                ui.label("Reed–Solomon");
+                let col = if d.rs_failed == 0 {
+                    Color32::from_rgb(110, 220, 110)
+                } else {
+                    Color32::from_rgb(240, 200, 80)
+                };
+                ui.colored_label(
+                    col,
+                    format!(
+                        "{} packets · {} bytes corrected · {} lost",
+                        d.packets, d.rs_corrected, d.rs_failed
+                    ),
+                );
+                ui.end_row();
+            }
+        });
+        if let Some(f) = &st.fec {
             if let Some(g) = &f.gse {
                 gse_card(ui, g);
             }

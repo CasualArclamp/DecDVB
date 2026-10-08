@@ -154,6 +154,9 @@ crates/
   decdvb-audio    multicast radio in the app: RTP/RFC 2250/3016/3640 and raw
                   ES depacketising, MPEG audio + AAC-LC decode (Symphonia),
                   resampling, sound output (cpal), recording as broadcast
+  decdvb-modem    other satellite modem formats: DVB-S (Viterbi K = 7 with
+                  puncturing, RS(204,188), Forney interleaving, energy dispersal),
+                  generic RS over GF(256); the Intelsat / TPC modes next
   decdvb-io       HackRF source (libhackrf FFI / soapy), IQ file reader/writer
                   (cs8/cs16/cf32), HackRF TX sink, ring buffers
   decdvb-engine   orchestrates RX (and TX) chain; ACM state; multistream/ISI

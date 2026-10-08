@@ -597,6 +597,7 @@ dependencies = [
  "decdvb-gse",
  "decdvb-io",
  "decdvb-mod",
+ "decdvb-modem",
 ]
 
 [[package]]
@@ -629,6 +630,7 @@ dependencies = [
  "decdvb-io",
  "decdvb-ip",
  "decdvb-mod",
+ "decdvb-modem",
  "decdvb-ts",
  "num-complex",
  "rustfft",
@@ -714,6 +716,13 @@ dependencies = [
  "decdvb-ts",
  "num-complex",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "decdvb-modem"
+version = "0.0.0"
+dependencies = [
+ "decdvb-core",
 ]
 
 [[package]]

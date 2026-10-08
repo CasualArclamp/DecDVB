@@ -58,7 +58,7 @@ impl Options {
                     let v = v.to_str().unwrap_or_default().to_ascii_lowercase();
                     o.decoder = Some(
                         decoder_by_name(&v)
-                            .ok_or("--decoder takes id, ip, ts, psk, rec or spec")?,
+                            .ok_or("--decoder takes id, ip, ts, dvbs, psk, rec or spec")?,
                     );
                 }
                 Some("--select") => {
@@ -97,6 +97,7 @@ fn decoder_by_name(name: &str) -> Option<decdvb_engine::DecoderKind> {
         "id" | "identify" => Identify,
         "ip" | "gse" => Dvbs2Ip,
         "ts" => Dvbs2Ts,
+        "dvbs" => DvbsTs,
         "psk" => PskSymbols,
         "rec" | "iq" => IqRecord,
         "spec" | "spectrum" => Spectrum,
