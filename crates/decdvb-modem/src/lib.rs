@@ -10,11 +10,13 @@
 //! - [`tpc2964`]: `tpc_2964` frames, their structure found from the signal.
 //! - [`payload`]: what a modem's data carry (HDLC, MPEG-TS) and how they are
 //!   scrambled, found from the data.
+//! - [`text`]: live text search in any bit stream, every reading at once.
 
 pub mod conv;
 pub mod dvbs;
 pub mod interleave;
 pub mod payload;
 pub mod rs;
+pub mod text;
 pub mod tpc;
 pub mod tpc2964;

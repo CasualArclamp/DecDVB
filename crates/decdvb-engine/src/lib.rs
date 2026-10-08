@@ -10,11 +10,13 @@ pub mod estimate;
 pub mod fec;
 pub mod frontend;
 pub mod identify;
+pub mod period;
 pub mod psk;
 pub mod spectrum;
 pub mod vfo;
 
 pub use carriers::{Carrier, detect_carriers};
+pub use decdvb_modem::text::TextView;
 pub use demod::{Demod, LockState, PlFrame};
 pub use estimate::{BandEstimate, estimate_band};
 pub use fec::{BbFrame, FecDecoder, FecOutput, FecStats, GseView, TsView};

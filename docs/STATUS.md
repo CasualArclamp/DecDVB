@@ -622,3 +622,47 @@ used comes from the RCV-20x manual (Table 3.2) and the signal.
 - Also this session: **v0.1.0 released** — `release.yml` (DecDRM's pattern)
   builds the static-CRT exes on a tag, checks versions and the C runtime,
   smoke-tests the CLI and drafts the release; `decdvb-gui --version`.
+
+## Proprietary-waveform fingerprints, live text (2026-10-09)
+
+Rory: "look for modes like NovelSat NS4 and Q-Flex FastLink", and "in the
+generic, something for looking for live strings". Also **v0.2.0 released**
+(TPC 2964).
+
+What is public (vendor sheets, manuals, a NovelSat patent; summarised from
+reading, nothing kept in the repo): NS3/NS4 use BCH + LDPC with 64800/16200
+frames, extra code rates (13/30, 7/15, 8/15, 17/30, 19/30), roll-offs down
+to 2 % (NS4), a "Golden-Sequence" setting 0–262141 (the S2 Gold-code range)
+and scrambling "reset at the start of a frame" sparing the header — S2-style
+framing is likely but the PLS meaning is not published. Paradise FastLink
+(Q-Flex) publishes rates and roll-offs only; its "DVB-S2X low-latency"
+extension adds 5400- and 3240-bit frames. Comtech VersaFEC-2: 9600/1600-symbol
+blocks. None publishes a sync word.
+
+- **Identify**: `Dvbs2Info::unconfirmed_spacing` — S2 headers recurring on a
+  grid their PLS codes do not explain → "DVB-S2-style PLHEADERs every N
+  symbols … a proprietary DVB-S2 extension (NovelSat NS3/NS4, or a vendor's
+  short frames)". `roll_off_2pct` — fits 2 % better than 5 % → "sharper than
+  DVB-S2X allows". The roll-off fit held its floor at −300 dB when the fitted
+  floor went negative, which made a 2 % carrier read 35 %; now it is held at
+  the measured floor.
+- **`period.rs`**: frame-structure finder — autocorrelation of unit-magnitude
+  locked symbols by FFT; the first peak at least half the strongest, ≥ 6×
+  the median; with ≥ 8 frames, frames folded (pass 1 straight, pass 2 each
+  frame turned onto the candidate positions) to find the runs of repeating
+  symbols. A period with nothing repeating in the fold is the data's own
+  regularity (unscrambled text) and is not reported. On the scene's DVB-S
+  carrier it finds the synthetic TS's 40-packet repeat.
+- **Live text** (`decdvb-modem::text`, `psk::TextSearch`): generic PSK VFOs
+  read the decided bits 32 ways per carrier orientation (plain/differential
+  × 8 alignments × 2 bit orders), keep runs of ≥ 6 printable characters, and
+  call the reading with ≥ 4× the median's text the one; strings ≥ 10 shown
+  live, the longest from any reading as candidates. 3.6 Msym/s for QPSK.
+- **Spectral lines**: unscrambled data puts lines on its carrier, which made
+  the ENBW (and so the symbol rate) collapse and the carrier read as a lump.
+  `estimate::flatten_lines` takes up to 8 narrow lines standing on a plateau
+  out of the level and flatness measures (not a CW on the floor, not a comb,
+  not lines holding most of the power), and the ENBW reference is now also
+  bounded by the median over the middle half of the occupied band.
+- Not possible without captures: naming FastLink/VersaFEC; confirming the NS3/NS4
+  header layout. HackRF tops out at 20 MS/s, below most NS4 hypermuxes.

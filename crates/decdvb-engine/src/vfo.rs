@@ -126,6 +126,9 @@ pub struct VfoSettings {
     pub gold_code: u32,
     /// Generic PSK: the constellation to decide on; `None` takes Identify's.
     pub psk_modulation: Option<decdvb_core::Modulation>,
+    /// Generic PSK: look for text in the decided bits, every way of reading
+    /// them at once.
+    pub find_text: bool,
     /// Write the decoder's output to a file: symbols (generic PSK) or IP
     /// packets as PCAP (DVB-S2 → GSE/IP). Off by default — the decoder shows
     /// what it finds until recording is asked for.
@@ -164,6 +167,7 @@ impl VfoSettings {
             symbol_rate: None,
             gold_code: 0,
             psk_modulation: None,
+            find_text: true,
             record: false,
             gse_variant: None,
             // Local only: a player on this machine. Point them elsewhere on
@@ -219,6 +223,8 @@ pub struct VfoStatus {
     pub gold_code: Option<u32>,
     /// DVB-S2 decoders: what FEC has made of the frames.
     pub fec: Option<FecStats>,
+    /// Generic PSK: text found in the decided bits.
+    pub text: Option<decdvb_modem::text::TextView>,
 }
 
 /// A running demodulator's carrier loop, for display.
@@ -378,6 +384,8 @@ enum Decoder {
         open_failed: bool,
         /// The carrier's offset in the band, for file names.
         carrier_hz: f64,
+        /// The live text search, while asked for.
+        text: Option<Box<crate::psk::TextSearch>>,
     },
 }
 
@@ -476,6 +484,7 @@ impl Worker {
                 written: 0,
                 open_failed: false,
                 carrier_hz: s.offset_hz,
+                text: None,
             },
         }
     }
@@ -746,6 +755,7 @@ impl Worker {
                 written,
                 open_failed,
                 carrier_hz,
+                text,
             } => match demod {
                 Some(d) => {
                     self.syms.clear();
@@ -758,6 +768,15 @@ impl Worker {
                     };
                     file.follow(&self.settings, d, *carrier_hz);
                     write_symbols(writer, written, &self.syms, &mut self.sym_bytes);
+                    match (self.settings.find_text, text.as_mut()) {
+                        (true, Some(t)) => t.push(&self.syms),
+                        (true, None) => {
+                            let mut t = Box::new(crate::psk::TextSearch::new(d.modulation()));
+                            t.push(&self.syms);
+                            *text = Some(t);
+                        }
+                        (false, _) => *text = None,
+                    }
                 }
                 None => {
                     buf.extend_from_slice(&self.bb);
@@ -1027,6 +1046,7 @@ impl Worker {
                 path,
                 written,
                 open_failed,
+                text,
                 ..
             } => match demod {
                 None => {
@@ -1052,6 +1072,7 @@ impl Worker {
                         st.recording = Some((p.clone(), *written));
                     }
                     st.recording_active = writer.is_some();
+                    st.text = text.as_ref().map(|t| t.view());
                     let lock = format!(
                         "{} {}, MER {:.1} dB",
                         d.modulation().name(),
@@ -1409,6 +1430,67 @@ mod tests {
         assert_eq!(bytes.len() as u64, written);
         assert!(bytes.iter().all(|&b| b < 8));
         assert!(path.to_string_lossy().ends_with(".bin"));
+    }
+
+    #[test]
+    fn psk_vfo_finds_text_in_the_bits() {
+        // QPSK at 62.5 kBd carrying random bytes with a message every so
+        // often, LSB first, mapped through the DVB-S2 QPSK labels.
+        let cst = Constellation::qpsk();
+        let mut s = 0x7E57u64;
+        let mut next = move || {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            s.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        let mut bytes = Vec::new();
+        let mut k = 0;
+        while bytes.len() < 40_000 {
+            for _ in 0..(40 + next() % 80) {
+                bytes.push(next() as u8);
+            }
+            bytes.extend_from_slice(format!("VK2DEC BEACON {k:05} ").as_bytes());
+            k += 1;
+        }
+        let bits: Vec<usize> = bytes
+            .iter()
+            .flat_map(|&b| (0..8).map(move |i| ((b >> i) & 1) as usize))
+            .collect();
+        let syms: Vec<Iq> = bits
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| cst.map(p[0] << 1 | p[1]))
+            .collect();
+        let mut sh = Shaper::new(8, 0.25, 16);
+        let mut x = Vec::new();
+        sh.process(&syms, &mut x);
+        let w = std::f64::consts::TAU * 40_000.0 / 500_000.0;
+        for (n, v) in x.iter_mut().enumerate() {
+            let ph = w * n as f64 + 1.0;
+            *v *= Iq::new(ph.cos() as f32, ph.sin() as f32);
+        }
+        // Unscrambled text puts lines in the spectrum that throw the blind
+        // symbol rate off: set, as one would on such a carrier.
+        let mut settings = VfoSettings::new("TXT", 40_000.0, 110_000.0, DecoderKind::PskSymbols);
+        settings.symbol_rate = Some(62_500.0);
+        settings.psk_modulation = Some(decdvb_core::Modulation::Qpsk);
+        let status = Arc::new(Mutex::new(VfoStatus::default()));
+        let mut wk = Worker::new(
+            500_000.0,
+            settings,
+            status.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        feed(&mut wk, &x, 65_536);
+        let st = status.lock().unwrap().clone();
+        let t = st.text.expect("no text search");
+        assert!(t.best.is_some(), "{t:?} / {}", st.message);
+        assert!(
+            t.strings.iter().any(|s| s.contains("VK2DEC BEACON")),
+            "{t:?}"
+        );
     }
 
     #[test]

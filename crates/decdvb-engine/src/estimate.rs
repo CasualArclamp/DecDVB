@@ -31,6 +31,72 @@ pub struct BandEstimate {
     pub symbol_rate_hz: f64,
 }
 
+/// Bins either side a bin is judged against when looking for lines.
+const LINE_HALF: usize = 6;
+/// A bin this far above its neighbourhood's median is part of a line.
+const LINE_DB: f32 = 3.0;
+/// The neighbourhood must stand this far above the floor: a line *on* a
+/// carrier, not a CW carrier on the floor.
+const LINE_ON_DB: f32 = 6.0;
+/// More separate lines than this is a comb (which must stay rough).
+const MAX_LINES: usize = 8;
+
+/// A dB spectrum with narrow lines standing on a carrier's plateau
+/// flattened to their neighbourhood: the carrier component of unbalanced
+/// (unscrambled) data, or a pilot tone. Left in, a line passes for the
+/// plateau level — the equivalent noise bandwidth, and with it the symbol
+/// rate, comes out far too low — and makes a clean carrier look rough.
+/// A line on the noise floor (a CW carrier) and a comb of more than
+/// [`MAX_LINES`] lines are left alone.
+pub fn flatten_lines(db: &[f32], floor_db: f32) -> Vec<f32> {
+    let n = db.len();
+    let mut window = Vec::with_capacity(2 * LINE_HALF + 1);
+    let mut med = vec![0f32; n];
+    let mut line = vec![false; n];
+    for i in 0..n {
+        window.clear();
+        window.extend_from_slice(&db[i.saturating_sub(LINE_HALF)..(i + LINE_HALF + 1).min(n)]);
+        window.sort_unstable_by(f32::total_cmp);
+        let m = window[window.len() / 2];
+        med[i] = m;
+        line[i] = m > floor_db + LINE_ON_DB && db[i] > m + LINE_DB;
+    }
+    let runs =
+        line.windows(2).filter(|w| !w[0] && w[1]).count() + line.first().map_or(0, |&l| l as usize);
+    if runs == 0 || runs > MAX_LINES {
+        return db.to_vec();
+    }
+    // Lines holding most of the power are the signal (a CW and its window
+    // leakage), not something on it.
+    let lin = |v: f32| 10f64.powf(v as f64 / 10.0);
+    let in_lines: f64 = (0..n)
+        .filter(|&i| line[i])
+        .map(|i| lin(db[i]) - lin(med[i]))
+        .sum();
+    let total: f64 = db.iter().map(|&v| (lin(v) - lin(floor_db)).max(0.0)).sum();
+    if in_lines > 0.5 * total {
+        return db.to_vec();
+    }
+    db.iter()
+        .zip(&med)
+        .zip(&line)
+        .map(|((&v, &m), &l)| if l { m } else { v })
+        .collect()
+}
+
+/// The level of a carrier's flat top: the median over the middle half of
+/// its occupied band (`width` bins from `start`), which narrow lines on it
+/// cannot move — unlike the bins near the maximum, which a strong line
+/// becomes. Infinite (no say) for a band too narrow to have a middle.
+pub fn core_level(excess: &[f64], start: usize, width: usize) -> f64 {
+    if width < 8 {
+        return f64::INFINITY;
+    }
+    let mut core: Vec<f64> = excess[start + width / 4..start + width - width / 4].to_vec();
+    core.sort_unstable_by(f64::total_cmp);
+    core[core.len() / 2]
+}
+
 /// Estimate the occupied band from a dB spectrum produced by
 /// [`crate::Spectrum::compute`] (FFT-shifted, so bin 0 is `-rate/2`).
 ///
@@ -47,6 +113,9 @@ pub fn estimate_band(spectrum_db: &[f32], sample_rate: f64, fraction: f64) -> Op
     sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let floor_db = sorted[n / 2];
     let peak_db = *sorted.last().unwrap();
+    // Measure the modulated part: lines on the carrier left out.
+    let flat = flatten_lines(spectrum_db, floor_db);
+    let spectrum_db = &flat[..];
 
     // Work in linear power with the floor removed, so noise bins contribute ~0
     // and the centroid is not dragged towards the middle of the window.
@@ -87,6 +156,7 @@ pub fn estimate_band(spectrum_db: &[f32], sample_rate: f64, fraction: f64) -> Op
     // with a two-pointer sweep over the running sum.
     let target = total * fraction.clamp(0.0, 1.0);
     let mut best = n;
+    let mut best_lo = 0usize;
     let mut lo = 0usize;
     let mut acc = 0.0f64;
     for hi in 0..n {
@@ -95,8 +165,9 @@ pub fn estimate_band(spectrum_db: &[f32], sample_rate: f64, fraction: f64) -> Op
             acc -= excess[lo];
             lo += 1;
         }
-        if acc >= target {
-            best = best.min(hi - lo + 1);
+        if acc >= target && hi - lo + 1 < best {
+            best = hi - lo + 1;
+            best_lo = lo;
         }
     }
 
@@ -113,7 +184,7 @@ pub fn estimate_band(spectrum_db: &[f32], sample_rate: f64, fraction: f64) -> Op
         0.0
     } else {
         plateau.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let p0 = plateau[plateau.len() / 2];
+        let p0 = plateau[plateau.len() / 2].min(core_level(&excess, best_lo, best));
         if p0 > 0.0 { total * bin_hz / p0 } else { 0.0 }
     };
 
@@ -130,6 +201,19 @@ pub fn estimate_band(spectrum_db: &[f32], sample_rate: f64, fraction: f64) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_on_the_carrier_does_not_shrink_the_symbol_rate() {
+        // 400 bins of plateau, a +12 dB line 4 bins wide in its middle.
+        let mut s = synth(4096, 2048, 400, -10.0, -40.0);
+        s[2046..2050].fill(2.0);
+        let e = estimate_band(&s, 4096.0, 0.99).unwrap();
+        assert!((e.symbol_rate_hz - 400.0).abs() < 20.0, "{e:?}");
+        // A lone CW on the floor is not touched.
+        let mut cw = vec![-40.0f32; 4096];
+        cw[1000..1004].fill(0.0);
+        assert_eq!(flatten_lines(&cw, -40.0), cw);
+    }
 
     /// Build a dB spectrum with a flat band of `width` bins centred on `center`.
     fn synth(n: usize, center: usize, width: usize, signal_db: f32, floor_db: f32) -> Vec<f32> {

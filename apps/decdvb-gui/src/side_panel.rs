@@ -253,6 +253,15 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                     }
                 });
                 ui.end_row();
+
+                ui.label("Text");
+                ui.checkbox(&mut s.find_text, "look for text in the bits")
+                    .on_hover_text(
+                        "Search the decided bits for readable strings under every \
+                         phase rotation, mirror image, bit order, byte alignment and \
+                         differential decoding at once",
+                    );
+                ui.end_row();
             }
 
             if s.decoder == DecoderKind::Tpc2964 {
@@ -604,6 +613,9 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
             }
         });
         psk_note(ui);
+        if let Some(t) = &st.text {
+            text_card(ui, t);
+        }
     }
 
     // ---- plots
@@ -642,6 +654,46 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
     }
 
     actions
+}
+
+/// Text found in a generic carrier's bits, live.
+fn text_card(ui: &mut Ui, t: &decdvb_engine::TextView) {
+    ui.add_space(6.0);
+    ui.label(RichText::new("Text (live)").strong());
+    match &t.best {
+        Some(how) => {
+            ui.label(RichText::new(format!("read as: {how}")).small());
+            egui::ScrollArea::vertical()
+                .id_salt("text_strings")
+                .max_height(180.0)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for s in &t.strings {
+                        ui.label(RichText::new(s).monospace());
+                    }
+                });
+        }
+        None => {
+            ui.label(
+                RichText::new(format!(
+                    "nothing stands out yet — {} read {} ways",
+                    format::bytes(t.bytes),
+                    t.readings
+                ))
+                .weak(),
+            );
+        }
+    }
+    if !t.candidates.is_empty() {
+        egui::CollapsingHeader::new("Longest strings, any reading")
+            .id_salt("text_candidates")
+            .default_open(t.best.is_none())
+            .show(ui, |ui| {
+                for (how, s) in &t.candidates {
+                    ui.label(RichText::new(s).monospace()).on_hover_text(how);
+                }
+            });
+    }
 }
 
 /// A TPC 2964 VFO: the carrier, the frame sync and structure found, the
@@ -1427,6 +1479,16 @@ fn identification_card(
                         _ => format!("{} (estimate)", c.label()),
                     };
                     ui.label(txt);
+                    ui.end_row();
+                }
+                if let Some(p) = &id.frame_structure {
+                    ui.label("Frames");
+                    ui.label(p.describe()).on_hover_text(format!(
+                        "Symbols that repeat every frame (a header, unique word or pilots) \
+                         found by autocorrelation: {:.0}× above the noise, over {} frames. \
+                         Their layout fingerprints the framing even without a decoder.",
+                        p.prominence, p.frames
+                    ));
                     ui.end_row();
                 }
                 ui.label("Centre");

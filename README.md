@@ -199,6 +199,14 @@ the carrier phase is ambiguous by the constellation's symmetry (90° for QPSK),
 so the labels may be a fixed rotation of the sent ones — a sync word found
 offline resolves it.
 
+**Text (live)**: the decided bits are also searched for readable strings,
+under every phase rotation and mirror image, both bit orders, all eight byte
+alignments, plain and differentially decoded — 256 readings at once for
+QPSK. The reading with far more text than the rest is shown, scrolling as
+the strings arrive (telemetry, beacons, NMEA, idle messages), with the
+longest strings from any reading as candidates. Untick *look for text* to
+save the CPU (about a quarter of a core at 1 MBd).
+
 ### What Identify reports
 
 It splits what it *knows* from what it *guesses*. **DVB-S2** is reported as a
@@ -207,7 +215,25 @@ next frame — with the MODCODs in use, pilots, frame lengths, and CCM vs ACM.
 Anything else gets measurements (symbol rate, roll-off, an estimated
 constellation) and a labelled guess: plain QPSK reads *"possibly DVB-S (not
 verified)"* (the DVB-S decoder confirms it), and a BPSK or QPSK carrier with
-the TPC 2964 unique word every 2964 bits is named as such. A carrier too slow to show three frames in the first look is marked
+the TPC 2964 unique word every 2964 bits is named as such. For the rest it
+looks for fingerprints of proprietary waveforms:
+
+- **DVB-S2-style headers off their own grid**: SOF and PLS headers that recur
+  regularly but not where their PLS codes say the next frame starts — S2
+  framing whose codes mean something else, as NovelSat NS3/NS4 appear to use
+  (their manuals describe S2-style headers, S2 frame sizes and Gold-code
+  scrambling, with extra code rates) or a vendor's short frames.
+- **A 2 % roll-off**, sharper than DVB-S2X's 5 % — NovelSat NS4's.
+- **Frame structure**: any symbols that repeat frame after frame (a header,
+  unique word or pilots) show up in the autocorrelation of the locked
+  symbols; Identify reports the period and, given enough frames, where the
+  repeating symbols sit (*"repeats every 3330 symbols; 162 known symbols: 90
+  from 0, then 2 blocks of 36 every 1476"*) — a fingerprint of a framing even
+  when no specification is public.
+
+Paradise FastLink, Comtech VersaFEC and the TPC/LDPC modes of SCPC modems
+publish no sync word or frame layout, so they can only be recognised by
+such measurements; captures of them would let DecDVB name them. A carrier too slow to show three frames in the first look is marked
 *provisional* while it listens longer. Between identifications it keeps
 demodulating with what it found, so the constellation and MER stay live.
 

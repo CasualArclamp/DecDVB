@@ -16,6 +16,7 @@ use std::collections::VecDeque;
 use decdvb_core::{Iq, Modulation};
 use decdvb_dsp::{Agc, CarrierPll, Fir, SymbolSync, rrc_taps};
 use decdvb_fec::Constellation;
+use decdvb_modem::text::{TextFinder, TextView};
 
 /// Locked symbols kept for display.
 const RECENT: usize = 3000;
@@ -178,6 +179,69 @@ impl PskDemod {
     /// Residual carrier offset the loop is tracking, Hz.
     pub fn carrier_offset_hz(&self) -> f64 {
         self.pll.freq_cycles() * self.symbol_rate()
+    }
+}
+
+/// Live text search on a generic carrier: the hard decisions read under
+/// each of the constellation's phase ambiguities (and their mirror images),
+/// each a bit stream for a [`TextFinder`].
+pub struct TextSearch {
+    finder: TextFinder,
+    cst: Constellation,
+    /// Turn applied before deciding, and whether to mirror (conjugate) first.
+    turns: Vec<(Iq, bool)>,
+    bits: Vec<Vec<u8>>,
+}
+
+impl TextSearch {
+    pub fn new(modulation: Modulation) -> Self {
+        let cst = Constellation::generic(modulation);
+        let (steps, mirror) = match modulation {
+            Modulation::Bpsk | Modulation::Pi2Bpsk => (2, false),
+            Modulation::Psk8 => (8, true),
+            _ => (4, true),
+        };
+        let mut turns = Vec::new();
+        let mut names = Vec::new();
+        for m in [false, true].into_iter().take(if mirror { 2 } else { 1 }) {
+            for k in 0..steps {
+                let a = std::f32::consts::TAU * k as f32 / steps as f32;
+                turns.push((Iq::new(a.cos(), a.sin()), m));
+                names.push(format!(
+                    "turned {}°{}",
+                    360 * k / steps,
+                    if m { ", mirrored" } else { "" }
+                ));
+            }
+        }
+        TextSearch {
+            finder: TextFinder::new(names),
+            bits: vec![Vec::new(); turns.len()],
+            cst,
+            turns,
+        }
+    }
+
+    pub fn push(&mut self, syms: &[(u8, Iq)]) {
+        let nb = self.cst.bits() as usize;
+        for b in &mut self.bits {
+            b.clear();
+        }
+        for &(_, y) in syms {
+            for (k, &(turn, mirror)) in self.turns.iter().enumerate() {
+                let z = if mirror { y.conj() } else { y } * turn;
+                let label = self.cst.nearest(z);
+                // The label's bits, most significant first.
+                self.bits[k].extend((0..nb).rev().map(|i| ((label >> i) & 1) as u8));
+            }
+        }
+        for (k, b) in self.bits.iter().enumerate() {
+            self.finder.push(k, b);
+        }
+    }
+
+    pub fn view(&self) -> TextView {
+        self.finder.view()
     }
 }
 

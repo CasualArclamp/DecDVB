@@ -302,8 +302,12 @@ pub fn detect_carriers(spectrum_db: &[f32], rate: f64, min_snr_db: f32) -> Vec<C
             continue;
         }
 
-        let excess: Vec<f64> = (a..=b)
-            .map(|k| (10f64.powf(s[k] as f64 / 10.0) - floor_lin).max(0.0))
+        // Lines on the carrier (unscrambled data, a pilot tone) left out of
+        // its level and flatness.
+        let flat = crate::estimate::flatten_lines(&s[a..=b], floor);
+        let excess: Vec<f64> = flat
+            .iter()
+            .map(|&v| (10f64.powf(v as f64 / 10.0) - floor_lin).max(0.0))
             .collect();
         let total: f64 = excess.iter().sum();
         if total <= 0.0 {
@@ -318,15 +322,16 @@ pub fn detect_carriers(spectrum_db: &[f32], rate: f64, min_snr_db: f32) -> Vec<C
 
         // Narrowest window holding 99 % of the excess power.
         let target = 0.99 * total;
-        let (mut lo, mut acc, mut best) = (0usize, 0.0f64, excess.len());
+        let (mut lo, mut acc, mut best, mut best_lo) = (0usize, 0.0f64, excess.len(), 0usize);
         for hi in 0..excess.len() {
             acc += excess[hi];
             while lo < hi && acc - excess[lo] >= target {
                 acc -= excess[lo];
                 lo += 1;
             }
-            if acc >= target {
-                best = best.min(hi - lo + 1);
+            if acc >= target && hi - lo + 1 < best {
+                best = hi - lo + 1;
+                best_lo = lo;
             }
         }
 
@@ -337,7 +342,8 @@ pub fn detect_carriers(spectrum_db: &[f32], rate: f64, min_snr_db: f32) -> Vec<C
             .collect();
         let mut plateau: Vec<f64> = plateau_idx.iter().map(|&i| excess[i]).collect();
         plateau.sort_unstable_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-        let p0 = plateau[plateau.len() / 2];
+        let p0 =
+            plateau[plateau.len() / 2].min(crate::estimate::core_level(&excess, best_lo, best));
         let rs = if p0 > 0.0 { total * bin_hz / p0 } else { 0.0 };
 
         // A narrow line has a short top run that also holds most of the power:
@@ -353,9 +359,9 @@ pub fn detect_carriers(spectrum_db: &[f32], rate: f64, min_snr_db: f32) -> Vec<C
         // width) yet spans many periods of any comb. Not over the half-power
         // plateau: that clips a ripple's troughs out and hides it.
         let core: Vec<f32> = if width >= 20 {
-            let lo = a + width * 3 / 10;
-            let hi = b - width * 3 / 10;
-            s[lo..=hi].to_vec()
+            let lo = width * 3 / 10;
+            let hi = width - 1 - width * 3 / 10;
+            flat[lo..=hi].to_vec()
         } else {
             Vec::new()
         };

@@ -111,6 +111,11 @@ pub struct Dvbs2Info {
     /// stream analysed, PLS code) — what carrier recovery needs to know which
     /// constellation each stretch of payload uses.
     pub frames: Vec<(usize, u8)>,
+    /// No header confirmed, yet headers recur this many symbols apart: DVB-S2
+    /// framing whose PLS codes mean something else — a proprietary extension
+    /// such as NovelSat NS3/NS4 (whose manuals describe S2-style headers and
+    /// Gold-code scrambling) or a vendor's short frames.
+    pub unconfirmed_spacing: Option<usize>,
 }
 
 impl Dvbs2Info {
@@ -165,6 +170,12 @@ pub struct Identification {
     /// Lock coherence, 0..1 (see `decdvb_dsp::lock_coherence`).
     pub coherence: Option<f32>,
     pub carrier_locked: bool,
+    /// A frame structure found in a carrier DecDVB has no decoder for: the
+    /// period of its repeating symbols and where in the frame they sit.
+    pub frame_structure: Option<crate::period::Periodicity>,
+    /// The spectrum's skirts fit a 2 % roll-off better than DVB-S2X's
+    /// sharpest, 5 % (`roll_off` then reads 5 %).
+    pub roll_off_2pct: bool,
 }
 
 impl Identification {
@@ -183,6 +194,8 @@ impl Identification {
             mer_db: None,
             coherence: None,
             carrier_locked: false,
+            frame_structure: None,
+            roll_off_2pct: false,
         }
     }
 
@@ -192,10 +205,11 @@ impl Identification {
             .symbol_rate
             .map(|r| format!("{:.1} kS/s", r / 1e3))
             .unwrap_or_else(|| "?".into());
-        let ro = self
-            .roll_off
-            .map(|r| format!("α {:.2}", r.as_f64()))
-            .unwrap_or_default();
+        let ro = match self.roll_off {
+            _ if self.roll_off_2pct => "α ≈ 0.02 (sharper than DVB-S2X allows)".to_string(),
+            Some(r) => format!("α {:.2}", r.as_f64()),
+            None => String::new(),
+        };
         match &self.verdict {
             Verdict::NoSignal => "no signal".into(),
             Verdict::Carrier => format!(
@@ -225,7 +239,10 @@ impl Identification {
                     if d.with_pilots > 0 { ", pilots" } else { "" }
                 )
             }
-            Verdict::NotDvbS2 { hint } => format!("{hint}, {rs} {ro}"),
+            Verdict::NotDvbS2 { hint } => match &self.frame_structure {
+                Some(p) => format!("{hint}, {rs} {ro}; frames: {}", p.describe()),
+                None => format!("{hint}, {rs} {ro}"),
+            },
         }
     }
 }
@@ -342,16 +359,44 @@ fn rc_shape(f: f64, rs: f64, alpha: f64) -> f64 {
 /// then scores in dB over the occupied region so the skirts — where the
 /// candidates actually differ — carry the decision.
 pub fn fit_roll_off(spectrum_db: &[f32], rate: f64, center_hz: f64, rs: f64) -> Option<RollOff> {
+    let mut best: Option<(RollOff, f64)> = None;
+    for ro in RollOff::ALL {
+        if let Some(err) = roll_off_error(spectrum_db, rate, center_hz, rs, ro.as_f64())
+            && best.is_none_or(|(_, e)| err < e)
+        {
+            best = Some((ro, err));
+        }
+    }
+    best.map(|(ro, _)| ro)
+}
+
+/// A carrier fitted at 5 % that fits 2 % better: sharper than any DVB-S2X
+/// roll-off. NovelSat NS4 offers 2 % (its product sheets: "SRRC like 2%").
+pub fn sharper_than_s2x(spectrum_db: &[f32], rate: f64, center_hz: f64, rs: f64) -> bool {
+    match (
+        roll_off_error(spectrum_db, rate, center_hz, rs, 0.02),
+        roll_off_error(spectrum_db, rate, center_hz, rs, 0.05),
+    ) {
+        (Some(e2), Some(e5)) => e2 < 0.7 * e5,
+        _ => false,
+    }
+}
+
+/// Mean squared dB error of a raised-cosine fit with roll-off `alpha`.
+fn roll_off_error(
+    spectrum_db: &[f32],
+    rate: f64,
+    center_hz: f64,
+    rs: f64,
+    alpha: f64,
+) -> Option<f64> {
     let n = spectrum_db.len();
     let freq = |k: usize| (k as f64 / n as f64 - 0.5) * rate - center_hz;
     let meas: Vec<f64> = spectrum_db
         .iter()
         .map(|&d| 10f64.powf(d as f64 / 10.0))
         .collect();
-
-    let mut best: Option<(RollOff, f64)> = None;
-    for ro in RollOff::ALL {
-        let alpha = ro.as_f64();
+    {
         let model: Vec<f64> = (0..n).map(|k| rc_shape(freq(k), rs, alpha)).collect();
 
         // Least squares for meas ≈ a·model + b.
@@ -365,12 +410,20 @@ pub fn fit_roll_off(spectrum_db: &[f32], rate: f64, center_hz: f64, rs: f64) -> 
         let nn = n as f64;
         let det = nn * smm - sm * sm;
         if det.abs() < 1e-30 {
-            continue;
+            return None;
         }
         let a = (nn * smy - sm * sy) / det;
-        let b = ((sy - a * sm) / nn).max(1e-30);
+        // The fitted floor goes negative when the shape is wrong; held at
+        // the measured floor, a wrong roll-off predicts noise in its skirts
+        // instead of −300 dB, and the errors stay comparable.
+        let floor = meas
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min)
+            .max(1e-30);
+        let b = ((sy - a * sm) / nn).max(floor);
         if a <= 0.0 {
-            continue;
+            return None;
         }
 
         // Score in dB within ±(1+0.35)·Rs/2·1.2 of the centre: the region where
@@ -387,14 +440,10 @@ pub fn fit_roll_off(spectrum_db: &[f32], rate: f64, center_hz: f64, rs: f64) -> 
             }
         }
         if cnt == 0 {
-            continue;
+            return None;
         }
-        let err = err / cnt as f64;
-        if best.is_none_or(|(_, e)| err < e) {
-            best = Some((ro, err));
-        }
+        Some(err / cnt as f64)
     }
-    best.map(|(ro, _)| ro)
 }
 
 /// Classify the constellation from timing-recovered (not carrier-recovered)
@@ -573,6 +622,21 @@ pub fn detect_dvbs2(sym: &[Iq]) -> Dvbs2Info {
             info.frames.push((i, pls.plsc));
         }
     }
+    if info.headers_confirmed == 0 && peaks.len() >= 3 {
+        // The shortest spacing that recurs (a missed header makes a
+        // multiple of it).
+        let d: Vec<usize> = peaks.windows(2).map(|w| w[1] - w[0]).collect();
+        info.unconfirmed_spacing = d
+            .iter()
+            .copied()
+            .filter(|&x| {
+                d.iter()
+                    .filter(|&&y| y.abs_diff(x) <= GRID_TOLERANCE)
+                    .count()
+                    >= 2
+            })
+            .min();
+    }
     info
 }
 
@@ -653,6 +717,8 @@ pub fn identify_in(x: &[Iq], rate: f64, bandwidth: Option<f64>) -> Identificatio
 
     // 3. Roll-off, from the spectrum centred on the carrier.
     id.roll_off = fit_roll_off(&db, rate, band.center_hz, rs);
+    id.roll_off_2pct =
+        id.roll_off == Some(RollOff::R05) && sharper_than_s2x(&db, rate, band.center_hz, rs);
     let alpha = id.roll_off.map_or(0.35, |r| r.as_f64());
 
     // 4. Matched filter + timing recovery. Below 2 samples per symbol the
@@ -713,11 +779,33 @@ pub fn identify_in(x: &[Iq], rate: f64, bandwidth: Option<f64>) -> Identificatio
     let tpc = !is_s2
         && matches!(cst, ConstellationGuess::Bpsk | ConstellationGuess::Qpsk)
         && decdvb_modem::tpc2964::detect(&lock.symbols, cst == ConstellationGuess::Qpsk);
+    // 9. Not DVB-S2 nor TPC 2964: does anything repeat frame by frame? A
+    //    header or pilots every frame fingerprint a framing — proprietary
+    //    ones included — even with no decoder for it.
+    if !is_s2 && !tpc && id.carrier_locked {
+        id.frame_structure = crate::period::find_period(&lock.symbols, 16, 200_000);
+    }
     id.verdict = if is_s2 {
         Verdict::DvbS2(s2)
     } else {
         Verdict::NotDvbS2 {
             hint: match cst {
+                _ if s2.unconfirmed_spacing.is_some() => format!(
+                    "{}, DVB-S2-style PLHEADERs every {} symbols that their own PLS codes \
+                     do not explain — a proprietary DVB-S2 extension{}",
+                    cst.label(),
+                    s2.unconfirmed_spacing.unwrap_or_default(),
+                    if id.roll_off_2pct {
+                        " (2 % roll-off too: likely NovelSat NS4)"
+                    } else {
+                        " (NovelSat NS3/NS4, or a vendor's short frames)"
+                    }
+                ),
+                _ if id.roll_off_2pct => format!(
+                    "{}, no DVB-S2 PLHEADER, roll-off sharper than DVB-S2X's 5 % \
+                     (NovelSat NS4 offers 2 %)",
+                    cst.label()
+                ),
                 _ if tpc => format!(
                     "{}, TPC 2964 unique word every 2964 bits — Intelsat IESS-315 turbo code",
                     cst.label()
@@ -1157,6 +1245,71 @@ mod tests {
             v => panic!("expected not-DVB-S2, got {v:?}"),
         }
         assert_eq!(id.constellation, Some(ConstellationGuess::Qpsk));
+    }
+
+    /// Random QPSK symbols.
+    fn qpsk_symbols(n: usize, nz: &mut Noise) -> Vec<Iq> {
+        let k = std::f32::consts::FRAC_1_SQRT_2;
+        (0..n)
+            .map(|_| match (nz.uniform() * 4.0) as u32 {
+                0 => Iq::new(k, k),
+                1 => Iq::new(-k, k),
+                2 => Iq::new(-k, -k),
+                _ => Iq::new(k, -k),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn s2_headers_off_their_own_grid_are_a_proprietary_extension() {
+        // A DVB-S2 PLHEADER (QPSK 1/2 normal, pilots: 33282-symbol frames)
+        // every 3000 symbols: S2 framing whose PLS codes mean something else.
+        use decdvb_frame::pi2bpsk::map_bpsk;
+        use decdvb_frame::plsc::{PlsInfo, PlscEncoder};
+        use decdvb_frame::{SOF_BIG_ENDIAN, SOF_LEN};
+        let mut nz = Noise(31);
+        let enc = PlscEncoder::new();
+        let plsc = PlsInfo::for_modcod(4, false, true).plsc;
+        let mut syms = Vec::new();
+        while syms.len() < 90_000 {
+            let mut h = vec![Iq::new(0.0, 0.0); 90];
+            map_bpsk(SOF_BIG_ENDIAN, &mut h[..SOF_LEN], SOF_LEN);
+            enc.encode(plsc, &mut h[SOF_LEN..]);
+            syms.extend(h);
+            syms.extend(qpsk_symbols(2910, &mut nz));
+        }
+        let mut sh = Shaper::new(4, 0.20, 16);
+        let mut x = Vec::new();
+        sh.process(&syms, &mut x);
+        let x: Vec<Iq> = x.iter().map(|&s| s + nz.gauss() * 0.1).collect();
+        let id = identify(&x, 4.0);
+        match &id.verdict {
+            Verdict::NotDvbS2 { hint } => {
+                assert!(hint.contains("PLHEADERs every 3000 symbols"), "{hint}")
+            }
+            v => panic!("expected not-DVB-S2, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn a_two_percent_roll_off_is_flagged() {
+        let mut nz = Noise(41);
+        for (alpha, sharp) in [(0.05, false), (0.02, true)] {
+            let syms = qpsk_symbols(120_000, &mut nz);
+            // A 2 % pulse needs a long span to be 2 % in fact.
+            let mut sh = Shaper::new(4, alpha, 96);
+            let mut x = Vec::new();
+            sh.process(&syms, &mut x);
+            let x: Vec<Iq> = x.iter().map(|&s| s + nz.gauss() * 0.03).collect();
+            let id = identify(&x, 4.0);
+            assert_eq!(id.roll_off_2pct, sharp, "α {alpha}: {}", id.summary());
+            assert_eq!(
+                id.roll_off,
+                Some(RollOff::R05),
+                "α {alpha}: {}",
+                id.summary()
+            );
+        }
     }
 
     #[test]
