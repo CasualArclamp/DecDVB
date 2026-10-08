@@ -34,7 +34,8 @@ and a CW tone. Every carrier was found and identified blind.*
 | **Live HackRF One**, 2–20 MS/s, pure Rust over USB (no DLLs), LNB LO | ✅ |
 | **LDPC + BCH → BBFRAMEs**: all 21 S2 codes, BBHEADER, stream info, payload rate | ✅ |
 | All S2X MODCODs, VL-SNR | M3 |
-| GSE → IP → PCAP, MPEG-TS | M4 |
+| **GSE → IP → PCAP** + live IP stats; GSE variant detected from the data | ✅ |
+| MPEG-TS output | M4 (next) |
 | Modulator (HackRF TX / IQ file) | M6 |
 
 ## Using it
@@ -67,6 +68,22 @@ and every one below it. With the HackRF running it retunes the radio.
 The side bar lists the VFOs with their CPU load (✕ removes one), and shows the
 selected one's settings, its Identify result or demodulator state (lock, MER,
 residual offset), a carrier-locked constellation and a zoomed spectrum.
+
+### DVB-S2 → GSE/IP → PCAP
+
+A **DVB-S2/S2X → GSE/IP** VFO demodulates, decodes LDPC and BCH, and reads
+the BBFRAMEs. Generic-stream frames go through GSE (ETSI TS 102 606) to IP,
+fragments reassembled and their CRC-32s checked. The side bar shows the
+stream, IP packet and byte counts, the IP rate, protocols and the busiest
+flows; press **● Record** next to *PCAP* to write the packets to a `.pcap`
+(raw IP, opens in Wireshark).
+
+Real links do not all follow the standard. As in
+[dontlookup](https://github.com/ucsdsysnet/dontlookup), DecDVB reads every
+data field four ways at once — GSE_LENGTH counting the 2-byte header or not,
+the fragment id as 8 bits or as 6 bits plus a 2-bit counter — and keeps
+whichever yields valid IP (checksums, lengths). The *GSE* setting can force
+one. If none yields IP, a blind IPv4 search over the data fields takes over.
 
 ### Generic PSK → symbols
 

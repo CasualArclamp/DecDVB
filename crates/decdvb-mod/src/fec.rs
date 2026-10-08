@@ -1,11 +1,23 @@
 //! The transmit FEC chain: BBFRAME → BCH → LDPC → FECFRAME
-//! (EN 302 307-1 §5.3), and a TS-mode BBFRAME source for test signals.
+//! (EN 302 307-1 §5.3), and BBFRAME sources for test signals: TS packets
+//! (TS mode) or IP over GSE (generic continuous mode).
 
 use std::collections::HashMap;
 
 use decdvb_core::{FecFrame, RollOff};
 use decdvb_fec::{Bch, FecParams, LdpcCode};
 use decdvb_frame::{BBHEADER_LEN, BbHeader, StreamFormat, bb_scramble, crc8};
+use decdvb_gse::{GseEncapsulator, Label, Variant};
+
+/// Where a framer's BBFRAMEs come from.
+pub trait BbFrameSource: Send {
+    /// The next BBFRAME of `bytes` bytes, header included and BB-scrambled.
+    fn next_frame(&mut self, bytes: usize) -> Vec<u8>;
+    /// The roll-off the BBHEADER announces.
+    fn set_roll_off(&mut self, roll_off: RollOff);
+    /// CCM (one MODCOD) or ACM/VCM, for MATYPE.
+    fn set_ccm(&mut self, ccm: bool);
+}
 
 /// BCH and LDPC encoders, built on first use per code.
 #[derive(Default)]
@@ -104,6 +116,20 @@ impl TsBbFramer {
 
     /// The next BBFRAME of `bytes` bytes, header included and BB-scrambled.
     pub fn next_frame(&mut self, bytes: usize) -> Vec<u8> {
+        BbFrameSource::next_frame(self, bytes)
+    }
+}
+
+impl BbFrameSource for TsBbFramer {
+    fn set_roll_off(&mut self, roll_off: RollOff) {
+        self.roll_off = roll_off;
+    }
+
+    fn set_ccm(&mut self, ccm: bool) {
+        self.ccm = ccm;
+    }
+
+    fn next_frame(&mut self, bytes: usize) -> Vec<u8> {
         let field = bytes - BBHEADER_LEN;
         let mut data = Vec::with_capacity(field);
         data.extend_from_slice(&self.carry[..self.carry.len().min(field)]);
@@ -136,6 +162,98 @@ impl TsBbFramer {
             dfl: (field * 8) as u16,
             sync: TS_SYNC,
             syncd,
+            high_efficiency: false,
+        };
+        let mut frame = Vec::with_capacity(bytes);
+        frame.extend_from_slice(&header.to_bytes());
+        frame.extend_from_slice(&data);
+        bb_scramble(&mut frame);
+        frame
+    }
+}
+
+/// Builds GS-mode BBFRAMEs carrying IP over GSE: a deterministic mix of
+/// UDP flows between documentation addresses (RFC 5737), packets of 40 to
+/// 9000 bytes so that some fragment across frames, in any GSE [`Variant`].
+pub struct GseBbFramer {
+    enc: GseEncapsulator,
+    rng: u64,
+    seq: u32,
+    pub roll_off: RollOff,
+    pub ccm: bool,
+}
+
+impl GseBbFramer {
+    pub fn new(seed: u64, variant: Variant) -> Self {
+        GseBbFramer {
+            enc: GseEncapsulator::new(variant),
+            rng: seed | 1,
+            seq: 0,
+            roll_off: RollOff::R35,
+            ccm: true,
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// The `n`-th test packet: flow `n % 5`, a size from a fixed cycle.
+    fn packet(&mut self) -> Vec<u8> {
+        let n = self.seq;
+        self.seq += 1;
+        let flow = (n % 5) as u8;
+        let len = [64usize, 1400, 512, 9000, 40, 1200, 200][n as usize % 7];
+        let mut payload = vec![0u8; len];
+        for chunk in payload.chunks_mut(8) {
+            let r = self.next_u64().to_le_bytes();
+            chunk.copy_from_slice(&r[..chunk.len()]);
+        }
+        decdvb_ip::packet::udp_v4(
+            [192, 0, 2, 10 + flow],
+            [198, 51, 100, 20 + flow],
+            40_000 + flow as u16,
+            5004,
+            &payload,
+        )
+    }
+}
+
+impl BbFrameSource for GseBbFramer {
+    fn set_roll_off(&mut self, roll_off: RollOff) {
+        self.roll_off = roll_off;
+    }
+
+    fn set_ccm(&mut self, ccm: bool) {
+        self.ccm = ccm;
+    }
+
+    fn next_frame(&mut self, bytes: usize) -> Vec<u8> {
+        let field = bytes - BBHEADER_LEN;
+        // Keep the queue topped up so every frame is full.
+        while self.enc.queued() < 4 {
+            let p = self.packet();
+            self.enc
+                .push(0x0800, Label::Six([0x02, 0, 0, 0, 0, 0x01]), p);
+        }
+        let data = self.enc.fill(field);
+        let header = BbHeader {
+            format: StreamFormat::GenericContinuous,
+            single_stream: true,
+            ccm: self.ccm,
+            issyi: false,
+            npd: false,
+            roll_off: Some(self.roll_off),
+            isi: 0,
+            upl: 0,
+            dfl: (field * 8) as u16,
+            sync: 0,
+            syncd: 0,
             high_efficiency: false,
         };
         let mut frame = Vec::with_capacity(bytes);

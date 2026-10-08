@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 
 use decdvb_core::Modulation;
 use decdvb_engine::{
-    CarrierState, ConstellationGuess, DecoderKind, FecStats, Identification, LockState, RateSource,
-    Verdict, VfoId, VfoStatus,
+    CarrierState, ConstellationGuess, DecoderKind, FecStats, GseView, Identification, LockState,
+    RateSource, Verdict, VfoId, VfoStatus,
 };
+use decdvb_gse::{Source, Variant};
 use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, Ui, vec2};
 use egui_plot::{Line, Plot, PlotPoints, Points};
 
@@ -287,6 +288,49 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                 ui.end_row();
             }
 
+            if s.decoder == DecoderKind::Dvbs2Ip {
+                ui.label("GSE");
+                let txt = s.gse_variant.map_or("auto (from the data)", |v| v.label());
+                egui::ComboBox::from_id_salt("gse_variant")
+                    .selected_text(txt)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut s.gse_variant, None, "auto (from the data)");
+                        for v in Variant::ALL {
+                            ui.selectable_value(&mut s.gse_variant, Some(v), v.label());
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("PCAP");
+                ui.horizontal(|ui| {
+                    let (label, tip) = if s.record {
+                        ("⏹ Stop", "Close the PCAP file")
+                    } else {
+                        (
+                            "● Record",
+                            "Write the IP packets to a PCAP file (raw IP, Wireshark reads it)",
+                        )
+                    };
+                    let b = egui::Button::new(label).selected(s.record);
+                    if ui.add(b).on_hover_text(tip).clicked() {
+                        s.record = !s.record;
+                    }
+                    let active = st
+                        .fec
+                        .as_ref()
+                        .and_then(|f| f.gse.as_ref())
+                        .is_some_and(|g| g.pcap_active);
+                    if s.record && !active {
+                        ui.label(
+                            RichText::new("starts with the first GSE frame")
+                                .weak()
+                                .small(),
+                        );
+                    }
+                });
+                ui.end_row();
+            }
+
             ui.label("");
             ui.horizontal(|ui| {
                 ui.checkbox(&mut s.enabled, "enabled");
@@ -365,6 +409,9 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
         });
         if let Some(f) = &st.fec {
             fec_card(ui, f);
+            if let Some(g) = &f.gse {
+                gse_card(ui, g);
+            }
         }
     }
 
@@ -515,6 +562,124 @@ fn fec_card(ui: &mut Ui, f: &FecStats) {
             ui.end_row();
         }
     });
+}
+
+/// IP out of GSE: where it comes from, how much, who is talking, and the
+/// PCAP.
+fn gse_card(ui: &mut Ui, g: &GseView) {
+    ui.add_space(6.0);
+    ui.label(RichText::new("GSE / IP").strong());
+    egui::Grid::new("gse").num_columns(2).show(ui, |ui| {
+        ui.label("Source");
+        let txt = match g.source {
+            Some(Source::Gse(v)) => format!("GSE, {}", v.label()),
+            Some(Source::Blind) => "blind IPv4 search (no GSE variant fits)".into(),
+            None => "no IP found yet".into(),
+        };
+        ui.label(txt);
+        ui.end_row();
+        ui.label("IP packets");
+        ui.label(format!(
+            "{} ({:.1} MB) · IPv4 {} · IPv6 {}",
+            g.packets,
+            g.bytes as f64 / 1e6,
+            g.ipv4,
+            g.ipv6
+        ));
+        ui.end_row();
+        if g.ip_bps > 0.0 {
+            ui.label("IP rate");
+            ui.label(format::bitrate(g.ip_bps));
+            ui.end_row();
+        }
+        if !g.protocols.is_empty() {
+            ui.label("Protocols");
+            let names: Vec<String> = g
+                .protocols
+                .iter()
+                .rev()
+                .map(|(&p, &n)| {
+                    let name = match p {
+                        6 => "TCP".to_string(),
+                        17 => "UDP".to_string(),
+                        1 => "ICMP".to_string(),
+                        58 => "ICMPv6".to_string(),
+                        other => format!("proto {other}"),
+                    };
+                    format!("{name} {n}")
+                })
+                .collect();
+            ui.label(names.join(" · "));
+            ui.end_row();
+        }
+        if !g.other_protocols.is_empty() {
+            ui.label("Not IP");
+            let v: Vec<String> = g
+                .other_protocols
+                .iter()
+                .map(|(t, n)| format!("0x{t:04X} ×{n}"))
+                .collect();
+            ui.label(v.join(", "));
+            ui.end_row();
+        }
+        if let Some((path, n)) = &g.pcap {
+            ui.label("PCAP");
+            if let Some(e) = &g.pcap_error {
+                ui.colored_label(Color32::from_rgb(230, 110, 110), e);
+            } else if g.pcap_active {
+                ui.colored_label(Color32::from_rgb(230, 90, 90), format!("● {n} packets"));
+            } else {
+                ui.label(format!("stopped, {n} packets"));
+            }
+            ui.end_row();
+            ui.label("");
+            ui.label(RichText::new(path.display().to_string()).small());
+            ui.end_row();
+        }
+    });
+    if !g.top.is_empty() {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!("Top flows (of {})", g.flows))
+                .small()
+                .strong(),
+        );
+        egui::Grid::new("flows")
+            .num_columns(3)
+            .striped(true)
+            .show(ui, |ui| {
+                for f in &g.top {
+                    ui.label(
+                        RichText::new(format!("{} → {}", f.src, f.dst))
+                            .monospace()
+                            .small(),
+                    );
+                    ui.label(RichText::new(format!("{}", f.packets)).small());
+                    ui.label(RichText::new(format!("{:.1} kB", f.bytes as f64 / 1e3)).small());
+                    ui.end_row();
+                }
+            });
+    }
+    egui::CollapsingHeader::new("GSE variants")
+        .id_salt("gse_variants")
+        .show(ui, |ui| {
+            egui::Grid::new("variants").num_columns(4).show(ui, |ui| {
+                ui.label(RichText::new("variant").small());
+                ui.label(RichText::new("IP").small());
+                ui.label(RichText::new("reassembled").small());
+                ui.label(RichText::new("CRC ok / bad").small());
+                ui.end_row();
+                for r in &g.variants {
+                    ui.label(RichText::new(r.variant.label()).small());
+                    ui.label(RichText::new(r.ip_packets.to_string()).small());
+                    ui.label(RichText::new(r.stats.reassembled.to_string()).small());
+                    ui.label(
+                        RichText::new(format!("{} / {}", r.stats.crc_ok, r.stats.crc_bad)).small(),
+                    );
+                    ui.end_row();
+                }
+            });
+        });
 }
 
 /// Carrier loop rows for a two-column grid.

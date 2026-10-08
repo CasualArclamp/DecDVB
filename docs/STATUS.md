@@ -256,3 +256,40 @@ drag moves the spectrum and, past the span's edge, tunes a live HackRF.
 - FEC throughput for wide carriers: explicit SIMD, or a decoder pool.
 - Cycle-slip resistance without pilots (non-causal phase smoothing between
   headers).
+
+## M4, part 1 — GSE → IP → PCAP (done, 2026-10-08)
+
+- **`decdvb-ip`**: IPv4/IPv6 validation (IPv4 header checksum, lengths),
+  a classic PCAP writer (LINKTYPE_RAW), live statistics (protocols, a
+  bounded flow table, top talkers) and the blind IPv4 search.
+- **`decdvb-gse`**: a GSE decoder per variant — GSE_LENGTH standard or
+  counting the header (dontlookup's "hdrlen"), frag id 8-bit or 6+2 split —
+  with reassembly across BBFRAMEs, label types incl. re-use, padding, and the
+  CRC-32/MPEG-2 over total length, protocol type, label and PDU. `GseIp` runs
+  all four on every data field, scores each by valid IP and passes on the
+  best one's packets; a blind IPv4 search takes over if none yields IP for
+  50 fields. Bridged-Ethernet PDUs (type 0x0001) give up their IP. An
+  encapsulator produces any variant, for tests and the modulator.
+- **Engine**: good generic-stream BBFRAMEs (UPL 0) go from the FEC thread
+  through `GseIp`; **● Record** writes PCAP (a new file per recording, with
+  no restart). The GSE variant can be forced per VFO.
+- **Test signals**: `GseBbFramer` puts UDP flows between RFC 5737
+  documentation addresses into GSE in any variant; the `scene` capture's
+  1 MS/s carrier now carries IP over GSE.
+
+Verified: a QPSK 3/4 short-frame carrier carrying GSE written the
+non-standard way (header-inclusive length, split frag ids) through a VFO —
+the variant found from the data, fragments reassembled with CRCs matching,
+and a PCAP whose every record parses as IP. In the GUI on the scene: 389 of
+389 BBFRAMEs, 782 IPv4/UDP packets at 847 kbit/s.
+
+Note: the CRC-32 coverage and total-length meaning follow TS 102 606-1 as
+read here, and match this encoder; dontlookup computes the CRC but ignores
+mismatches, so real links will show whether they agree (the GSE variants
+table in the side bar counts CRC ok / bad).
+
+### Next
+
+- MPEG-TS output from TS-mode BBFRAMEs (`decdvb-ts`): sync-byte restore
+  from the CRC-8s, null-packet re-insertion, `.ts` file / UDP.
+- Live confirmation on a real GSE carrier.

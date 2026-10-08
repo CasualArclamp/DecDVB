@@ -20,7 +20,7 @@ use decdvb_dsp::Ddc;
 use decdvb_io::IqFileWriter;
 
 use crate::demod::{Demod, LockState};
-use crate::fec::{FecStats, FecWorker};
+use crate::fec::{FecOutput, FecStats, FecWorker};
 use crate::identify::{Identification, Verdict, identify_in};
 use crate::psk::PskDemod;
 use crate::spectrum::Spectrum;
@@ -93,9 +93,12 @@ pub struct VfoSettings {
     pub gold_code: u32,
     /// Generic PSK: the constellation to decide on; `None` takes Identify's.
     pub psk_modulation: Option<decdvb_core::Modulation>,
-    /// Generic PSK: write symbols to a file. Off by default — the decoder
-    /// shows the locked constellation until recording is asked for.
+    /// Write the decoder's output to a file: symbols (generic PSK) or IP
+    /// packets as PCAP (DVB-S2 → GSE/IP). Off by default — the decoder shows
+    /// what it finds until recording is asked for.
     pub record: bool,
+    /// DVB-S2 → GSE/IP: read GSE this way; `None` detects it from the data.
+    pub gse_variant: Option<decdvb_gse::Variant>,
     /// Where the IQ recorder and the symbol writer write.
     pub record_dir: PathBuf,
 }
@@ -117,6 +120,7 @@ impl VfoSettings {
             gold_code: 0,
             psk_modulation: None,
             record: false,
+            gse_variant: None,
             record_dir: std::env::temp_dir(),
         }
     }
@@ -426,6 +430,10 @@ impl Worker {
         // carrier kept its gathered signal and analysed a mixture of the two.
         let signal_changed = rebuild_ddc || retuned || new_decoder;
         self.settings = new;
+        // Record / GSE variant changes reach a running FEC thread directly.
+        if let Decoder::Dvbs2 { fec: Some(w), .. } = &self.decoder {
+            w.set_output(fec_output(&self.settings, &self.ddc));
+        }
         // A recorder keeps its file across a retune (a new file per drag frame
         // would be worse); everything that analyses the signal starts afresh.
         let analyses = !matches!(self.decoder, Decoder::Record { .. } | Decoder::Spectrum);
@@ -586,7 +594,7 @@ impl Worker {
                                 .set_offset(self.settings.offset_hz + id.center_offset_hz);
                             self.frames.clear();
                             d.process(&shifted, &mut self.frames);
-                            let w = FecWorker::spawn(rs);
+                            let w = FecWorker::spawn(rs, fec_output(&self.settings, &self.ddc));
                             for f in self.frames.drain(..) {
                                 w.offer(f);
                             }
@@ -794,18 +802,21 @@ impl Worker {
                         });
                     }
                     let fec = fec.as_ref().map(|w| w.stats());
-                    let output = if self.settings.decoder == DecoderKind::Dvbs2Ts {
-                        "TS"
-                    } else {
-                        "GSE/IP"
-                    };
                     st.message = match (d.lock_state(), &fec) {
                         (LockState::Searching, _) => "searching for PLHEADERs".into(),
                         (LockState::Found, _) => "found a PLHEADER, confirming".into(),
-                        (LockState::Locked, Some(f)) if f.frames > 0 => format!(
-                            "locked · {} of {} BBFRAMEs good · {output} output arrives in M4",
-                            f.ok, f.frames
-                        ),
+                        (LockState::Locked, Some(f)) if f.frames > 0 => {
+                            let what = match (&f.gse, self.settings.decoder) {
+                                (Some(g), DecoderKind::Dvbs2Ip) => {
+                                    format!("{} IP packets", g.packets)
+                                }
+                                _ if f.ts_frames > 0 => {
+                                    format!("{} TS frames (MPEG-TS output is next)", f.ts_frames)
+                                }
+                                _ => "no stream data yet".into(),
+                            };
+                            format!("locked · {} of {} BBFRAMEs good · {what}", f.ok, f.frames)
+                        }
                         (LockState::Locked, _) => {
                             format!("locked, {} frames, MER {:.1} dB", d.frames(), d.mer_db())
                         }
@@ -859,6 +870,18 @@ impl Worker {
                 }
             },
         }
+    }
+}
+
+/// What a DVB-S2 VFO's FEC thread should write. The DDC is tuned onto the
+/// carrier by then, so its offset names the file.
+fn fec_output(s: &VfoSettings, ddc: &Ddc) -> FecOutput {
+    FecOutput {
+        record: s.record && s.decoder == DecoderKind::Dvbs2Ip,
+        dir: s.record_dir.clone(),
+        name: s.name.clone(),
+        carrier_hz: ddc.offset_hz(),
+        gse_variant: s.gse_variant,
     }
 }
 
@@ -1231,6 +1254,70 @@ mod tests {
         let h = fec.last_header.expect("no BBHEADER");
         assert_eq!(h.format, decdvb_frame::StreamFormat::Transport);
         assert!(fec.es_n0_db.is_some_and(|e| e > 15.0), "{fec:?}");
+    }
+
+    #[test]
+    fn dvbs2_ip_vfo_finds_the_gse_variant_and_writes_pcap() {
+        use decdvb_gse::{LengthMode, Source, Variant};
+        use decdvb_mod::{FrameSpec, GseBbFramer, PlFramer};
+        // IP over GSE written the non-standard way (length including the
+        // header, split frag ids), QPSK 3/4 short frames at 125 kBd.
+        let variant = Variant::ALL[3];
+        let syms = PlFramer::new(0, 6)
+            .with_source(Box::new(GseBbFramer::new(9, variant)))
+            .build_schedule(&[FrameSpec::new(7, true, true)], 200_000);
+        let mut sh = Shaper::new(4, 0.35, 16);
+        let mut x = Vec::new();
+        sh.process(&syms, &mut x);
+        let w = std::f64::consts::TAU * 40_000.0 / 500_000.0;
+        for (n, v) in x.iter_mut().enumerate() {
+            let ph = w * n as f64;
+            *v *= Iq::new(ph.cos() as f32, ph.sin() as f32);
+        }
+        let dir = std::env::temp_dir().join(format!("decdvb-pcap-vfo-{}", std::process::id()));
+        let mut settings = VfoSettings::new("IP", 40_000.0, 190_000.0, DecoderKind::Dvbs2Ip);
+        settings.record = true;
+        settings.record_dir = dir.clone();
+        let status = Arc::new(Mutex::new(VfoStatus::default()));
+        let mut wk = Worker::new(
+            500_000.0,
+            settings,
+            status.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        feed(&mut wk, &x, 65_536);
+        let t0 = Instant::now();
+        let gse = loop {
+            wk.publish(0);
+            let g = status.lock().unwrap().fec.clone().and_then(|f| f.gse);
+            if g.as_ref().is_some_and(|g| g.packets >= 10) || t0.elapsed().as_secs() > 20 {
+                break g.expect("no GSE");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        drop(wk); // closes the PCAP
+
+        let Some(Source::Gse(found)) = gse.source else {
+            panic!("source {:?}", gse.source)
+        };
+        assert_eq!(found.length, LengthMode::HeaderIncluded);
+        assert!(gse.packets >= 10, "{gse:?}");
+        assert_eq!(gse.ipv4, gse.packets);
+        assert!(gse.top[0].dst.to_string().starts_with("198.51.100."));
+        let (path, written) = gse.pcap.clone().expect("no PCAP");
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(gse.pcap_active && written > 0);
+        // Header, then records of 16 bytes plus a packet each.
+        let (mut at, mut n) = (24usize, 0u64);
+        while at + 16 <= bytes.len() {
+            let len = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap()) as usize;
+            assert!(decdvb_ip::parse(&bytes[at + 16..at + 16 + len]).is_some());
+            at += 16 + len;
+            n += 1;
+        }
+        assert_eq!(at, bytes.len());
+        assert!(n >= written, "{n} records, {written} counted");
     }
 
     #[test]

@@ -5,9 +5,9 @@
 //!
 //! | offset   | what                                             |
 //! |----------|--------------------------------------------------|
-//! | −2.5 MHz | DVB-S2 CCM, QPSK 1/2 + pilots, 1 MS/s, α 0.20    |
+//! | −2.5 MHz | DVB-S2 CCM, QPSK 1/2 + pilots, 1 MS/s, α 0.20 — IP over GSE |
 //! | −0.8 MHz | an unmodulated CW tone                           |
-//! | +1.2 MHz | DVB-S2 **ACM**: QPSK 1/2 → 8PSK 3/5 → short 16APSK 2/3, 500 kS/s, α 0.25 |
+//! | +1.2 MHz | DVB-S2 **ACM**: QPSK 1/2 → 8PSK 3/5 → short 16APSK 2/3, 500 kS/s, α 0.25 — MPEG-TS |
 //! | +2.8 MHz | plain QPSK, no PLHEADERs, 250 kS/s, α 0.35       |
 //!
 //! The DVB-S2 carriers are real, fully coded signals: TS packets in BBFRAMEs,
@@ -17,8 +17,9 @@ use std::path::Path;
 
 use anyhow::Result;
 use decdvb_core::{Iq, RollOff, SampleFormat};
+use decdvb_gse::Variant;
 use decdvb_io::IqFileWriter;
-use decdvb_mod::{FrameSpec, PlFramer, Shaper};
+use decdvb_mod::{FrameSpec, GseBbFramer, PlFramer, Shaper};
 
 pub const RATE: f64 = 8e6;
 
@@ -71,8 +72,9 @@ pub fn write(out: &Path, seconds: f64) -> Result<()> {
     // LDPC), so the scene decodes end to end; their BBHEADERs announce the
     // roll-off each is shaped with.
     let a = {
-        let mut f = PlFramer::new(0, 1);
-        f.ts.roll_off = RollOff::R20;
+        let mut f =
+            PlFramer::new(0, 1).with_source(Box::new(GseBbFramer::new(1, Variant::STANDARD)));
+        f.set_roll_off(RollOff::R20);
         let syms = f.build_schedule(&[FrameSpec::new(4, false, true)], n / 8 + 64);
         shaped(&syms, 8, 0.20)
     };
@@ -83,7 +85,7 @@ pub fn write(out: &Path, seconds: f64) -> Result<()> {
             FrameSpec::new(18, true, true),
         ];
         let mut f = PlFramer::new(0, 2);
-        f.ts.roll_off = RollOff::R25;
+        f.set_roll_off(RollOff::R25);
         let syms = f.build_schedule(&sched, n / 16 + 64);
         shaped(&syms, 16, 0.25)
     };

@@ -9,6 +9,6 @@ pub mod fec;
 pub mod framer;
 pub mod shaper;
 
-pub use fec::{FecEncoder, TsBbFramer};
+pub use fec::{BbFrameSource, FecEncoder, GseBbFramer, TsBbFramer};
 pub use framer::{FrameSpec, PlFramer};
 pub use shaper::Shaper;

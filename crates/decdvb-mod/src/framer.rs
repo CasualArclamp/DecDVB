@@ -16,7 +16,7 @@ use decdvb_fec::demap::map_fecframe;
 use decdvb_fec::{Constellation, FecParams};
 use decdvb_frame::pi2bpsk::map_bpsk;
 
-use crate::fec::{FecEncoder, TsBbFramer};
+use crate::fec::{BbFrameSource, FecEncoder, TsBbFramer};
 use decdvb_frame::{
     PILOT_BLK_LEN, PLHEADER_LEN, PlScrambler, PlsInfo, PlscEncoder, SLOT_LEN, SLOTS_PER_PILOT_BLK,
     SOF_BIG_ENDIAN, SOF_LEN,
@@ -58,8 +58,8 @@ pub struct PlFramer {
     scrambler: PlScrambler,
     plsc: PlscEncoder,
     rng: u64,
-    /// The BBFRAME source; set its roll-off to match the shaping filter.
-    pub ts: TsBbFramer,
+    /// Where the BBFRAMEs come from (TS packets unless told otherwise).
+    source: Box<dyn BbFrameSource>,
     fec: FecEncoder,
     data: Vec<Iq>,
 }
@@ -70,10 +70,21 @@ impl PlFramer {
             scrambler: PlScrambler::new(gold_code),
             plsc: PlscEncoder::new(),
             rng: seed | 1,
-            ts: TsBbFramer::new(seed ^ 0x7E57),
+            source: Box::new(TsBbFramer::new(seed ^ 0x7E57)),
             fec: FecEncoder::new(),
             data: Vec::new(),
         }
+    }
+
+    /// Take BBFRAMEs from `source` instead (e.g. IP over GSE).
+    pub fn with_source(mut self, source: Box<dyn BbFrameSource>) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// The roll-off the BBHEADERs announce; match the shaping filter's.
+    pub fn set_roll_off(&mut self, roll_off: decdvb_core::RollOff) {
+        self.source.set_roll_off(roll_off);
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -118,7 +129,7 @@ impl PlFramer {
             self.data.clear();
             match FecParams::new(size, mc.rate) {
                 Some(p) => {
-                    let bb = self.ts.next_frame(p.bbframe_bytes());
+                    let bb = self.source.next_frame(p.bbframe_bytes());
                     let fec = self.fec.encode(p, &bb);
                     map_fecframe(&fec, &cst, mc.rate, &mut self.data);
                 }
@@ -159,9 +170,10 @@ impl PlFramer {
         );
         let mut out = Vec::with_capacity(n_symbols + 40_000);
         // One MODCOD throughout is CCM; anything else is ACM/VCM (MATYPE).
-        self.ts.ccm = schedule.iter().filter(|s| s.modcod != 0).all(|s| {
-            (s.modcod, s.short_fecframe) == (schedule[0].modcod, schedule[0].short_fecframe)
-        });
+        self.source
+            .set_ccm(schedule.iter().filter(|s| s.modcod != 0).all(|s| {
+                (s.modcod, s.short_fecframe) == (schedule[0].modcod, schedule[0].short_fecframe)
+            }));
         let mut k = 0;
         while out.len() < n_symbols {
             self.build(schedule[k % schedule.len()], &mut out);

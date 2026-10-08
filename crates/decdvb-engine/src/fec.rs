@@ -5,18 +5,24 @@
 //!
 //! It runs on its own thread per VFO (`FecWorker`), fed through a bounded
 //! queue: the demodulator must keep real time, and when decoding cannot,
-//! frames are dropped and counted rather than stalling it.
+//! frames are dropped and counted rather than stalling it. Good GS-mode
+//! BBFRAMEs then go through GSE to IP (every GSE variant tried, the one
+//! yielding valid IP kept — `decdvb_gse::GseIp`), into live statistics and,
+//! while recording, a PCAP file.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use decdvb_core::{FecFrame, Iq, s2_modcod};
 use decdvb_fec::demap::{demap_llr, quantize};
 use decdvb_fec::{Bch, BchError, Constellation, DecodeOutcome, FecParams, LdpcCode, LdpcDecoder};
-use decdvb_frame::{BbHeader, BbHeaderError, PlsInfo, bb_scramble};
+use decdvb_frame::{BBHEADER_LEN, BbHeader, BbHeaderError, PlsInfo, StreamFormat, bb_scramble};
+use decdvb_gse::{GseIp, IpPacket, Source, Variant, VariantReport};
+use decdvb_ip::{Flow, IpStats, PcapWriter};
 
 use crate::demod::{PILOT_AFTER, PILOT_PERIOD, PlFrame};
 
@@ -174,28 +180,74 @@ pub struct FecStats {
     pub payload_bps: f64,
     /// Fraction of real time the FEC thread is busy.
     pub load: f32,
+    /// Good TS-mode frames (MPEG-TS output arrives with M4's TS work).
+    pub ts_frames: u64,
+    /// What GSE and IP have made of the GS-mode frames.
+    pub gse: Option<GseView>,
+}
+
+/// IP out of GSE, for display.
+#[derive(Debug, Clone, Default)]
+pub struct GseView {
+    /// Where packets come from: the GSE variant in use, or the blind search.
+    pub source: Option<Source>,
+    /// Every variant's counts, for comparison.
+    pub variants: Vec<VariantReport>,
+    /// Non-IP PDUs by protocol type.
+    pub other_protocols: BTreeMap<u16, u64>,
+    pub packets: u64,
+    pub bytes: u64,
+    pub ipv4: u64,
+    pub ipv6: u64,
+    /// Packets by IP protocol number.
+    pub protocols: BTreeMap<u8, u64>,
+    /// The busiest flows by bytes.
+    pub top: Vec<Flow>,
+    pub flows: usize,
+    /// IP bit rate over the last couple of seconds of signal.
+    pub ip_bps: f64,
+    /// The PCAP being written, or the last one, and its packet count.
+    pub pcap: Option<(PathBuf, u64)>,
+    pub pcap_active: bool,
+    pub pcap_error: Option<String>,
+}
+
+/// Where and whether a VFO's FEC writes its output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FecOutput {
+    /// Write IP packets to a PCAP file.
+    pub record: bool,
+    pub dir: PathBuf,
+    /// For file names.
+    pub name: String,
+    pub carrier_hz: f64,
+    /// Read GSE this way instead of detecting it.
+    pub gse_variant: Option<Variant>,
 }
 
 /// Runs a [`FecDecoder`] on its own thread.
 pub(crate) struct FecWorker {
     tx: Option<SyncSender<PlFrame>>,
     stats: Arc<Mutex<FecStats>>,
+    output: Arc<Mutex<FecOutput>>,
     join: Option<JoinHandle<()>>,
 }
 
 impl FecWorker {
-    /// `symbol_rate` turns frame lengths into signal time for the rate.
-    pub fn spawn(symbol_rate: f64) -> Self {
+    /// `symbol_rate` turns frame lengths into signal time for the rates.
+    pub fn spawn(symbol_rate: f64, output: FecOutput) -> Self {
         let (tx, rx) = mpsc::sync_channel(QUEUE);
         let stats = Arc::new(Mutex::new(FecStats::default()));
-        let shared = stats.clone();
+        let output = Arc::new(Mutex::new(output));
+        let (s, o) = (stats.clone(), output.clone());
         let join = std::thread::Builder::new()
             .name("decdvb-fec".into())
-            .spawn(move || run(rx, shared, symbol_rate))
+            .spawn(move || run(rx, s, o, symbol_rate))
             .expect("spawn FEC thread");
         FecWorker {
             tx: Some(tx),
             stats,
+            output,
             join: Some(join),
         }
     }
@@ -207,6 +259,11 @@ impl FecWorker {
         {
             self.stats.lock().unwrap().dropped += 1;
         }
+    }
+
+    /// Change what is written; takes effect from the next frame.
+    pub fn set_output(&self, o: FecOutput) {
+        *self.output.lock().unwrap() = o;
     }
 
     pub fn stats(&self) -> FecStats {
@@ -224,8 +281,140 @@ impl Drop for FecWorker {
     }
 }
 
-fn run(rx: Receiver<PlFrame>, stats: Arc<Mutex<FecStats>>, symbol_rate: f64) {
+/// The GSE → IP → PCAP end of the FEC thread.
+struct IpStage {
+    gse: GseIp,
+    stats: IpStats,
+    packets: Vec<IpPacket>,
+    pcap: Option<PcapWriter>,
+    path: Option<PathBuf>,
+    error: Option<String>,
+    /// IP rate window: bytes and signal seconds.
+    win: (f64, f64),
+    ip_bps: f64,
+    last_top: Instant,
+    top: Vec<Flow>,
+}
+
+impl IpStage {
+    fn new() -> Self {
+        IpStage {
+            gse: GseIp::new(),
+            stats: IpStats::default(),
+            packets: Vec::new(),
+            pcap: None,
+            path: None,
+            error: None,
+            win: (0.0, 0.0),
+            ip_bps: 0.0,
+            last_top: Instant::now(),
+            top: Vec::new(),
+        }
+    }
+
+    /// Open or close the PCAP to match `o.record` (a new file per recording).
+    fn follow(&mut self, o: &FecOutput) {
+        self.gse.forced = o.gse_variant;
+        match (o.record, self.pcap.is_some()) {
+            (true, false) if self.error.is_none() => {
+                let stamp = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let path = o.dir.join(format!(
+                    "decdvb-{}-{:+.0}Hz-{stamp}.pcap",
+                    o.name.replace(' ', "_"),
+                    o.carrier_hz
+                ));
+                let _ = std::fs::create_dir_all(&o.dir);
+                match PcapWriter::create(&path) {
+                    Ok(w) => self.pcap = Some(w),
+                    Err(e) => self.error = Some(format!("{}: {e}", path.display())),
+                }
+                self.path = Some(path);
+            }
+            (false, true) => {
+                if let Some(mut w) = self.pcap.take() {
+                    let _ = w.flush();
+                }
+            }
+            (false, false) => self.error = None,
+            _ => {}
+        }
+    }
+
+    /// One good GS-mode frame's data field.
+    fn data_field(&mut self, field: &[u8]) {
+        self.packets.clear();
+        self.gse.data_field(field, &mut self.packets);
+        let now = SystemTime::now();
+        for p in &self.packets {
+            self.stats.add(&p.info);
+            self.win.0 += p.data.len() as f64;
+            if let Some(w) = &mut self.pcap
+                && let Err(e) = w.write(now, &p.data)
+            {
+                self.error = Some(e.to_string());
+                self.pcap = None;
+            }
+        }
+    }
+
+    /// Signal time passes (every frame, good or not).
+    fn tick(&mut self, secs: f64) {
+        self.win.1 += secs;
+        if self.win.1 >= 2.0 || (self.ip_bps == 0.0 && self.win.1 > 0.2) {
+            self.ip_bps = self.win.0 * 8.0 / self.win.1;
+            if self.win.1 >= 2.0 {
+                self.win = (0.0, 0.0);
+            }
+        }
+    }
+
+    fn view(&mut self) -> GseView {
+        // Ranking flows sorts the table: twice a second is plenty.
+        if self.last_top.elapsed().as_millis() >= 500 || self.top.is_empty() {
+            self.top = self.stats.top_flows(8);
+            self.last_top = Instant::now();
+        }
+        GseView {
+            source: self.gse.source(),
+            variants: self.gse.reports(),
+            other_protocols: self.gse.other_protocols.clone(),
+            packets: self.stats.packets,
+            bytes: self.stats.bytes,
+            ipv4: self.stats.ipv4,
+            ipv6: self.stats.ipv6,
+            protocols: self.stats.protocols.clone(),
+            top: self.top.clone(),
+            flows: self.stats.flow_count(),
+            ip_bps: self.ip_bps,
+            pcap: self
+                .path
+                .clone()
+                .map(|p| (p, self.pcap.as_ref().map_or(0, |w| w.packets()))),
+            pcap_active: self.pcap.is_some(),
+            pcap_error: self.error.clone(),
+        }
+    }
+}
+
+impl Drop for IpStage {
+    fn drop(&mut self) {
+        if let Some(w) = &mut self.pcap {
+            let _ = w.flush();
+        }
+    }
+}
+
+fn run(
+    rx: Receiver<PlFrame>,
+    stats: Arc<Mutex<FecStats>>,
+    output: Arc<Mutex<FecOutput>>,
+    symbol_rate: f64,
+) {
     let mut dec = FecDecoder::new();
+    let mut ip: Option<IpStage> = None;
     // Payload rate window: DFL bits and signal seconds.
     let (mut win_bits, mut win_secs) = (0f64, 0f64);
     let mut busy = 0f64;
@@ -233,13 +422,36 @@ fn run(rx: Receiver<PlFrame>, stats: Arc<Mutex<FecStats>>, symbol_rate: f64) {
         let t0 = Instant::now();
         let secs = f.pls.plframe_len as f64 / symbol_rate;
         let out = dec.decode(&f);
+
+        // GSE/IP on good generic-stream frames (UPL 0: continuous; GSE also
+        // turns up flagged as packetized with UPL 0).
+        let gs = out.as_ref().and_then(|b| match &b.header {
+            Ok(h) if b.ok() && h.format != StreamFormat::Transport && h.upl == 0 => {
+                let end = (BBHEADER_LEN + h.dfl as usize / 8).min(b.bytes.len());
+                Some(&b.bytes[BBHEADER_LEN..end])
+            }
+            _ => None,
+        });
+        if let Some(field) = gs {
+            let stage = ip.get_or_insert_with(IpStage::new);
+            stage.follow(&output.lock().unwrap());
+            stage.data_field(field);
+        }
+        if let Some(stage) = &mut ip {
+            stage.tick(secs);
+            if gs.is_none() {
+                // Keep Record/Stop responsive between GS frames.
+                stage.follow(&output.lock().unwrap());
+            }
+        }
+
         let used = t0.elapsed().as_secs_f64();
         busy = 0.95 * busy + 0.05 * (used / secs.max(1e-9));
 
         let mut s = stats.lock().unwrap();
         s.load = busy as f32;
         win_secs += secs;
-        if let Some(b) = out {
+        if let Some(b) = &out {
             s.frames += 1;
             s.iterations += b.ldpc.iterations as u64;
             s.ldpc_unconverged += !b.ldpc.converged as u64;
@@ -258,6 +470,9 @@ fn run(rx: Receiver<PlFrame>, stats: Arc<Mutex<FecStats>>, symbol_rate: f64) {
                         .or_default() += 1;
                     s.per_modcod.entry(b.pls.modcod).or_default().0 += 1;
                     win_bits += h.dfl as f64;
+                    if h.format == StreamFormat::Transport {
+                        s.ts_frames += 1;
+                    }
                 }
             }
         }
@@ -267,6 +482,9 @@ fn run(rx: Receiver<PlFrame>, stats: Arc<Mutex<FecStats>>, symbol_rate: f64) {
         } else if s.payload_bps == 0.0 && win_secs > 0.2 {
             // A first figure quickly, refined once the window fills.
             s.payload_bps = win_bits / win_secs;
+        }
+        if let Some(stage) = &mut ip {
+            s.gse = Some(stage.view());
         }
     }
 }

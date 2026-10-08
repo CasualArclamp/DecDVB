@@ -138,7 +138,12 @@ pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
                     .unwrap_or_else(|| "dummy".into());
                 match &st.fec {
                     Some(f) if f.ok > 0 && f.payload_bps > 0.0 => {
-                        format!("LOCK {mc} · {}", format::bitrate(f.payload_bps))
+                        let rec = f.gse.as_ref().is_some_and(|g| g.pcap_active);
+                        format!(
+                            "LOCK {mc} · {}{}",
+                            format::bitrate(f.payload_bps),
+                            if rec { " ● REC" } else { "" }
+                        )
                     }
                     Some(f) if f.frames > 0 && f.ok == 0 => format!("LOCK {mc} · FEC fail"),
                     _ => format!("LOCK {mc}"),

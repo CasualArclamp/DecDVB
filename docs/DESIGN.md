@@ -280,8 +280,10 @@ them all and accept whichever yields a valid IP header (checksum + sane
 lengths):
 
 1. **Length meaning.** *Standard*: `GSE_LENGTH` counts every byte after the
-   2-byte header. *`hdrlen`*: `GSE_LENGTH` counts the **PDU only**, excluding
-   the frag-id / total-length / protocol-type / label fields that follow it.
+   2-byte header. *`hdrlen`*: `GSE_LENGTH` counts the 2-byte header **as
+   well**, so the body is `GSE_LENGTH − 2` bytes (`gse_hdrlen.ksy`:
+   `size: gse_length-2`). *(Corrected in M4: this note first said "the PDU
+   only", which the Kaitai source does not support.)*
 2. **Fragment id.** *Standard*: `frag_id` is a plain u8. *`split`*: that byte is
    a 6-bit `frag_id` plus a 2-bit continuity counter.
 
