@@ -476,6 +476,32 @@ mod tests {
         assert_eq!(d.offset_hz(), 1e6);
     }
 
+    /// `cargo test --release -p decdvb-dsp ddc_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn ddc_throughput() {
+        let rate = 20e6;
+        let input = tone(rate, 1.0e6, 2_000_000);
+        for bw in [5e6, 1.5e6, 500e3, 100e3] {
+            let mut d = Ddc::new(rate, 1.0e6, bw);
+            let mut out = Vec::new();
+            let t0 = std::time::Instant::now();
+            for _ in 0..5 {
+                out.clear();
+                d.process(&input, &mut out);
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            let real = 5.0 * input.len() as f64 / rate;
+            eprintln!(
+                "VFO {:>7.0} kHz at 20 MS/s: {:>5.1} % of a core ({:?}, {:.1} MAC/sample)",
+                bw / 1e3,
+                100.0 * secs / real,
+                d.stage_layout(),
+                d.cost()
+            );
+        }
+    }
+
     #[test]
     fn output_count_matches_decimation() {
         for (rate, bw) in [(10e6, 1e6), (20e6, 380e3)] {
