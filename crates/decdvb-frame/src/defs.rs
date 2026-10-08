@@ -28,6 +28,10 @@ pub const MAX_PILOT_BLKS: usize = 22;
 pub const MAX_PLFRAME_LEN: usize =
     PLHEADER_LEN + MAX_SLOTS * SLOT_LEN + MAX_PILOT_BLKS * PILOT_BLK_LEN;
 
+/// Longest PLFRAME payload (everything after the PLHEADER, pilots included) —
+/// the length of the PL scrambling sequence.
+pub const MAX_PLFRAME_PAYLOAD: usize = MAX_PLFRAME_LEN - PLHEADER_LEN;
+
 /// The 26-bit SOF pattern, MSB transmitted first (EN 302 307-1 §5.5.2.1).
 pub const SOF_PATTERN: u32 = 0x018D_2E82;
 

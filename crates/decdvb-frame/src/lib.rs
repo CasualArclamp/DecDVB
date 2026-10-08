@@ -9,9 +9,11 @@ pub mod defs;
 pub mod pi2bpsk;
 pub mod plsc;
 pub mod rm;
+pub mod scramble;
 pub mod sync;
 
 pub use defs::*;
 pub use plsc::{PlsInfo, PlscDecoder, PlscDemap, PlscEncoder};
 pub use rm::ReedMuller;
+pub use scramble::PlScrambler;
 pub use sync::PlHeaderCorrelator;
