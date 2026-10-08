@@ -17,7 +17,9 @@ pub const SLOTS_PER_PILOT_BLK: usize = 16;
 /// A pilot block is 36 symbols.
 pub const PILOT_BLK_LEN: usize = 36;
 
-/// Fewest slots in a PLFRAME (a dummy frame, or short FECFRAME at 256APSK).
+/// Fewest slots in a PLFRAME: the S2X code reserved for 1024-ary (72); a
+/// dummy frame and short 32APSK have 36 — but slots there are 90 symbols
+/// of a frame only those long, so this bounds nothing the receiver sizes.
 pub const MIN_SLOTS: usize = 36;
 /// Most slots in a PLFRAME (normal FECFRAME at QPSK).
 pub const MAX_SLOTS: usize = 360;
@@ -42,8 +44,8 @@ pub const SOF_BIG_ENDIAN: u64 = (SOF_PATTERN as u64) << 38;
 /// PLS code scrambling sequence (EN 302 307-1 §5.5.2.4).
 pub const PLSC_SCRAMBLER: u64 = 0x719d_83c9_5342_2dfa;
 
-/// Number of distinct 7-bit PLS codewords.
-pub const N_PLSC_CODEWORDS: usize = 128;
+/// Number of distinct PLS codewords: 8 bits with S2X (EN 302 307-2 §5.5.2).
+pub const N_PLSC_CODEWORDS: usize = 256;
 
 #[cfg(test)]
 mod tests {

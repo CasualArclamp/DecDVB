@@ -7,12 +7,13 @@
 //!
 //! The data symbols are real: a TS-mode BBFRAME of test packets, BCH and LDPC
 //! encoded, interleaved and mapped (`fec`), so a test signal decodes end to
-//! end. The one exception is a code the standard does not define (short
-//! FECFRAME 9/10): its PLHEADER can still be built, with random points after.
+//! end — S2 and S2X MODCODs alike. The exceptions are codes with nothing
+//! defined to encode (S2 short FECFRAME 9/10, S2X reserved codes, and VL-SNR
+//! frames for now): their PLHEADER is still built, with random points of the
+//! right number after, so a receiver can be tested for keeping lock.
 
-use decdvb_core::{FecFrame, Modulation};
-use decdvb_core::{Iq, s2_modcod};
-use decdvb_fec::demap::map_fecframe;
+use decdvb_core::{FecFrame, Iq, Modulation, modcod};
+use decdvb_fec::demap::Mapper;
 use decdvb_fec::{Constellation, FecParams};
 use decdvb_frame::pi2bpsk::map_bpsk;
 
@@ -25,8 +26,10 @@ use decdvb_frame::{
 /// What one frame should carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameSpec {
-    /// MODCOD 0..=28 (0 = dummy frame).
+    /// The MODCOD number ([`decdvb_core::modcod`]): S2's 0..=28 (0 = dummy
+    /// frame), or an S2X PLS code (128..=255, pilot bit ignored).
     pub modcod: u8,
+    /// S2 only: the short FECFRAME (S2X codes name their own).
     pub short_fecframe: bool,
     pub pilots: bool,
 }
@@ -40,8 +43,17 @@ impl FrameSpec {
         }
     }
 
+    /// An S2X frame by PLS code.
+    pub const fn s2x(pls: u8, pilots: bool) -> Self {
+        FrameSpec {
+            modcod: pls,
+            short_fecframe: false,
+            pilots,
+        }
+    }
+
     pub fn info(&self) -> PlsInfo {
-        PlsInfo::from_fields(self.modcod, self.short_fecframe, self.pilots)
+        PlsInfo::for_modcod(self.modcod, self.short_fecframe, self.pilots)
     }
 }
 
@@ -100,7 +112,7 @@ impl PlFramer {
     /// Append one complete PLFRAME to `out`.
     ///
     /// # Panics
-    /// If the MODCOD is not one of the 28 S2 MODCODs or 0 (dummy).
+    /// For S2's unused MODCODs 29–31.
     pub fn build(&mut self, spec: FrameSpec, out: &mut Vec<Iq>) {
         let info = spec.info();
         let start = out.len();
@@ -116,24 +128,28 @@ impl PlFramer {
             // A dummy frame's payload is 36 slots of the unmodulated symbol.
             out.extend(std::iter::repeat_n(PILOT, info.xfecframe_len as usize));
         } else {
-            let size = if spec.short_fecframe {
-                FecFrame::Short
-            } else {
-                FecFrame::Normal
-            };
-            let mc = s2_modcod(spec.modcod, size)
-                .unwrap_or_else(|| panic!("MODCOD {} is not a DVB-S2 MODCOD", spec.modcod));
-            let cst = Constellation::for_modcod(mc.modulation, mc.rate)
-                .unwrap_or_else(|| panic!("no constellation for {mc}"));
+            assert!(
+                info.is_s2x() || spec.modcod <= 28,
+                "MODCOD {} is not a DVB-S2 MODCOD",
+                spec.modcod
+            );
+            let mc = info.modcod();
+            let mapper = mc.as_ref().and_then(Mapper::for_modcod);
+            let params = mc.and_then(|m| FecParams::new(m.frame, m.rate));
 
             self.data.clear();
-            match FecParams::new(size, mc.rate) {
-                Some(p) => {
+            match (mapper, params) {
+                (Some(mp), Some(p)) => {
                     let bb = self.source.next_frame(p.bbframe_bytes());
                     let fec = self.fec.encode(p, &bb);
-                    map_fecframe(&fec, &cst, mc.rate, &mut self.data);
+                    mp.map(&fec, &mut self.data);
                 }
-                None => {
+                _ => {
+                    // Nothing defined to encode: random points of the frame's
+                    // constellation (QPSK where it has none).
+                    let cst = mc
+                        .and_then(|m| Constellation::for_modcod(&m))
+                        .unwrap_or_else(Constellation::qpsk);
                     let mask = (1usize << cst.bits()) - 1;
                     for _ in 0..info.xfecframe_len {
                         let bits = (self.next_u64() >> 32) as usize & mask;
@@ -183,9 +199,9 @@ impl PlFramer {
     }
 }
 
-/// The modulation each S2 MODCOD uses, for callers that only have the index.
-pub fn modulation_of(modcod: u8) -> Option<Modulation> {
-    s2_modcod(modcod, FecFrame::Normal).map(|m| m.modulation)
+/// The modulation a MODCOD uses, for callers that only have its number.
+pub fn modulation_of(index: u8) -> Option<Modulation> {
+    modcod(index, FecFrame::Normal).map(|m| m.modulation)
 }
 
 #[cfg(test)]
@@ -257,6 +273,28 @@ mod tests {
             }
         }
         assert_eq!(i, payload.len());
+    }
+
+    #[test]
+    fn s2x_frames_have_the_pls_lengths_and_decode_back() {
+        let mut f = PlFramer::new(0, 4);
+        let mut dec = PlscDecoder::new();
+        for spec in [
+            FrameSpec::s2x(132, true),  // QPSK 13/45
+            FrameSpec::s2x(138, false), // 2+4+2APSK
+            FrameSpec::s2x(186, true),  // 4+12+20+28APSK
+            FrameSpec::s2x(200, false), // 128APSK: 103 slots
+            FrameSpec::s2x(206, true),  // 256APSK 20/30 (points by table)
+            FrameSpec::s2x(246, true),  // short 4+12+16rbAPSK
+            FrameSpec::s2x(250, true),  // reserved: random payload
+        ] {
+            let mut out = Vec::new();
+            f.build(spec, &mut out);
+            let info = spec.info();
+            assert_eq!(out.len(), info.plframe_len as usize, "{spec:?}");
+            let got = dec.decode(&out[SOF_LEN - 1..], PlscDemap::CoherentSoft);
+            assert_eq!(got, info, "{spec:?}");
+        }
     }
 
     #[test]

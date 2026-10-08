@@ -5,14 +5,16 @@ built like **SDR++**: a big waterfall over the whole span, and VFOs you drop on
 it, each running the decoder of your choice — including a blind **"what is
 this?"** mode that finds a carrier's symbol rate and tells you what it is.
 
-Planned: adaptive coding and modulation (**ACM**) decoding, **GSE** to **IP**
-written as a PCAP, **MPEG-TS** extraction, and a matching modulator.
+It decodes DVB-S2 and DVB-S2X with adaptive coding and modulation (**ACM**),
+frame by frame: **GSE** to **IP** written as a PCAP, **MPEG-TS** to a file or
+a media player, multicast radio played in the app.
 
-![DecDVB: carriers in an 8 MS/s span, each claimed by a DVB-S2 VFO; the selected one is an ACM carrier, frame-locked, its 16APSK frames carrier-locked at 23.7 dB MER](docs/images/waterfall.png)
+![DecDVB: carriers in an 8 MS/s span, each claimed by an Identify VFO; the selected one is identified as a DVB-S2X ACM carrier at 500 kS/s with its four MODCODs listed](docs/images/waterfall.png)
 
-*A synthetic 8 MS/s test scene (`decdvb scene`): two DVB-S2 carriers — one
-CCM, one ACM switching QPSK 1/2 → 8PSK 3/5 → 16APSK 2/3 — a plain QPSK carrier
-and a CW tone. Every carrier was found and identified blind.*
+*A synthetic 8 MS/s test scene (`decdvb scene`): a DVB-S2 CCM carrier, an
+ACM carrier mixing S2 and S2X MODCODs (QPSK 1/2 → 8PSK 25/36 → 16APSK 26/45 →
+32APSK 32/45), a plain QPSK carrier and a CW tone. Every carrier was found and
+identified blind.*
 
 > Early development. [`docs/DESIGN.md`](docs/DESIGN.md) holds the scope and the
 > milestone plan, [`docs/STATUS.md`](docs/STATUS.md) what is done.
@@ -24,16 +26,17 @@ and a CW tone. Every carrier was found and identified blind.*
 | Waterfall + spectrum over the whole span, zoom and pan | ✅ |
 | Carrier detection: every carrier marked with its symbol rate | ✅ |
 | VFOs: draw, drag, resize, click a carrier to claim it; one thread each | ✅ |
-| **Identify** — blind symbol rate, roll-off, constellation, DVB-S2 detection | ✅ |
-| DVB-S2 PL demodulation: frame lock, MODCOD per frame (ACM) | ✅ |
+| **Identify** — blind symbol rate, roll-off, constellation, DVB-S2/S2X detection | ✅ |
+| DVB-S2/S2X PL demodulation: frame lock, MODCOD per frame (ACM) | ✅ |
 | Carrier recovery: a locked constellation and MER, for Identify and DVB-S2 VFOs | ✅ |
 | **Generic PSK/APSK → symbols** (`.bin`, one byte per symbol), for non-DVB carriers | ✅ |
 | Narrow carriers: VFOs down to 500 Hz, ~10 kBd SCPC carriers lock | ✅ |
 | IQ recorder and spectrum-only VFOs | ✅ |
 | IQ file replay (`cs8`, `cs16`, `cf32`), rate/centre from file names | ✅ |
 | **Live HackRF One**, 2–20 MS/s, pure Rust over USB (no DLLs), LNB LO | ✅ |
-| **LDPC + BCH → BBFRAMEs**: all 21 S2 codes, BBHEADER, stream info, payload rate | ✅ |
-| All S2X MODCODs, VL-SNR | M3 |
+| **LDPC + BCH → BBFRAMEs**: all 21 S2 and 31 S2X codes, BBHEADER, stream info, payload rate | ✅ |
+| **S2X**: 8-bit PLS code, all 55 normal/short MODCODs — 2+4+2 8APSK to 256APSK, the new interleavers | ✅ |
+| S2X VL-SNR (pi/2-BPSK, medium FECFRAMEs), superframing | to do |
 | **GSE → IP → PCAP** + live IP stats; GSE variant detected from the data | ✅ |
 | **MPEG-TS**: services, PIDs, errors; `.ts` file, UDP, TCP/HTTP to VLC or PotPlayer | ✅ |
 | **TS analyser** (EBSPro-style): PIDs, services, now/next, network, tables | ✅ |

@@ -408,3 +408,44 @@ slider and playback controls, the list sorted by address, and a file output.
 occupied width plus about 12 % (was 25 %, or 1.5 Rs), and stops short of the
 nearest neighbouring carrier (`Carrier::vfo_bandwidth_among`), never narrower
 than the carrier itself: close carriers no longer end up inside each other's VFOs.
+
+## M3, part 2 — the S2X physical layer for normal and short frames (done, 2026-10-08)
+
+With Rory's OK, EN 302 307-2 V1.3.1 (the ETSI PDF) and GNU Radio's `gr-dtv`
+(sparse checkout) are in `reference/`. Tables were read out of the PDF with
+PyMuPDF's table finder and turned into Rust by scripts, not retyped; gr-dtv
+was the cross-check.
+
+- **PLS code, 8 bits** (§5.5.2): the S2X generator row 0x90AC2DDD (Figure 20)
+  on top of S2's (64,7) code — distance 32 among S2 codes, 24 across all 256.
+  An S2X header's 64 PLS symbols are turned +90° against the SOF; the
+  coherent reads try both ways (S2 codewords plainly, S2X ones turned back),
+  the differential read takes the first bit both ways. The frame-sync
+  correlator needed nothing: it only uses differentials within symbol pairs.
+- **`PlsInfo`** holds the 8-bit code, the FECFRAME and `modcod()`; S2X codes
+  map to Table 17a MODCODs, VL-SNR frames (129, 131: the lengths of normal
+  QPSK/16APSK with pilots, so lock holds), and the Table 17b reserved codes
+  with their stated lengths. 128APSK takes 103 slots.
+- **`decdvb_core::modcod`**: one numbering for S2 (1–28) and S2X (PLS code,
+  132–248); `Display` gives the canonical names ("16APSK 1/2-L").
+- **Constellations**: 2+4+2 8APSK, 8+8 16APSK (by γ, and the 18/30, 20/30
+  point tables), 4+12 16APSK with S2X ratios, 4+12+16rb and 4+8+4+16 32APSK,
+  16+16+16+16, 8+16+20+20 and 4+12+20+28 64APSK, 128APSK, 256APSK on rings
+  and the 20/30, 22/30 point tables. Tests: unit power, ring populations
+  match each name, every table row's angles are φ, −φ, π−φ, π+φ, labels
+  agree with gr-dtv where checked. Table 15d's 256APSK has pairs of points
+  0.0001 apart — in the standard and in gr-dtv; not an error.
+- **Interleavers** (Tables 9a/9b) per MODCOD; `demap::Mapper` bundles
+  constellation, interleaver and 128APSK's padding (6 zero bits, 12 all-ones
+  symbols).
+- **Modulator**: `FrameSpec::s2x(pls, pilots)`; reserved codes get a random
+  payload of the right length. **Test scene**: carrier B is S2/S2X ACM.
+- **Tests**: every S2X MODCOD maps and demaps noiselessly; an ACM carrier
+  through ten S2X constellation families plus S2 QPSK and a reserved code
+  decodes, at 30 dB, to exactly the BBFRAMEs sent. In the GUI the scene's S2X
+  carrier decodes 100 %, and Identify calls it DVB-S2X with the MODCOD table.
+
+**Still to do for S2X:** VL-SNR (header with Walsh–Hadamard codes, extra
+pilots, pi/2-BPSK with spreading, shortening and puncturing, medium
+FECFRAMEs with GF(2^15) BCH), the other PL scrambling sequences of Table 19e
+in acquisition, and superframing (Annex E; DESIGN puts it in M5).

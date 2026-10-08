@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::f64::consts::TAU;
 
-use decdvb_core::{FecFrame, Iq, Modulation, s2_modcod};
+use decdvb_core::{Iq, Modulation};
 use decdvb_dsp::{Agc, CarrierPll, Fir, LOCK_COHERENCE, SymbolSync, rrc_taps};
 use decdvb_fec::Constellation;
 use decdvb_frame::pi2bpsk::map_bpsk;
@@ -692,17 +692,13 @@ fn carrier_bandwidth(es_n0_db: f64) -> f64 {
     0.002 * 5f64.powf(t)
 }
 
-/// The constellation a frame's data is decided against; QPSK for MODCODs
-/// outside the S2 table (its decisions still track the 4-fold symmetry every
-/// S2 constellation has).
+/// The constellation a frame's data is decided against; QPSK where the PLS
+/// code names none — VL-SNR (pi/2-BPSK and QPSK, all on QPSK's points),
+/// reserved codes, S2's unused MODCODs — whose decisions still track the
+/// 4-fold symmetry every constellation has.
 fn frame_constellation(pls: PlsInfo) -> Constellation {
-    let size = if pls.short_fecframe {
-        FecFrame::Short
-    } else {
-        FecFrame::Normal
-    };
-    s2_modcod(pls.modcod, size)
-        .and_then(|mc| Constellation::for_modcod(mc.modulation, mc.rate))
+    pls.modcod()
+        .and_then(|mc| Constellation::for_modcod(&mc))
         .unwrap_or_else(Constellation::qpsk)
 }
 

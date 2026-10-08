@@ -127,7 +127,8 @@ pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
                 Verdict::DvbS2(d) => {
                     let mode = if d.variable_coding() { "ACM" } else { "CCM" };
                     let rs = id.symbol_rate.map(format::rate).unwrap_or_default();
-                    format!("DVB-S2 {mode} {rs}")
+                    let kind = if d.is_s2x() { "DVB-S2X" } else { "DVB-S2" };
+                    format!("{kind} {mode} {rs}")
                 }
                 Verdict::NotDvbS2 { .. } => {
                     let c = id
@@ -144,7 +145,7 @@ pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
             Some(LockState::Locked) => {
                 let mc = st
                     .last_modcod
-                    .and_then(|m| decdvb_core::s2_modcod(m, decdvb_core::FecFrame::Normal))
+                    .and_then(|m| decdvb_core::modcod(m, decdvb_core::FecFrame::Normal))
                     .map(|m| m.to_string())
                     .unwrap_or_else(|| "dummy".into());
                 match &st.fec {

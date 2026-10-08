@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use decdvb_core::{FecFrame, RxConfig, SampleFormat, s2_modcod_table};
+use decdvb_core::{FecFrame, RxConfig, SampleFormat, s2_modcod_table, s2x_modcod_table};
 use decdvb_engine::{Receiver, estimate_band};
 use decdvb_io::{IqFileReader, IqSource, format_from_path};
 
@@ -413,7 +413,29 @@ fn modcods() -> Result<()> {
             short
         );
     }
-    println!("\n28 DVB-S2 MODCODs. S2X additions land in milestone M3.");
+    println!("\n28 DVB-S2 MODCODs (EN 302 307-1 Table 12).\n");
+    println!(
+        "{:>3}  {:<16} {:>8}  {:<7} {:>6}",
+        "PLS", "MODCOD", "LDPC", "FECFRAME", "K"
+    );
+    for m in s2x_modcod_table() {
+        println!(
+            "{:>3}  {:<16} {:>8}  {:<7} {:>7}",
+            m.index,
+            m.to_string(),
+            m.rate.to_string(),
+            if m.frame == FecFrame::Short {
+                "short"
+            } else {
+                "normal"
+            },
+            m.k_approx()
+        );
+    }
+    println!(
+        "\n{} DVB-S2X MODCODs (EN 302 307-2 Table 17a), by PLS code with pilots off.",
+        s2x_modcod_table().len()
+    );
     Ok(())
 }
 

@@ -7,7 +7,7 @@
 //! |----------|--------------------------------------------------|
 //! | −2.5 MHz | DVB-S2 CCM, QPSK 1/2 + pilots, 1 MS/s, α 0.20 — IP over GSE |
 //! | −0.8 MHz | an unmodulated CW tone                           |
-//! | +1.2 MHz | DVB-S2 **ACM**: QPSK 1/2 → 8PSK 3/5 → short 16APSK 2/3, 500 kS/s, α 0.25 — MPEG-TS |
+//! | +1.2 MHz | DVB-S2/**S2X ACM**: QPSK 1/2 → 8PSK 25/36 → short 16APSK 26/45 → 32APSK 32/45 (4+8+4+16), 500 kS/s, α 0.25 — MPEG-TS |
 //! | +2.8 MHz | plain QPSK, no PLHEADERs, 250 kS/s, α 0.35       |
 //!
 //! The DVB-S2 carriers are real, fully coded signals: TS packets in BBFRAMEs,
@@ -79,10 +79,12 @@ pub fn write(out: &Path, seconds: f64) -> Result<()> {
         shaped(&syms, 8, 0.20)
     };
     let b = {
+        // S2 and S2X MODCODs in one ACM carrier, as S2X allows.
         let sched = [
             FrameSpec::new(4, false, true),
-            FrameSpec::new(12, false, true),
-            FrameSpec::new(18, true, true),
+            FrameSpec::s2x(144, true),
+            FrameSpec::s2x(240, true),
+            FrameSpec::s2x(178, true),
         ];
         let mut f = PlFramer::new(0, 2);
         f.set_roll_off(RollOff::R25);

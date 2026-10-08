@@ -61,6 +61,17 @@ pub fn derotate_bpsk(input: &[Iq], out: &mut [f32], n: usize) {
     }
 }
 
+/// Coherent de-rotation keeping both parts: `out[j]`'s real part is the
+/// 2-PAM decision of a symbol sent as plain pi/2-BPSK, its imaginary part that
+/// of one sent turned by +90° — as S2X turns its PLS code (EN 302 307-2
+/// §5.5.2).
+pub fn derotate_bpsk_iq(input: &[Iq], out: &mut [Iq], n: usize) {
+    assert!(input.len() >= n && out.len() >= n, "buffer too short");
+    for j in 0..n {
+        out[j] = input[j] * ROT[j & 1];
+    }
+}
+
 /// Differential (non-coherent) hard demapping, for when the carrier phase is
 /// unknown or still rotating.
 ///

@@ -1,8 +1,11 @@
 //! Modulation and coding definitions.
 //!
-//! The 28 standard DVB-S2 MODCODs (ETSI EN 302 307-1, used in the PLS code) are
-//! tabulated here. DVB-S2X adds many more MODCODs, VL-SNR modes and the medium
-//! FECFRAME; those are filled in at milestone M3 (see `docs/DESIGN.md`).
+//! The 28 DVB-S2 MODCODs (ETSI EN 302 307-1 Table 12) and the DVB-S2X ones
+//! (EN 302 307-2 Table 17a) are tabulated here, each under the number its
+//! PLS code carries: S2 MODCODs by their 5-bit field (1..=28), S2X ones by
+//! the 8-bit PLS code with the pilot bit clear (132..=248). The two ranges do
+//! not overlap, so one `u8` names any MODCOD. VL-SNR (PLS codes 129 and 131)
+//! gets its MODCOD from a header of its own and is not in these tables.
 
 use std::fmt;
 
@@ -16,6 +19,8 @@ pub enum Modulation {
     Pi2Bpsk,
     Qpsk,
     Psk8,
+    /// 2+4+2 8APSK (S2X).
+    Apsk8,
     Apsk16,
     Apsk32,
     Apsk64,
@@ -29,7 +34,7 @@ impl Modulation {
         match self {
             Modulation::Bpsk | Modulation::Pi2Bpsk => 1,
             Modulation::Qpsk => 2,
-            Modulation::Psk8 => 3,
+            Modulation::Psk8 | Modulation::Apsk8 => 3,
             Modulation::Apsk16 => 4,
             Modulation::Apsk32 => 5,
             Modulation::Apsk64 => 6,
@@ -44,6 +49,7 @@ impl Modulation {
             Modulation::Pi2Bpsk => "pi/2-BPSK",
             Modulation::Qpsk => "QPSK",
             Modulation::Psk8 => "8PSK",
+            Modulation::Apsk8 => "8APSK",
             Modulation::Apsk16 => "16APSK",
             Modulation::Apsk32 => "32APSK",
             Modulation::Apsk64 => "64APSK",
@@ -109,11 +115,17 @@ impl FecFrame {
 /// One modulation-and-coding point: what the PLHEADER announces for a PLFRAME.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Modcod {
-    /// Index as signalled in the PLS code (S2: 1..=28; dummy frame = 0).
+    /// The MODCOD's number: S2's 5-bit MODCOD field (1..=28; a dummy frame is
+    /// 0), or for S2X the PLS code with its pilot bit clear (132..=248).
     pub index: u8,
     pub modulation: Modulation,
+    /// The LDPC code identifier (the "implementation" rate, which picks the
+    /// code tables): 90/180, not 1/2.
     pub rate: CodeRate,
     pub frame: FecFrame,
+    /// The standard's canonical rate name where it differs from `rate`
+    /// ("1/2-L" for 8+8APSK 90/180).
+    pub label: Option<&'static str>,
 }
 
 impl Modcod {
@@ -125,9 +137,20 @@ impl Modcod {
     }
 }
 
+impl Modcod {
+    /// An S2X MODCOD (PLS code 128..=255).
+    pub const fn is_s2x(&self) -> bool {
+        self.index >= 128
+    }
+}
+
+/// The canonical name: "QPSK 1/2", "16APSK 1/2-L", "QPSK 11/45".
 impl fmt::Display for Modcod {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.modulation, self.rate)
+        match self.label {
+            Some(l) => write!(f, "{} {l}", self.modulation),
+            None => write!(f, "{} {}", self.modulation, self.rate),
+        }
     }
 }
 
@@ -137,6 +160,26 @@ const fn mc(index: u8, m: Modulation, num: u16, den: u16) -> Modcod {
         modulation: m,
         rate: CodeRate::new(num, den),
         frame: FecFrame::Normal,
+        label: None,
+    }
+}
+
+/// An S2X MODCOD: PLS code, modulation, LDPC code identifier, FECFRAME and
+/// canonical rate name if it differs.
+const fn x(
+    pls: u8,
+    m: Modulation,
+    num: u16,
+    den: u16,
+    frame: FecFrame,
+    label: Option<&'static str>,
+) -> Modcod {
+    Modcod {
+        index: pls,
+        modulation: m,
+        rate: CodeRate::new(num, den),
+        frame,
+        label,
     }
 }
 
@@ -181,6 +224,92 @@ static S2_MODCODS: [Modcod; 28] = {
     ]
 };
 
+/// The DVB-S2X MODCODs (EN 302 307-2 Table 17a), by PLS code with the
+/// pilot bit clear, with the LDPC code each uses (the "implementation"
+/// name) and its canonical name. Which constellation goes with a code rate
+/// (4+12 or 8+8 16APSK, the three 32APSKs, the three 64APSKs) follows from
+/// the rate: the standard never pairs one rate with two shapes of one order.
+static S2X_MODCODS: [Modcod; 55] = {
+    use FecFrame::{Normal as N, Short as S};
+    use Modulation::*;
+    [
+        x(132, Qpsk, 13, 45, N, None),
+        x(134, Qpsk, 9, 20, N, None),
+        x(136, Qpsk, 11, 20, N, None),
+        x(138, Apsk8, 100, 180, N, Some("5/9-L")),
+        x(140, Apsk8, 104, 180, N, Some("26/45-L")),
+        x(142, Psk8, 23, 36, N, None),
+        x(144, Psk8, 25, 36, N, None),
+        x(146, Psk8, 13, 18, N, None),
+        x(148, Apsk16, 90, 180, N, Some("1/2-L")),
+        x(150, Apsk16, 96, 180, N, Some("8/15-L")),
+        x(152, Apsk16, 100, 180, N, Some("5/9-L")),
+        x(154, Apsk16, 26, 45, N, None),
+        x(156, Apsk16, 3, 5, N, None),
+        x(158, Apsk16, 18, 30, N, Some("3/5-L")),
+        x(160, Apsk16, 28, 45, N, None),
+        x(162, Apsk16, 23, 36, N, None),
+        x(164, Apsk16, 20, 30, N, Some("2/3-L")),
+        x(166, Apsk16, 25, 36, N, None),
+        x(168, Apsk16, 13, 18, N, None),
+        x(170, Apsk16, 140, 180, N, Some("7/9")),
+        x(172, Apsk16, 154, 180, N, Some("77/90")),
+        x(174, Apsk32, 2, 3, N, Some("2/3-L")),
+        x(178, Apsk32, 128, 180, N, Some("32/45")),
+        x(180, Apsk32, 132, 180, N, Some("11/15")),
+        x(182, Apsk32, 140, 180, N, Some("7/9")),
+        x(184, Apsk64, 128, 180, N, Some("32/45-L")),
+        x(186, Apsk64, 132, 180, N, Some("11/15")),
+        x(190, Apsk64, 7, 9, N, None),
+        x(194, Apsk64, 4, 5, N, None),
+        x(198, Apsk64, 5, 6, N, None),
+        x(200, Apsk128, 135, 180, N, Some("3/4")),
+        x(202, Apsk128, 140, 180, N, Some("7/9")),
+        x(204, Apsk256, 116, 180, N, Some("29/45-L")),
+        x(206, Apsk256, 20, 30, N, Some("2/3-L")),
+        x(208, Apsk256, 124, 180, N, Some("31/45-L")),
+        x(210, Apsk256, 128, 180, N, Some("32/45")),
+        x(212, Apsk256, 22, 30, N, Some("11/15-L")),
+        x(214, Apsk256, 135, 180, N, Some("3/4")),
+        x(216, Qpsk, 11, 45, S, None),
+        x(218, Qpsk, 4, 15, S, None),
+        x(220, Qpsk, 14, 45, S, None),
+        x(222, Qpsk, 7, 15, S, None),
+        x(224, Qpsk, 8, 15, S, None),
+        x(226, Qpsk, 32, 45, S, None),
+        x(228, Psk8, 7, 15, S, None),
+        x(230, Psk8, 8, 15, S, None),
+        x(232, Psk8, 26, 45, S, None),
+        x(234, Psk8, 32, 45, S, None),
+        x(236, Apsk16, 7, 15, S, None),
+        x(238, Apsk16, 8, 15, S, None),
+        x(240, Apsk16, 26, 45, S, None),
+        x(242, Apsk16, 3, 5, S, None),
+        x(244, Apsk16, 32, 45, S, None),
+        x(246, Apsk32, 2, 3, S, None),
+        x(248, Apsk32, 32, 45, S, None),
+    ]
+};
+
+/// The S2X MODCOD table (see [`S2X_MODCODS`]).
+pub fn s2x_modcod_table() -> &'static [Modcod] {
+    &S2X_MODCODS
+}
+
+/// Any MODCOD by its number: S2 (1..=28, in `frame`) or S2X (its PLS code;
+/// the pilot bit is ignored, and so is `frame`, the FECFRAME being part of
+/// an S2X MODCOD).
+pub fn modcod(index: u8, frame: FecFrame) -> Option<Modcod> {
+    if index < 32 {
+        s2_modcod(index, frame)
+    } else {
+        S2X_MODCODS
+            .iter()
+            .find(|m| m.index == index & 0xFE)
+            .copied()
+    }
+}
+
 /// The standard DVB-S2 MODCOD table (see [`S2_MODCODS`]).
 pub fn s2_modcod_table() -> &'static [Modcod] {
     &S2_MODCODS
@@ -212,6 +341,33 @@ mod tests {
         let m = s2_modcod(4, FecFrame::Normal).unwrap(); // QPSK 1/2
         assert_eq!(m.k_approx(), 32_400);
         assert_eq!(m.modulation.bits_per_symbol(), 2);
+    }
+
+    #[test]
+    fn s2x_table_matches_table_17a() {
+        let t = s2x_modcod_table();
+        assert_eq!(t.len(), 55);
+        // Even codes only, increasing, none of the reserved ones (Table 17b).
+        for w in t.windows(2) {
+            assert!(w[0].index < w[1].index);
+        }
+        for m in t {
+            assert_eq!(m.index & 1, 0);
+            assert!(![128, 130, 176, 188, 192, 196].contains(&m.index));
+            assert_eq!(m.frame == FecFrame::Short, m.index >= 216);
+        }
+        let m = modcod(148, FecFrame::Short).unwrap();
+        assert_eq!(m.to_string(), "16APSK 1/2-L");
+        assert_eq!(m.rate, CodeRate::new(90, 180));
+        assert_eq!(m.frame, FecFrame::Normal);
+        // The pilots-on code names the same MODCOD.
+        assert_eq!(modcod(149, FecFrame::Normal), Some(m));
+        assert_eq!(
+            modcod(216, FecFrame::Normal).unwrap().to_string(),
+            "QPSK 11/45"
+        );
+        assert!(modcod(129, FecFrame::Normal).is_none()); // VL-SNR
+        assert_eq!(modcod(4, FecFrame::Short).unwrap().frame, FecFrame::Short);
     }
 
     #[test]

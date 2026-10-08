@@ -1,34 +1,53 @@
-//! The physical-layer signalling code: 7 bits that describe the frame.
+//! The physical-layer signalling code: 8 bits that describe the frame.
 //!
-//! ETSI EN 302 307-1 §5.5.2. The PLS code is the whole basis of ACM: every
-//! PLFRAME announces its own MODCOD, FECFRAME length and whether it carries
-//! pilots, so a receiver can follow a transmitter that changes coding from one
-//! frame to the next without being told anything in advance.
+//! ETSI EN 302 307-1 §5.5.2, extended by EN 302 307-2 §5.5.2. The PLS code
+//! is the whole basis of ACM: every PLFRAME announces its own MODCOD,
+//! FECFRAME length and whether it carries pilots, so a receiver can follow a
+//! transmitter that changes coding from one frame to the next without being
+//! told anything in advance.
 //!
-//! Layout of the 7-bit dataword: `MODCOD (5 bits) | short FECFRAME | pilots`.
+//! Layout of the dataword `b0 … b7`:
+//! - `b0 = 0`, DVB-S2: `0 | MODCOD (5 bits) | short FECFRAME | pilots`, the
+//!   S2 code unchanged.
+//! - `b0 = 1`, DVB-S2X: `1 | MODCOD and FECFRAME (6 bits) | pilots`, the
+//!   MODCODs of EN 302 307-2 Table 17a, the VL-SNR frames (codes 129 and
+//!   131) and codes reserved with a known length (Table 17b). The 64 PLS-code
+//!   symbols of an S2X header are also turned by +90° against the SOF.
 //!
 //! Frame-geometry derivation cross-checked against `gr-dvbs2rx`'s
-//! `lib/pl_signaling.cc` (GPL-3).
+//! `lib/pl_signaling.cc` (GPL-3), and for S2X against `gr-dtv`'s
+//! `dvbs2_physical_cc_impl.cc` (GPL-3).
 
-use decdvb_core::Iq;
+use decdvb_core::{FecFrame, Iq, Modcod, modcod};
 
 use crate::defs::{PILOT_BLK_LEN, PLSC_LEN, PLSC_SCRAMBLER, SLOT_LEN, SLOTS_PER_PILOT_BLK};
-use crate::pi2bpsk::{demap_bpsk, demap_bpsk_diff, derotate_bpsk, map_bpsk};
+use crate::pi2bpsk::{demap_bpsk_diff, derotate_bpsk_iq, map_bpsk};
 use crate::rm::ReedMuller;
 
 /// Everything the PLS code tells us about a PLFRAME.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlsInfo {
-    /// The raw 7-bit PLS code.
+    /// The raw 8-bit PLS code; its MSB (`b0`) is set for S2X.
     pub plsc: u8,
-    /// MODCOD index, 0..=31. 0 means a dummy frame.
+    /// The MODCOD number ([`decdvb_core::modcod`]): S2's 5-bit field
+    /// (0 = a dummy frame), or the S2X PLS code with its pilot bit clear.
     pub modcod: u8,
-    /// Short FECFRAME (16 200 bits) rather than normal (64 800).
+    /// The FECFRAME length the code announces.
+    pub frame: FecFrame,
+    /// Short FECFRAME (16 200 bits).
     pub short_fecframe: bool,
     /// The PLFRAME carries pilot blocks.
     pub has_pilots: bool,
     /// A dummy frame: no payload, sent to fill time when there is no data.
     pub dummy_frame: bool,
+    /// An S2X VL-SNR frame (codes 129, 131): set 1 or 2. Its MODCOD is in
+    /// the VL-SNR header after the PLHEADER; its length is that of normal
+    /// QPSK (set 1) or 16APSK (set 2) with pilots, and so is the layout of
+    /// its regular pilots.
+    pub vlsnr: Option<u8>,
+    /// An S2X code reserved for future use (Table 17b): its length is known,
+    /// so lock holds through it, but not what it carries.
+    pub reserved: bool,
     /// Bits per constellation symbol (0 for a dummy frame).
     pub n_mod: u8,
     /// Payload slots of 90 symbols.
@@ -44,11 +63,11 @@ pub struct PlsInfo {
 }
 
 impl PlsInfo {
-    /// Derive the frame geometry from a 7-bit PLS code.
-    ///
-    /// Only the low 7 bits are used.
+    /// Derive the frame geometry from an 8-bit PLS code.
     pub fn parse(plsc: u8) -> Self {
-        let plsc = plsc & 0x7F;
+        if plsc & 0x80 != 0 {
+            return Self::parse_s2x(plsc);
+        }
         let modcod = plsc >> 2;
         let short_fecframe = plsc & 0x2 != 0;
         let dummy_frame = modcod == 0;
@@ -69,7 +88,69 @@ impl PlsInfo {
         if short_fecframe && !dummy_frame {
             n_slots >>= 2;
         }
+        let frame = if short_fecframe {
+            FecFrame::Short
+        } else {
+            FecFrame::Normal
+        };
+        Self::geometry(plsc, modcod, frame, has_pilots, dummy_frame, n_mod, n_slots)
+            .with(None, false)
+    }
 
+    /// An S2X code (EN 302 307-2 §5.5.2.2): a Table 17a MODCOD, a VL-SNR
+    /// frame, or a reserved code of known length (Table 17b).
+    fn parse_s2x(plsc: u8) -> Self {
+        let pilots = plsc & 1 != 0;
+        // (bits per symbol, pilots, VL-SNR set, reserved).
+        let (n_mod, frame, has_pilots, vlsnr, reserved) = match plsc {
+            // VL-SNR: pilots always on; the geometry of normal QPSK and
+            // 16APSK with pilots (§5.5.2.0, Figures 17 and 18).
+            129 => (2, FecFrame::Normal, true, Some(1), false),
+            131 => (4, FecFrame::Normal, true, Some(2), false),
+            // Table 17b, n-ary normal frames, pilots off then on.
+            128 => (3, FecFrame::Normal, false, None, true),
+            130 => (4, FecFrame::Normal, false, None, true),
+            176 => (5, FecFrame::Normal, false, None, true),
+            177 => (5, FecFrame::Normal, true, None, true),
+            188 | 192 | 196 => (6, FecFrame::Normal, false, None, true),
+            189 | 193 | 197 => (6, FecFrame::Normal, true, None, true),
+            250 => (3, FecFrame::Normal, true, None, true),
+            251 => (4, FecFrame::Normal, true, None, true),
+            252 => (5, FecFrame::Normal, true, None, true),
+            253 => (6, FecFrame::Normal, true, None, true),
+            254 => (8, FecFrame::Normal, true, None, true),
+            255 => (10, FecFrame::Normal, true, None, true),
+            _ => match modcod(plsc, FecFrame::Normal) {
+                Some(m) => (m.modulation.bits_per_symbol(), m.frame, pilots, None, false),
+                // Every S2X code is one of the above; this is unreachable
+                // short of a table error, and the frame is skipped.
+                None => (2, FecFrame::Normal, pilots, None, true),
+            },
+        };
+        // S = ceil(N / (90 · n_mod)): 128APSK pads its 64 800 bits to 103
+        // slots (§5.3.2.2, Table 16).
+        let per_slot = SLOT_LEN * n_mod as usize;
+        let n_slots = frame.n_ldpc().div_ceil(per_slot) as u16;
+        Self::geometry(plsc, plsc & 0xFE, frame, has_pilots, false, n_mod, n_slots)
+            .with(vlsnr, reserved)
+    }
+
+    fn with(mut self, vlsnr: Option<u8>, reserved: bool) -> Self {
+        self.vlsnr = vlsnr;
+        self.reserved = reserved;
+        self
+    }
+
+    /// The lengths that follow from the slot count and the pilots.
+    fn geometry(
+        plsc: u8,
+        modcod: u8,
+        frame: FecFrame,
+        has_pilots: bool,
+        dummy_frame: bool,
+        n_mod: u8,
+        n_slots: u16,
+    ) -> Self {
         // One pilot block after every 16 slots, but not a trailing one.
         let n_pilots = if has_pilots {
             ((n_slots as usize - 1) / SLOTS_PER_PILOT_BLK) as u8
@@ -85,9 +166,12 @@ impl PlsInfo {
         PlsInfo {
             plsc,
             modcod,
-            short_fecframe,
+            frame,
+            short_fecframe: frame == FecFrame::Short,
             has_pilots,
             dummy_frame,
+            vlsnr: None,
+            reserved: false,
             n_mod,
             n_slots,
             n_pilots,
@@ -97,9 +181,37 @@ impl PlsInfo {
         }
     }
 
-    /// Build from the fields instead of a raw code.
+    /// An S2 frame from its fields.
     pub fn from_fields(modcod: u8, short_fecframe: bool, has_pilots: bool) -> Self {
         Self::parse(((modcod & 0x1F) << 2) | ((short_fecframe as u8) << 1) | has_pilots as u8)
+    }
+
+    /// An S2X frame from its PLS code (the pilot bit is set from `pilots`).
+    pub fn s2x(pls: u8, has_pilots: bool) -> Self {
+        Self::parse(0x80 | (pls & 0xFE) | has_pilots as u8)
+    }
+
+    /// Any frame from a MODCOD number ([`decdvb_core::modcod`]).
+    pub fn for_modcod(modcod: u8, short_fecframe: bool, has_pilots: bool) -> Self {
+        if modcod >= 128 {
+            Self::s2x(modcod, has_pilots)
+        } else {
+            Self::from_fields(modcod, short_fecframe, has_pilots)
+        }
+    }
+
+    /// An S2X code.
+    pub fn is_s2x(&self) -> bool {
+        self.plsc & 0x80 != 0
+    }
+
+    /// The frame's MODCOD, when it is a data frame of a known MODCOD (not a
+    /// dummy, VL-SNR or reserved frame).
+    pub fn modcod(&self) -> Option<Modcod> {
+        if self.dummy_frame || self.vlsnr.is_some() || self.reserved {
+            return None;
+        }
+        modcod(self.modcod, self.frame)
     }
 }
 
@@ -121,12 +233,18 @@ impl PlscEncoder {
         }
     }
 
-    /// Write the 64 PLS symbols for a raw 7-bit code.
+    /// Write the 64 PLS symbols for an 8-bit code: pi/2-BPSK continuing the
+    /// SOF's, turned by +90° for an S2X code (EN 302 307-2 §5.5.2.0).
     ///
     /// # Panics
     /// If `out` is shorter than 64.
     pub fn encode(&self, plsc: u8, out: &mut [Iq]) {
-        map_bpsk(self.rm.encode(plsc & 0x7F), out, PLSC_LEN);
+        map_bpsk(self.rm.encode(plsc), out, PLSC_LEN);
+        if plsc & 0x80 != 0 {
+            for s in &mut out[..PLSC_LEN] {
+                *s = Iq::new(-s.im, s.re);
+            }
+        }
     }
 
     /// Write the 64 PLS symbols for the given fields.
@@ -156,9 +274,17 @@ pub enum PlscDemap {
 }
 
 /// Decodes 64 noisy pi/2-BPSK symbols back into a PLS code.
+///
+/// An S2 header's PLS code continues the SOF's pi/2-BPSK; an S2X one is
+/// turned by +90°. The coherent modes read the symbols both ways — the plain
+/// way against the 128 S2 codewords, turned back against the 128 S2X ones —
+/// and keep the better match, so the turn itself counts towards telling the
+/// two apart. The differential mode only sees the turn at the first symbol,
+/// and reads that one bit both ways.
 pub struct PlscDecoder {
     rm: ReedMuller,
     soft: Vec<f32>,
+    rot: Vec<Iq>,
 }
 
 impl Default for PlscDecoder {
@@ -172,6 +298,7 @@ impl PlscDecoder {
         PlscDecoder {
             rm: ReedMuller::new(PLSC_SCRAMBLER),
             soft: vec![0.0; PLSC_LEN],
+            rot: vec![Iq::new(0.0, 0.0); PLSC_LEN],
         }
     }
 
@@ -183,6 +310,7 @@ impl PlscDecoder {
         PlscDecoder {
             rm: ReedMuller::with_enabled(PLSC_SCRAMBLER, expected),
             soft: vec![0.0; PLSC_LEN],
+            rot: vec![Iq::new(0.0, 0.0); PLSC_LEN],
         }
     }
 
@@ -200,15 +328,60 @@ impl PlscDecoder {
             symbols.len() > PLSC_LEN,
             "need the last SOF symbol plus 64 PLS symbols"
         );
+        let s2 = |d: u8| d < 128;
+        let s2x = |d: u8| d >= 128;
         let plsc = match how {
-            PlscDemap::CoherentSoft => {
-                derotate_bpsk(&symbols[1..], &mut self.soft, PLSC_LEN);
-                self.rm.decode_soft(&self.soft)
+            PlscDemap::CoherentSoft | PlscDemap::CoherentHard => {
+                derotate_bpsk_iq(&symbols[1..], &mut self.rot, PLSC_LEN);
+                let hard = |f: fn(&Iq) -> f32, rot: &[Iq]| {
+                    rot.iter()
+                        .enumerate()
+                        .fold(0u64, |c, (j, y)| c | ((f(y) < 0.0) as u64) << (63 - j))
+                };
+                let (a, b) = if how == PlscDemap::CoherentSoft {
+                    // Plain: the real parts; turned: the imaginary parts.
+                    for (s, y) in self.soft.iter_mut().zip(&self.rot) {
+                        *s = y.re;
+                    }
+                    let a = self.rm.best_soft(&self.soft, s2);
+                    for (s, y) in self.soft.iter_mut().zip(&self.rot) {
+                        *s = y.im;
+                    }
+                    let b = self.rm.best_soft(&self.soft, s2x);
+                    (a.map(|(d, m)| (d, -m)), b.map(|(d, m)| (d, -m)))
+                } else {
+                    let a = self.rm.best_hard(hard(|y| y.re, &self.rot), s2);
+                    let b = self.rm.best_hard(hard(|y| y.im, &self.rot), s2x);
+                    (a.map(|(d, m)| (d, m as f32)), b.map(|(d, m)| (d, m as f32)))
+                };
+                pick(a, b)
             }
-            PlscDemap::CoherentHard => self.rm.decode_hard(demap_bpsk(&symbols[1..], PLSC_LEN)),
-            PlscDemap::Differential => self.rm.decode_hard(demap_bpsk_diff(symbols, PLSC_LEN)),
+            PlscDemap::Differential => {
+                let code = demap_bpsk_diff(symbols, PLSC_LEN);
+                // The first bit is read across the SOF/PLS boundary, where
+                // S2X turns by 90°: read it the other way for S2X. Every
+                // later bit is relative to it, so a different first bit
+                // flips them all.
+                let d = symbols[1].conj() * symbols[0];
+                let first_s2 = d.im < 0.0;
+                let first_s2x = d.re < 0.0;
+                let code_x = if first_s2 == first_s2x { code } else { !code };
+                let a = self.rm.best_hard(code, s2);
+                let b = self.rm.best_hard(code_x, s2x);
+                pick(a.map(|(d, m)| (d, m as f32)), b.map(|(d, m)| (d, m as f32)))
+            }
         };
         PlsInfo::parse(plsc)
+    }
+}
+
+/// The better of the S2 and S2X candidates (lower cost; S2 on a tie).
+fn pick(a: Option<(u8, f32)>, b: Option<(u8, f32)>) -> u8 {
+    match (a, b) {
+        (Some(a), Some(b)) if b.1 < a.1 => b.0,
+        (Some(a), _) => a.0,
+        (None, Some(b)) => b.0,
+        (None, None) => 0,
     }
 }
 
@@ -270,14 +443,10 @@ mod tests {
     #[test]
     fn longest_frame_is_normal_qpsk_with_pilots() {
         // Nothing may exceed the buffer size the acquisition code allocates.
-        let mut worst = 0u32;
-        for modcod in 0..32u8 {
-            for short in [false, true] {
-                for pilots in [false, true] {
-                    worst = worst.max(PlsInfo::from_fields(modcod, short, pilots).plframe_len);
-                }
-            }
-        }
+        let worst = (0..=255u8)
+            .map(|c| PlsInfo::parse(c).plframe_len)
+            .max()
+            .unwrap();
         assert_eq!(worst as usize, MAX_PLFRAME_LEN);
     }
 
@@ -304,6 +473,109 @@ mod tests {
         assert_eq!(bits(23), 4); // 16APSK 9/10
         assert_eq!(bits(24), 5); // 32APSK 3/4
         assert_eq!(bits(28), 5); // 32APSK 9/10
+    }
+
+    /// A PLHEADER for any 8-bit code.
+    fn plheader_code(plsc: u8) -> Vec<Iq> {
+        let mut out = vec![Iq::new(0.0, 0.0); PLHEADER_LEN];
+        map_bpsk(SOF_BIG_ENDIAN, &mut out[..SOF_LEN], SOF_LEN);
+        PlscEncoder::new().encode(plsc, &mut out[SOF_LEN..]);
+        out
+    }
+
+    #[test]
+    fn every_8_bit_code_round_trips_in_all_three_modes() {
+        let mut dec = PlscDecoder::new();
+        for plsc in 0..=255u8 {
+            let header = plheader_code(plsc);
+            for how in [
+                PlscDemap::CoherentSoft,
+                PlscDemap::CoherentHard,
+                PlscDemap::Differential,
+            ] {
+                let got = dec.decode(&header[SOF_LEN - 1..], how);
+                assert_eq!(got.plsc, plsc, "{how:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn s2x_pls_symbols_are_turned_90_degrees() {
+        // Same 7 low bits, b0 set: the symbols are the S2 ones times j,
+        // except for the extra generator row's bits.
+        let a = plheader_code(0x84);
+        let b = plheader_code(0x04);
+        assert_eq!(a[..SOF_LEN], b[..SOF_LEN]);
+        let turned = PlscEncoder::new();
+        let mut c = vec![Iq::new(0.0, 0.0); PLSC_LEN];
+        turned.encode(0x84, &mut c);
+        let rm = ReedMuller::new(PLSC_SCRAMBLER);
+        let mut plain = vec![Iq::new(0.0, 0.0); PLSC_LEN];
+        map_bpsk(rm.encode(0x84), &mut plain, PLSC_LEN);
+        for (x, y) in c.iter().zip(&plain) {
+            assert!((x - y * Iq::new(0.0, 1.0)).norm() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn s2x_geometry() {
+        // QPSK 13/45 normal: like S2 QPSK.
+        let p = PlsInfo::s2x(132, true);
+        assert_eq!((p.n_mod, p.n_slots, p.n_pilots), (2, 360, 22));
+        assert_eq!(p.plframe_len as usize, MAX_PLFRAME_LEN);
+        assert_eq!(p.modcod().unwrap().to_string(), "QPSK 13/45");
+        // 128APSK: 103 slots (Table 16), the last 12 symbols padding.
+        let p = PlsInfo::s2x(200, false);
+        assert_eq!((p.n_mod, p.n_slots), (7, 103));
+        // 256APSK: 90 slots.
+        assert_eq!(PlsInfo::s2x(214, false).n_slots, 90);
+        // Short 32APSK 2/3 (4+12+16rb): 36 slots.
+        let p = PlsInfo::s2x(246, true);
+        assert_eq!((p.frame, p.n_slots, p.n_pilots), (FecFrame::Short, 36, 2));
+        // VL-SNR: the lengths of Figures 17 and 18, no MODCOD from the PLS.
+        let p = PlsInfo::parse(129);
+        assert_eq!((p.vlsnr, p.plframe_len), (Some(1), 33_282));
+        assert!(p.modcod().is_none());
+        assert_eq!(PlsInfo::parse(131).plframe_len, 16_686);
+        // Table 17b: every reserved code's length.
+        for (code, len) in [
+            (128u8, 21_690u32),
+            (130, 16_290),
+            (176, 13_050),
+            (177, 13_338),
+            (188, 10_890),
+            (189, 11_142),
+            (192, 10_890),
+            (193, 11_142),
+            (196, 10_890),
+            (197, 11_142),
+            (250, 22_194),
+            (251, 16_686),
+            (252, 13_338),
+            (253, 11_142),
+            (254, 8_370),
+            (255, 6_714),
+        ] {
+            let p = PlsInfo::parse(code);
+            assert!(p.reserved && p.modcod().is_none(), "{code}");
+            assert_eq!(p.plframe_len, len, "code {code}");
+        }
+        // Every other S2X code is a Table 17a MODCOD whose bits fill the
+        // slots it is given.
+        for code in 128..=255u8 {
+            let p = PlsInfo::parse(code);
+            if let Some(m) = p.modcod() {
+                let bits = p.n_slots as usize * SLOT_LEN * p.n_mod as usize;
+                assert!(
+                    bits >= m.frame.n_ldpc() && bits - m.frame.n_ldpc() < SLOT_LEN * 8,
+                    "{m}: {bits} bits for {}",
+                    m.frame.n_ldpc()
+                );
+                assert_eq!(p.has_pilots, code & 1 == 1);
+            } else {
+                assert!(p.reserved || p.vlsnr.is_some(), "code {code}");
+            }
+        }
     }
 
     #[test]

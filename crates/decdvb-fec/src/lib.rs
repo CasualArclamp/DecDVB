@@ -6,8 +6,9 @@
 //! - [`constellation`]: the S2 constellations and their bit labels.
 //! - [`demap`]: bit interleaving, mapping, and max-log soft demapping.
 //!
-//! S2X codes and constellations arrive in M3 — see `docs/DESIGN.md`.
+//! - [`apsk_tables`]: the S2X constellation and interleaver tables.
 
+pub mod apsk_tables;
 pub mod bch;
 pub mod constellation;
 pub mod demap;

@@ -1162,11 +1162,7 @@ fn identification_card(
             Color32::from_rgb(200, 200, 120),
         ),
         Verdict::DvbS2(d) => {
-            let kind = if d.uses_reserved_modcods() {
-                "DVB-S2X"
-            } else {
-                "DVB-S2"
-            };
+            let kind = if d.is_s2x() { "DVB-S2X" } else { "DVB-S2" };
             let mode = if d.variable_coding() {
                 "ACM / VCM"
             } else {
@@ -1207,7 +1203,7 @@ fn identification_card(
                     let mut mods: Vec<&str> = d
                         .modcods
                         .keys()
-                        .filter_map(|&m| decdvb_core::s2_modcod(m, decdvb_core::FecFrame::Normal))
+                        .filter_map(|&m| decdvb_core::modcod(m, decdvb_core::FecFrame::Normal))
                         .map(|mc| mc.modulation.name())
                         .collect();
                     mods.dedup();
@@ -1308,7 +1304,7 @@ fn modcod_table(ui: &mut Ui, counts: &BTreeMap<u8, u64>) {
                 let name = if m == 0 {
                     "dummy".to_string()
                 } else {
-                    decdvb_core::s2_modcod(m, decdvb_core::FecFrame::Normal)
+                    decdvb_core::modcod(m, decdvb_core::FecFrame::Normal)
                         .map(|mc| format!("{m:2} {mc}"))
                         .unwrap_or_else(|| format!("{m:2} (S2X/reserved)"))
                 };

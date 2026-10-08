@@ -119,8 +119,9 @@ impl Dvbs2Info {
         self.modcods.keys().filter(|&&m| m != 0).count() > 1
     }
 
-    /// Reserved S2 MODCOD indexes (29–31) appear in S2X signalling.
-    pub fn uses_reserved_modcods(&self) -> bool {
+    /// S2X PLS codes were seen (or S2's reserved MODCODs 29–31, which no
+    /// S2 transmitter sends).
+    pub fn is_s2x(&self) -> bool {
         self.modcods.keys().any(|&m| m >= 29)
     }
 }
@@ -207,16 +208,12 @@ impl Identification {
                     .iter()
                     .filter(|(m, _)| **m != 0)
                     .map(|(m, n)| {
-                        decdvb_core::s2_modcod(*m, decdvb_core::FecFrame::Normal)
+                        decdvb_core::modcod(*m, decdvb_core::FecFrame::Normal)
                             .map(|mc| format!("{mc}×{n}"))
                             .unwrap_or_else(|| format!("MODCOD {m}×{n}"))
                     })
                     .collect();
-                let kind = if d.uses_reserved_modcods() {
-                    "DVB-S2X"
-                } else {
-                    "DVB-S2"
-                };
+                let kind = if d.is_s2x() { "DVB-S2X" } else { "DVB-S2" };
                 let mode = if d.variable_coding() {
                     "ACM/VCM"
                 } else {
@@ -777,8 +774,7 @@ pub fn lock_carrier(
                 let sof_start = hdr_end + 1 - decdvb_frame::PLHEADER_LEN;
                 sof_sum += decdvb_frame::sof_differential(&sym[sof_start..sof_start + SOF_LEN]);
 
-                let cst = decdvb_core::s2_modcod(pls.modcod, decdvb_core::FecFrame::Normal)
-                    .and_then(|mc| Constellation::for_modcod(mc.modulation, mc.rate));
+                let cst = pls.modcod().and_then(|mc| Constellation::for_modcod(&mc));
                 let Some(cst) = cst else { continue };
                 let k = *index.entry(pls.modcod).or_insert_with(|| {
                     sets.push(cst);

@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime};
 
-use decdvb_core::{FecFrame, Iq, s2_modcod};
-use decdvb_fec::demap::{demap_llr, quantize};
-use decdvb_fec::{Bch, BchError, Constellation, DecodeOutcome, FecParams, LdpcCode, LdpcDecoder};
+use decdvb_core::Iq;
+use decdvb_fec::demap::{Mapper, quantize};
+use decdvb_fec::{Bch, BchError, DecodeOutcome, FecParams, LdpcCode, LdpcDecoder};
 use decdvb_frame::{BBHEADER_LEN, BbHeader, BbHeaderError, PlsInfo, StreamFormat, bb_scramble};
 use decdvb_gse::{GseIp, IpPacket, Source, Variant, VariantReport};
 use decdvb_ip::mcast::udp_payload;
@@ -72,7 +72,7 @@ impl BbFrame {
 
 struct Code {
     params: FecParams,
-    cst: Constellation,
+    mapper: Mapper,
     ldpc: LdpcDecoder,
     bch: Bch,
 }
@@ -92,8 +92,8 @@ impl FecDecoder {
         Self::default()
     }
 
-    /// Decode one frame; `None` for a dummy frame or a MODCOD with no S2 code
-    /// (short 9/10, or the S2X ones until M3).
+    /// Decode one frame; `None` for a dummy frame, a frame with no code to
+    /// decode (S2 short 9/10, S2X VL-SNR and reserved codes).
     pub fn decode(&mut self, f: &PlFrame) -> Option<BbFrame> {
         if f.pls.dummy_frame {
             return None;
@@ -122,14 +122,14 @@ impl FecDecoder {
                 .map(|(_, &y)| y * inv),
         );
         let n = p.n_ldpc;
-        if data.len() * code.cst.bits() as usize != n {
+        if data.len() != code.mapper.symbols() {
             return None;
         }
         llr.resize(n, 0.0);
         quantized.resize(n, 0);
         info.resize(p.n_bch / 8, 0);
 
-        demap_llr(data, &code.cst, p.rate, f.noise_var * inv * inv, llr);
+        code.mapper.demap_llr(data, f.noise_var * inv * inv, llr);
         quantize(llr, LLR_SCALE, quantized);
         let ldpc = code.ldpc.decode(quantized, info, MAX_ITERATIONS);
 
@@ -150,18 +150,13 @@ impl FecDecoder {
 }
 
 fn build_code(pls: PlsInfo) -> Option<Code> {
-    let size = if pls.short_fecframe {
-        FecFrame::Short
-    } else {
-        FecFrame::Normal
-    };
-    let mc = s2_modcod(pls.modcod, size)?;
-    let params = FecParams::new(size, mc.rate)?;
+    let mc = pls.modcod()?;
+    let params = FecParams::new(mc.frame, mc.rate)?;
     Some(Code {
         params,
-        cst: Constellation::for_modcod(mc.modulation, mc.rate)?,
+        mapper: Mapper::for_modcod(&mc)?,
         ldpc: LdpcDecoder::new(LdpcCode::new(params.ldpc_table())),
-        bch: Bch::new(size, params.t, params.n_bch),
+        bch: Bch::new(mc.frame, params.t, params.n_bch),
     })
 }
 
@@ -1007,18 +1002,13 @@ mod tests {
             .iter()
             .cycle()
             .take(frames)
-            .filter(|s| s.modcod != 0)
-            .map(|s| {
-                let size = if s.short_fecframe {
-                    FecFrame::Short
-                } else {
-                    FecFrame::Normal
-                };
-                let mc = s2_modcod(s.modcod, size).unwrap();
-                let p = FecParams::new(size, mc.rate).unwrap();
+            // Frames with nothing to encode (dummy, reserved) take no BBFRAME.
+            .filter_map(|s| {
+                let mc = s.info().modcod()?;
+                let p = FecParams::new(mc.frame, mc.rate)?;
                 let mut f = ts.next_frame(p.bbframe_bytes());
                 bb_scramble(&mut f);
-                f
+                Some(f)
             })
             .collect()
     }
@@ -1069,6 +1059,43 @@ mod tests {
             assert_eq!(h.format, StreamFormat::Transport);
             assert!(!h.ccm, "an ACM schedule must say so");
         }
+    }
+
+    #[test]
+    fn decodes_an_s2x_acm_carrier() {
+        // One frame of each S2X constellation family, in ACM with S2 QPSK
+        // 1/2 and a reserved code (kept lock through, nothing decoded), at
+        // 30 dB for 256APSK's sake.
+        let schedule = [
+            FrameSpec::s2x(132, true), // QPSK 13/45
+            FrameSpec::s2x(144, true), // 8PSK 25/36, interleaver "102"
+            FrameSpec::s2x(138, true), // 2+4+2APSK 5/9-L
+            FrameSpec::s2x(154, true), // 4+12APSK 26/45, "3201"
+            FrameSpec::s2x(158, true), // 8+8APSK 3/5-L, points by table
+            FrameSpec::s2x(178, true), // 4+8+4+16APSK 32/45
+            FrameSpec::s2x(250, true), // reserved, 8-ary
+            FrameSpec::s2x(186, true), // 4+12+20+28APSK 11/15
+            FrameSpec::s2x(200, true), // 128APSK 3/4: 103 slots
+            FrameSpec::s2x(214, true), // 256APSK 3/4
+            FrameSpec::s2x(240, true), // short 4+12APSK 26/45, "2130"
+            FrameSpec::new(4, false, true),
+        ];
+        let x = signal(&schedule, 600_000, 0.001, 30.0, 24);
+        let got = decode_all(&x);
+        let want = expected(&schedule, 80, 24);
+        assert!(got.len() >= 12, "only {} frames", got.len());
+        let first = want
+            .iter()
+            .position(|w| *w == got[0].bytes)
+            .expect("first frame not in the sent sequence");
+        let mut seen = std::collections::BTreeSet::new();
+        for (k, b) in got.iter().enumerate() {
+            let name = b.pls.modcod().map(|m| m.to_string()).unwrap_or_default();
+            assert!(b.ok(), "frame {k} ({name}): {:?} {:?}", b.ldpc, b.bch);
+            assert_eq!(b.bytes, want[first + k], "frame {k} ({name})");
+            seen.insert(b.pls.modcod);
+        }
+        assert!(seen.len() >= 10, "MODCODs decoded: {seen:?}");
     }
 
     #[test]

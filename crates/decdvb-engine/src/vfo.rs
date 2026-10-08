@@ -986,7 +986,7 @@ fn live_modulation(id: &Identification) -> decdvb_core::Modulation {
             .modcods
             .iter()
             .max_by_key(|(_, n)| **n)
-            .and_then(|(&m, _)| decdvb_core::s2_modcod(m, decdvb_core::FecFrame::Normal))
+            .and_then(|(&m, _)| decdvb_core::modcod(m, decdvb_core::FecFrame::Normal))
             .map_or(decdvb_core::Modulation::Qpsk, |mc| mc.modulation),
         _ => id
             .constellation

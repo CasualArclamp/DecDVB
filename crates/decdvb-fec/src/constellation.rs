@@ -7,12 +7,16 @@
 //! The APSK ring ratios γ depend on the code rate (Tables 9 and 10); the point
 //! orders were cross-checked against `leansdr`'s `sdr.h` and `dvb.h` (GPL-3).
 //!
-//! S2X adds 8/16/32APSK variants and 64/128/256APSK; those land with the S2X
-//! MODCODs in M3.
+//! DVB-S2X (EN 302 307-2 §5.4) adds 2+4+2 8APSK, 8+8 16APSK, two more
+//! 32APSKs, three 64APSKs, 128APSK and 256APSK, with their own labels (from
+//! the standard's tables, [`crate::apsk_tables`]) and ring ratios per code
+//! rate; and new ratios for 4+12 16APSK, whose labels are S2's.
 
 use std::f32::consts::PI;
 
-use decdvb_core::{CodeRate, Iq, Modulation};
+use decdvb_core::{CodeRate, FecFrame, Iq, Modcod, Modulation};
+
+use crate::apsk_tables::{self as t, Row};
 
 /// A constellation: its points indexed by bits, and how many bits each carries.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,7 +60,191 @@ fn apsk32_gammas(rate: CodeRate) -> Option<(f32, f32)> {
     })
 }
 
+/// 4+12APSK ring ratio for an S2X code rate (EN 302 307-2 Tables 11a, 11b).
+fn apsk16_gamma_s2x(rate: CodeRate, frame: FecFrame) -> Option<f32> {
+    Some(match (rate.num, rate.den, frame) {
+        (26, 45, _) | (3, 5, _) => 3.7,
+        (28, 45, FecFrame::Normal) => 3.5,
+        (23, 36, FecFrame::Normal) | (25, 36, FecFrame::Normal) => 3.1,
+        (13, 18, FecFrame::Normal) => 2.85,
+        (140, 180, FecFrame::Normal) => 3.6,
+        (154, 180, FecFrame::Normal) => 3.2,
+        (7, 15, FecFrame::Short) => 3.32,
+        (8, 15, FecFrame::Short) => 3.5,
+        (32, 45, FecFrame::Short) => 2.85,
+        _ => return None,
+    })
+}
+
+/// A point at radius `r`, angle `π·num/den`.
+fn polar_pi(r: f32, (num, den): (i32, i32)) -> Iq {
+    let a = PI * num as f32 / den as f32;
+    Iq::new(r * a.cos(), r * a.sin())
+}
+
 impl Constellation {
+    /// Scale to unit average power; the rings are the distinct radii.
+    fn normalised(modulation: Modulation, mut points: Vec<Iq>) -> Self {
+        let p = points.iter().map(|x| x.norm_sqr()).sum::<f32>() / points.len() as f32;
+        let k = 1.0 / p.sqrt();
+        for x in &mut points {
+            *x *= k;
+        }
+        let mut rings: Vec<f32> = Vec::new();
+        for x in &points {
+            let r = x.norm();
+            if rings.iter().all(|&q| (q - r).abs() > 1e-3) {
+                rings.push(r);
+            }
+        }
+        rings.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        Constellation {
+            modulation,
+            points,
+            rings,
+        }
+    }
+
+    /// From a label table (EN 302 307-2 §5.4): `radii[k]` is ring R(k+1)
+    /// relative to R1. Each row stands for up to four points, `p` and `q` in
+    /// its label picking the column of angles.
+    fn from_rows(modulation: Modulation, rows: &[Row], radii: &[f32]) -> Self {
+        let m = rows[0].0.len();
+        let mut points = vec![Iq::new(f32::NAN, 0.0); 1 << m];
+        for &(pattern, ring, phi) in rows {
+            let has = |c| pattern.contains(c) as usize;
+            for p in 0..=has('p') {
+                for q in 0..=has('q') {
+                    let label = pattern.chars().fold(0usize, |acc, c| {
+                        (acc << 1)
+                            | match c {
+                                '1' => 1,
+                                'p' => p,
+                                'q' => q,
+                                _ => 0,
+                            }
+                    });
+                    points[label] = polar_pi(radii[ring as usize - 1], phi[2 * p + q]);
+                }
+            }
+        }
+        debug_assert!(
+            points.iter().all(|x| !x.re.is_nan()),
+            "label table has gaps"
+        );
+        Self::normalised(modulation, points)
+    }
+
+    /// From a table of points by label (Tables 11e, 15d).
+    fn from_points(modulation: Modulation, pts: &[(f32, f32)]) -> Self {
+        Self::normalised(
+            modulation,
+            pts.iter().map(|&(i, q)| Iq::new(i, q)).collect(),
+        )
+    }
+
+    /// 256APSK on rings (Tables 15b, 15c): the top three label bits pick the
+    /// ring, `q p` and the low three the angle.
+    fn apsk256(radii: &[f32]) -> Self {
+        let mut points = vec![Iq::new(0.0, 0.0); 256];
+        for (label, x) in points.iter_mut().enumerate() {
+            let ring = t::APSK256_RINGS
+                .iter()
+                .find(|(pat, _)| usize::from_str_radix(&pat[..3], 2).ok() == Some(label >> 5))
+                .map(|r| r.1)
+                .unwrap();
+            let (num, den) = t::APSK256_ANGLES
+                .iter()
+                .find(|(pat, _)| usize::from_str_radix(&pat[5..], 2).ok() == Some(label & 7))
+                .map(|a| a.1)
+                .unwrap();
+            let (q, p) = ((label >> 4) & 1, (label >> 3) & 1);
+            // φ, −φ (q), π − φ (p), π + φ (both).
+            let phi = match (p, q) {
+                (0, 0) => (num, den),
+                (0, _) => (-num, den),
+                (_, 0) => (den - num, den),
+                _ => (den + num, den),
+            };
+            *x = polar_pi(radii[ring as usize - 1], phi);
+        }
+        Self::normalised(Modulation::Apsk256, points)
+    }
+
+    /// The S2X constellation for a MODCOD (EN 302 307-2 §5.4), with its
+    /// ring ratios (Tables 10b–15a).
+    fn s2x(mc: &Modcod) -> Option<Self> {
+        use Modulation::*;
+        let r = (mc.rate.num, mc.rate.den);
+        let short = mc.frame == FecFrame::Short;
+        let rings =
+            |g: &[f32]| -> Vec<f32> { std::iter::once(1.0).chain(g.iter().copied()).collect() };
+        Some(match (mc.modulation, r) {
+            (Qpsk, _) => Self::qpsk(),
+            (Psk8, _) => Self::psk8(),
+            (Apsk8, (100, 180)) => Self::from_rows(Apsk8, &t::APSK8_242, &rings(&[5.32, 6.8])),
+            (Apsk8, (104, 180)) => Self::from_rows(Apsk8, &t::APSK8_242, &rings(&[6.39, 8.0])),
+            (Apsk16, (90, 180) | (96, 180) | (100, 180)) => {
+                Self::from_rows(Apsk16, &t::APSK16_88, &rings(&[2.19]))
+            }
+            (Apsk16, (18, 30)) => Self::from_points(Apsk16, &t::APSK16_88_18_30),
+            (Apsk16, (20, 30)) => Self::from_points(Apsk16, &t::APSK16_88_20_30),
+            (Apsk16, _) => Self::apsk16(apsk16_gamma_s2x(mc.rate, mc.frame)?),
+            (Apsk32, (2, 3)) if !short => {
+                Self::from_rows(Apsk32, &t::APSK32_4_12_16RB, &rings(&[2.85, 5.55]))
+            }
+            (Apsk32, (2, 3)) => {
+                Self::from_rows(Apsk32, &t::APSK32_4_12_16RB, &rings(&[2.84, 5.54]))
+            }
+            (Apsk32, (32, 45)) => {
+                Self::from_rows(Apsk32, &t::APSK32_4_12_16RB, &rings(&[2.84, 5.26]))
+            }
+            (Apsk32, (128, 180)) => {
+                Self::from_rows(Apsk32, &t::APSK32_4_8_4_16, &rings(&[2.6, 2.99, 5.6]))
+            }
+            (Apsk32, (132, 180)) => {
+                Self::from_rows(Apsk32, &t::APSK32_4_8_4_16, &rings(&[2.6, 2.86, 5.6]))
+            }
+            (Apsk32, (140, 180)) => {
+                Self::from_rows(Apsk32, &t::APSK32_4_8_4_16, &rings(&[2.8, 3.08, 5.6]))
+            }
+            (Apsk64, (128, 180)) => {
+                Self::from_rows(Apsk64, &t::APSK64_16X4, &rings(&[1.88, 2.72, 3.95]))
+            }
+            (Apsk64, (7, 9) | (4, 5)) => {
+                Self::from_rows(Apsk64, &t::APSK64_8_16_20_20, &rings(&[2.2, 3.6, 5.2]))
+            }
+            (Apsk64, (5, 6)) => {
+                Self::from_rows(Apsk64, &t::APSK64_8_16_20_20, &rings(&[2.2, 3.5, 5.0]))
+            }
+            (Apsk64, (132, 180)) => {
+                Self::from_rows(Apsk64, &t::APSK64_4_12_20_28, &rings(&[2.4, 4.3, 7.0]))
+            }
+            (Apsk128, (135, 180)) => Self::from_rows(
+                Apsk128,
+                &t::APSK128,
+                &rings(&[1.715, 2.118, 2.681, 2.75, 3.819]),
+            ),
+            (Apsk128, (140, 180)) => Self::from_rows(
+                Apsk128,
+                &t::APSK128,
+                &rings(&[1.715, 2.118, 2.681, 2.75, 3.733]),
+            ),
+            (Apsk256, (116, 180) | (124, 180)) => {
+                Self::apsk256(&rings(&[1.791, 2.405, 2.980, 3.569, 4.235, 5.078, 6.536]))
+            }
+            (Apsk256, (128, 180)) => {
+                Self::apsk256(&rings(&[1.794, 2.409, 2.986, 3.579, 4.045, 4.6, 5.4]))
+            }
+            (Apsk256, (135, 180)) => {
+                Self::apsk256(&rings(&[1.794, 2.409, 2.986, 3.579, 4.045, 4.5, 5.2]))
+            }
+            (Apsk256, (20, 30)) => Self::from_points(Apsk256, &t::APSK256_20_30),
+            (Apsk256, (22, 30)) => Self::from_points(Apsk256, &t::APSK256_22_30),
+            _ => return None,
+        })
+    }
+
     /// BPSK: 0 → +1, 1 → −1. Not a DVB-S2 constellation; for generic carriers.
     pub fn bpsk() -> Self {
         Constellation {
@@ -173,9 +361,18 @@ impl Constellation {
         }
     }
 
-    /// The constellation for a DVB-S2 MODCOD, or `None` for combinations the
-    /// standard does not define (and, for now, for the S2X-only ones).
-    pub fn for_modcod(modulation: Modulation, rate: CodeRate) -> Option<Self> {
+    /// The constellation for an S2 or S2X MODCOD, or `None` for
+    /// combinations the standards do not define.
+    pub fn for_modcod(mc: &Modcod) -> Option<Self> {
+        if mc.is_s2x() {
+            Self::s2x(mc)
+        } else {
+            Self::for_s2(mc.modulation, mc.rate)
+        }
+    }
+
+    /// The constellation for a DVB-S2 modulation and code rate.
+    pub fn for_s2(modulation: Modulation, rate: CodeRate) -> Option<Self> {
         match modulation {
             Modulation::Bpsk => Some(Self::bpsk()),
             Modulation::Qpsk => Some(Self::qpsk()),
@@ -231,10 +428,10 @@ mod tests {
     fn all_s2() -> Vec<Constellation> {
         let mut v = vec![Constellation::qpsk(), Constellation::psk8()];
         for (n, d) in [(2, 3), (3, 4), (4, 5), (5, 6), (8, 9), (9, 10)] {
-            v.push(Constellation::for_modcod(Modulation::Apsk16, CodeRate::new(n, d)).unwrap());
+            v.push(Constellation::for_s2(Modulation::Apsk16, CodeRate::new(n, d)).unwrap());
         }
         for (n, d) in [(3, 4), (4, 5), (5, 6), (8, 9), (9, 10)] {
-            v.push(Constellation::for_modcod(Modulation::Apsk32, CodeRate::new(n, d)).unwrap());
+            v.push(Constellation::for_s2(Modulation::Apsk32, CodeRate::new(n, d)).unwrap());
         }
         v
     }
@@ -325,7 +522,117 @@ mod tests {
     #[test]
     fn undefined_combinations_are_none() {
         // 16APSK has no rate-1/2 point in S2.
-        assert!(Constellation::for_modcod(Modulation::Apsk16, CodeRate::new(1, 2)).is_none());
-        assert!(Constellation::for_modcod(Modulation::Apsk32, CodeRate::new(2, 3)).is_none());
+        assert!(Constellation::for_s2(Modulation::Apsk16, CodeRate::new(1, 2)).is_none());
+        assert!(Constellation::for_s2(Modulation::Apsk32, CodeRate::new(2, 3)).is_none());
+    }
+
+    fn s2x(pls: u8) -> Constellation {
+        let mc = decdvb_core::modcod(pls, FecFrame::Normal).unwrap();
+        Constellation::for_modcod(&mc).unwrap_or_else(|| panic!("{mc}"))
+    }
+
+    /// Points per ring, innermost first.
+    fn populations(c: &Constellation) -> Vec<usize> {
+        c.rings
+            .iter()
+            .map(|&r| {
+                c.points
+                    .iter()
+                    .filter(|p| (p.norm() - r).abs() < 1e-3)
+                    .count()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_s2x_modcod_has_a_unit_power_constellation() {
+        for mc in decdvb_core::s2x_modcod_table() {
+            let c = Constellation::for_modcod(mc).unwrap_or_else(|| panic!("none for {mc}"));
+            assert_eq!(c.points.len(), 1 << c.bits(), "{mc}");
+            let p: f32 = c.points.iter().map(|p| p.norm_sqr()).sum::<f32>() / c.points.len() as f32;
+            assert!((p - 1.0).abs() < 1e-4, "{mc}: power {p}");
+        }
+    }
+
+    #[test]
+    fn s2x_ring_populations_match_their_names() {
+        assert_eq!(populations(&s2x(138)), [2, 4, 2]); // 2+4+2APSK
+        assert_eq!(populations(&s2x(148)), [8, 8]); // 8+8APSK
+        assert_eq!(populations(&s2x(154)), [4, 12]); // 4+12APSK
+        assert_eq!(populations(&s2x(174)), [4, 12, 16]); // 4+12+16rbAPSK
+        assert_eq!(populations(&s2x(178)), [4, 8, 4, 16]); // 4+8+4+16APSK
+        assert_eq!(populations(&s2x(184)), [16, 16, 16, 16]);
+        assert_eq!(populations(&s2x(190)), [8, 16, 20, 20]);
+        assert_eq!(populations(&s2x(186)), [4, 12, 20, 28]);
+        assert_eq!(populations(&s2x(200)).iter().sum::<usize>(), 128);
+        assert_eq!(populations(&s2x(200)).len(), 6);
+        assert_eq!(populations(&s2x(204)), [32; 8]);
+    }
+
+    #[test]
+    fn s2x_ring_ratios_follow_the_tables() {
+        // 4+12+20+28APSK 132/180: γ = 2.4, 4.3, 7 (Table 13f).
+        let c = s2x(186);
+        let r = &c.rings;
+        for (k, g) in [(1, 2.4), (2, 4.3), (3, 7.0)] {
+            assert!((r[k] / r[0] - g).abs() < 1e-3, "ring {k}");
+        }
+        // 2+4+2APSK 100/180: γ = 5.32, 6.8 (Table 10b).
+        let c = s2x(138);
+        assert!((c.rings[1] / c.rings[0] - 5.32).abs() < 1e-3);
+        assert!((c.rings[2] / c.rings[0] - 6.8).abs() < 1e-3);
+    }
+
+    #[test]
+    fn label_table_rows_are_mirror_images() {
+        // Each row's four angles are φ, −φ, π−φ and π+φ in some order: a
+        // check on the tables as read out of the standard.
+        let all: [&[Row]; 7] = [
+            &t::APSK16_88,
+            &t::APSK32_4_12_16RB,
+            &t::APSK32_4_8_4_16,
+            &t::APSK64_16X4,
+            &t::APSK64_8_16_20_20,
+            &t::APSK64_4_12_20_28,
+            &t::APSK128,
+        ];
+        let norm = |(n, d): (i32, i32)| (n as f64 / d as f64).rem_euclid(2.0);
+        for rows in all {
+            for (lab, _, phi) in rows {
+                let a = norm(phi[0]);
+                let mut want = [
+                    a,
+                    (2.0 - a) % 2.0,
+                    (1.0 - a).rem_euclid(2.0),
+                    (1.0 + a) % 2.0,
+                ];
+                let mut got = phi.map(norm);
+                want.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                got.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                for (w, g) in want.iter().zip(&got) {
+                    assert!((w - g).abs() < 1e-9, "{lab}: {phi:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn s2x_points_are_distinct() {
+        // Every label its own point — except Table 15d's 256APSK 20/30 and
+        // 22/30, which pair some points 0.0001 apart (as gr-dtv has them).
+        for mc in decdvb_core::s2x_modcod_table() {
+            let rate = (mc.rate.num, mc.rate.den);
+            if mc.modulation == Modulation::Apsk256 && (rate == (20, 30) || rate == (22, 30)) {
+                continue;
+            }
+            let c = Constellation::for_modcod(mc).unwrap();
+            let mut min = f32::INFINITY;
+            for (i, a) in c.points.iter().enumerate() {
+                for b in &c.points[i + 1..] {
+                    min = min.min((a - b).norm());
+                }
+            }
+            assert!(min > 0.04, "{mc}: points {min} apart");
+        }
     }
 }
