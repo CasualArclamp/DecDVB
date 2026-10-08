@@ -35,7 +35,7 @@ and a CW tone. Every carrier was found and identified blind.*
 | **LDPC + BCH → BBFRAMEs**: all 21 S2 codes, BBHEADER, stream info, payload rate | ✅ |
 | All S2X MODCODs, VL-SNR | M3 |
 | **GSE → IP → PCAP** + live IP stats; GSE variant detected from the data | ✅ |
-| MPEG-TS output | M4 (next) |
+| **MPEG-TS**: services, PIDs, errors; `.ts` file, UDP, TCP/HTTP to VLC or PotPlayer | ✅ |
 | Modulator (HackRF TX / IQ file) | M6 |
 
 ## Using it
@@ -88,6 +88,25 @@ data field four ways at once — GSE_LENGTH counting the 2-byte header or not,
 the fragment id as 8 bits or as 6 bits plus a 2-bit counter — and keeps
 whichever yields valid IP (checksums, lengths). The *GSE* setting can force
 one. If none yields IP, a blind IPv4 search over the data fields takes over.
+
+### DVB-S2 → MPEG-TS → VLC / PotPlayer
+
+A **DVB-S2/S2X → MPEG-TS** VFO rebuilds the transport stream from TS-mode
+BBFRAMEs (sync bytes restored from the CRC-8 chain, deleted null packets put
+back) and shows its services (from the PAT, PMT and SDT), PIDs, CRC and
+continuity errors. Send it on with any of:
+
+| | |
+|---|---|
+| **TS file → ● Record** | a `.ts` in the output folder |
+| **UDP** `127.0.0.1:1234` | VLC: `udp://@:1234` · PotPlayer: `udp://127.0.0.1:1234` |
+| **TCP / HTTP** `127.0.0.1:8001` | VLC or PotPlayer: `http://127.0.0.1:8001/` (VLC also `tcp://…`) |
+| **▶ VLC / ▶ PotPlayer** | starts the TCP server and opens the stream in the player |
+
+Both network outputs start on 127.0.0.1, this machine only; use 0.0.0.0 (TCP)
+or another host's address (UDP) to reach the network. Several players can
+connect to the TCP server at once; one that stalls loses data rather than
+holding up the receiver.
 
 ### Generic PSK → symbols
 

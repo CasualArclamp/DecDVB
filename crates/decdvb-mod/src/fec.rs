@@ -66,6 +66,10 @@ const TS_SYNC: u8 = 0x47;
 pub struct TsBbFramer {
     rng: u64,
     cc: u8,
+    /// Packets made so far, and the PSI tables sent every 40 of them.
+    seq: u64,
+    tables: [Vec<u8>; 3],
+    table_cc: [u8; 3],
     /// The rest of a packet that did not fit the previous frame.
     carry: Vec<u8>,
     /// CRC-8 of the last packet's 187 useful bytes.
@@ -75,14 +79,29 @@ pub struct TsBbFramer {
     pub ccm: bool,
 }
 
-/// The test stream's PID.
+/// The test stream's data PID and its programme's PMT PID.
 pub const TEST_PID: u16 = 0x0100;
+pub const TEST_PMT_PID: u16 = 0x1000;
 
 impl TsBbFramer {
     pub fn new(seed: u64) -> Self {
         TsBbFramer {
             rng: seed | 1,
             cc: 0,
+            seq: 0,
+            // One programme, its data on TEST_PID as private data (it is
+            // noise, not video), named in the SDT.
+            tables: decdvb_ts::psi::test_tables(
+                1,
+                TEST_PMT_PID,
+                decdvb_ts::EsInfo {
+                    pid: TEST_PID,
+                    stream_type: 0x06,
+                },
+                "DecDVB",
+                "DecDVB test signal",
+            ),
+            table_cc: [0; 3],
             carry: Vec::new(),
             prev_crc: 0,
             roll_off: RollOff::R35,
@@ -99,8 +118,21 @@ impl TsBbFramer {
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
-    /// The next test packet, sync byte included.
+    /// The next test packet, sync byte included: a PAT, PMT or SDT every
+    /// 40 packets, else data.
     fn packet(&mut self) -> [u8; TS_LEN] {
+        let n = self.seq;
+        self.seq += 1;
+        if let k @ 0..3 = (n % 40) as usize {
+            let pid = [
+                decdvb_ts::psi::PID_PAT,
+                TEST_PMT_PID,
+                decdvb_ts::psi::PID_SDT,
+            ][k];
+            let cc = self.table_cc[k];
+            self.table_cc[k] = cc.wrapping_add(1) & 0x0F;
+            return decdvb_ts::psi::section_packet(pid, cc, &self.tables[k]);
+        }
         let mut p = [0u8; TS_LEN];
         p[0] = TS_SYNC;
         p[1] = (TEST_PID >> 8) as u8 & 0x1F;

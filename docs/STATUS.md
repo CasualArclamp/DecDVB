@@ -293,3 +293,34 @@ table in the side bar counts CRC ok / bad).
 - MPEG-TS output from TS-mode BBFRAMEs (`decdvb-ts`): sync-byte restore
   from the CRC-8s, null-packet re-insertion, `.ts` file / UDP.
 - Live confirmation on a real GSE carrier.
+
+## M4, part 2 — MPEG-TS out (done, 2026-10-08)
+
+- **`decdvb-ts`**: TS-mode data fields back to 188-byte packets. The
+  deframer treats the data fields as one stream and locks where SYNCD says,
+  verified by the CRC-8 chain (each packet's sync position holds the CRC of
+  the one before); if the chain fails there it searches every offset —
+  which also reads links whose encoders get SYNCD wrong (dontlookup's
+  "generic" and "Newtec" parsers). Sync bytes restored, failed CRCs flagged
+  in the transport error indicator, NPD null packets re-inserted, ISSY
+  counted (not read yet). A frame the demodulator, queue or FEC lost breaks
+  the stream: `PlFrame::after_gap`, queue drops and failed frames all
+  trigger a resync.
+- **Analysis**: per-PID packets, continuity errors and scrambling; PAT, PMT
+  and SDT (with CRC-32) for programme numbers, stream types and service
+  names (DVB text, UTF-8 or Latin-1).
+- **Outputs** from the FEC thread, switchable live: `.ts` file; UDP (7
+  packets per datagram); a TCP server that answers HTTP so VLC and PotPlayer
+  open `http://127.0.0.1:8001/`, each client on its own thread with a bounded
+  queue. ▶ VLC / ▶ PotPlayer start the server and launch the player once it
+  is up.
+- **Test signals**: the TS carrier carries a PAT, PMT and SDT ("DecDVB test
+  signal") every 40 packets.
+
+Verified: a QPSK 1/2 TS carrier through a VFO to a UDP socket — every
+datagram 7 packets with sync bytes, no CRC or continuity errors, the
+service name read from the SDT; the TCP server tested with a raw and an
+HTTP client on loopback. GUI on the scene: 5896 TS packets at 680 kbit/s.
+
+Also: the toolbar's 📁 Output folder (remembered in
+`%APPDATA%\DecDVB\prefs.txt`), LNB LO default 10700 MHz.

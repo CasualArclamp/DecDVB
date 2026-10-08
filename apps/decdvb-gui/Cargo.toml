@@ -21,6 +21,7 @@ hackrf = ["decdvb-io/hackrf"]
 [dependencies]
 decdvb-core = { path = "../../crates/decdvb-core" }
 decdvb-gse = { path = "../../crates/decdvb-gse" }
+decdvb-ts = { path = "../../crates/decdvb-ts" }
 decdvb-io = { path = "../../crates/decdvb-io" }
 decdvb-engine = { path = "../../crates/decdvb-engine" }
 anyhow.workspace = true

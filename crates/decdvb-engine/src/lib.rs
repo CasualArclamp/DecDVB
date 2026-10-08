@@ -17,7 +17,7 @@ pub mod vfo;
 pub use carriers::{Carrier, detect_carriers};
 pub use demod::{Demod, LockState, PlFrame};
 pub use estimate::{BandEstimate, estimate_band};
-pub use fec::{BbFrame, FecDecoder, FecOutput, FecStats, GseView};
+pub use fec::{BbFrame, FecDecoder, FecOutput, FecStats, GseView, TsView};
 pub use frontend::{Engine, EngineOptions, FrontStatus, SourceState};
 pub use identify::{
     ConstellationGuess, Identification, RateSource, Verdict, identify, identify_in,

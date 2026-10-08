@@ -14,5 +14,6 @@ decdvb-fec = { path = "../decdvb-fec" }
 decdvb-frame = { path = "../decdvb-frame" }
 decdvb-gse = { path = "../decdvb-gse" }
 decdvb-ip = { path = "../decdvb-ip" }
+decdvb-ts = { path = "../decdvb-ts" }
 num-complex.workspace = true
 thiserror.workspace = true

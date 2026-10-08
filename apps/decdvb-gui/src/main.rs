@@ -9,6 +9,7 @@ mod band_view;
 mod filename;
 mod format;
 mod freq_display;
+mod player;
 mod prefs;
 mod radio;
 mod side_panel;
@@ -106,6 +107,8 @@ struct App {
     new_decoder: DecoderKind,
     names: u32,
     paused: bool,
+    /// A player to open once its VFO's TCP server is up.
+    pending_player: Option<(VfoId, player::Player, std::time::Instant)>,
     note: String,
     automation: automation::Automation,
     #[cfg(feature = "hackrf")]
@@ -136,6 +139,7 @@ impl Default for App {
             new_decoder: DecoderKind::Identify,
             names: 1,
             paused: false,
+            pending_player: None,
             note: String::new(),
             automation: automation::Automation::new(&automation::Options::default()),
             #[cfg(feature = "hackrf")]
@@ -310,6 +314,45 @@ impl App {
                     self.set_rf_center(self.rf_center() + d);
                 }
             }
+            Action::Play(id, p) => {
+                // The server starts with the VFO's next TS frame; the player
+                // is launched once it is up (see `launch_pending_player`).
+                if let Some(v) = self.vfos.iter().find(|v| v.id == id)
+                    && !v.settings.ts_tcp_on
+                {
+                    let mut s = v.settings.clone();
+                    s.ts_tcp_on = true;
+                    self.apply(Action::Update(id, s));
+                }
+                self.pending_player = Some((id, p, std::time::Instant::now()));
+            }
+        }
+    }
+
+    /// Launch a player asked for with ▶ once its VFO's TCP server is up.
+    fn launch_pending_player(&mut self) {
+        let Some((id, p, since)) = self.pending_player else {
+            return;
+        };
+        let server = self
+            .statuses
+            .get(&id)
+            .and_then(|st| st.fec.as_ref())
+            .and_then(|f| f.ts.as_ref())
+            .and_then(|t| t.tcp.as_ref().map(|(a, _)| *a));
+        if let Some(addr) = server {
+            let url = player::http_url(addr);
+            self.note = match player::launch(p, &url) {
+                Ok(()) => format!("{} opening {url}", p.name()),
+                Err(e) => e,
+            };
+            self.pending_player = None;
+        } else if since.elapsed().as_secs() > 15 {
+            self.note = format!(
+                "{}: no TS server — is the VFO locked on a TS carrier, and its TCP address free?",
+                p.name()
+            );
+            self.pending_player = None;
         }
     }
 
@@ -657,6 +700,7 @@ impl eframe::App for App {
             let n = self.automation.select.unwrap_or(1).max(1);
             self.selected = self.vfos.get(n - 1).map(|v| v.id);
         }
+        self.launch_pending_player();
         self.automation.handle_screenshot(ctx);
         self.automation.tick(ctx);
         if self.automation.active() {

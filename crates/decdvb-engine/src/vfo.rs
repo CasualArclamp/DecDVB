@@ -99,6 +99,12 @@ pub struct VfoSettings {
     pub record: bool,
     /// DVB-S2 → GSE/IP: read GSE this way; `None` detects it from the data.
     pub gse_variant: Option<decdvb_gse::Variant>,
+    /// DVB-S2 → MPEG-TS: send the TS by UDP to `ts_udp` ("host:port").
+    pub ts_udp_on: bool,
+    pub ts_udp: String,
+    /// DVB-S2 → MPEG-TS: serve the TS over TCP/HTTP on `ts_tcp`.
+    pub ts_tcp_on: bool,
+    pub ts_tcp: String,
     /// Where the IQ recorder and the symbol writer write.
     pub record_dir: PathBuf,
 }
@@ -121,6 +127,12 @@ impl VfoSettings {
             psk_modulation: None,
             record: false,
             gse_variant: None,
+            // Local only: a player on this machine. Point them elsewhere on
+            // purpose to stream to the network.
+            ts_udp_on: false,
+            ts_udp: "127.0.0.1:1234".into(),
+            ts_tcp_on: false,
+            ts_tcp: "127.0.0.1:8001".into(),
             record_dir: std::env::temp_dir(),
         }
     }
@@ -806,12 +818,18 @@ impl Worker {
                         (LockState::Searching, _) => "searching for PLHEADERs".into(),
                         (LockState::Found, _) => "found a PLHEADER, confirming".into(),
                         (LockState::Locked, Some(f)) if f.frames > 0 => {
-                            let what = match (&f.gse, self.settings.decoder) {
-                                (Some(g), DecoderKind::Dvbs2Ip) => {
+                            let what = match (&f.gse, &f.ts, self.settings.decoder) {
+                                (Some(g), _, DecoderKind::Dvbs2Ip) => {
                                     format!("{} IP packets", g.packets)
                                 }
+                                (_, Some(t), DecoderKind::Dvbs2Ts) => {
+                                    match t.programmes.iter().find_map(|p| p.name.clone()) {
+                                        Some(n) => format!("{} TS packets · {n}", t.packets),
+                                        None => format!("{} TS packets", t.packets),
+                                    }
+                                }
                                 _ if f.ts_frames > 0 => {
-                                    format!("{} TS frames (MPEG-TS output is next)", f.ts_frames)
+                                    format!("{} TS frames — use the MPEG-TS decoder", f.ts_frames)
                                 }
                                 _ => "no stream data yet".into(),
                             };
@@ -882,6 +900,10 @@ fn fec_output(s: &VfoSettings, ddc: &Ddc) -> FecOutput {
         name: s.name.clone(),
         carrier_hz: ddc.offset_hz(),
         gse_variant: s.gse_variant,
+        ts: s.decoder == DecoderKind::Dvbs2Ts,
+        ts_record: s.record && s.decoder == DecoderKind::Dvbs2Ts,
+        ts_udp: s.ts_udp_on.then(|| s.ts_udp.trim().parse().ok()).flatten(),
+        ts_tcp: s.ts_tcp_on.then(|| s.ts_tcp.trim().parse().ok()).flatten(),
     }
 }
 
@@ -1318,6 +1340,68 @@ mod tests {
         }
         assert_eq!(at, bytes.len());
         assert!(n >= written, "{n} records, {written} counted");
+    }
+
+    #[test]
+    fn dvbs2_ts_vfo_streams_mpeg_ts_by_udp() {
+        use decdvb_mod::{FrameSpec, PlFramer};
+        // TS over DVB-S2, QPSK 1/2 with pilots at 125 kBd; the VFO sends the
+        // transport stream to a UDP socket this test listens on.
+        let syms = PlFramer::new(0, 8).build_schedule(&[FrameSpec::new(4, false, true)], 170_000);
+        let mut sh = Shaper::new(4, 0.35, 16);
+        let mut x = Vec::new();
+        sh.process(&syms, &mut x);
+        let w = std::f64::consts::TAU * 40_000.0 / 500_000.0;
+        for (n, v) in x.iter_mut().enumerate() {
+            let ph = w * n as f64;
+            *v *= Iq::new(ph.cos() as f32, ph.sin() as f32);
+        }
+        let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(std::time::Duration::from_secs(20)))
+            .unwrap();
+        let mut settings = VfoSettings::new("TS", 40_000.0, 190_000.0, DecoderKind::Dvbs2Ts);
+        settings.ts_udp_on = true;
+        settings.ts_udp = rx.local_addr().unwrap().to_string();
+        let status = Arc::new(Mutex::new(VfoStatus::default()));
+        let mut wk = Worker::new(
+            500_000.0,
+            settings,
+            status.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        feed(&mut wk, &x, 65_536);
+
+        // Datagrams of 7 packets, each starting with the sync byte.
+        let mut buf = [0u8; 2048];
+        let mut packets = 0;
+        while packets < 70 {
+            let (n, _) = rx.recv_from(&mut buf).expect("no TS by UDP");
+            assert_eq!(n, 7 * 188);
+            assert!(buf[..n].chunks(188).all(|p| p[0] == 0x47));
+            packets += 7;
+        }
+        let t0 = Instant::now();
+        let ts = loop {
+            wk.publish(0);
+            let t = status.lock().unwrap().fec.clone().and_then(|f| f.ts);
+            if t.as_ref()
+                .is_some_and(|t| t.programmes.iter().any(|p| p.name.is_some()))
+                || t0.elapsed().as_secs() > 20
+            {
+                break t.expect("no TS");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(ts.crc_errors, 0, "{ts:?}");
+        assert_eq!(ts.cc_errors, 0, "{ts:?}");
+        let p = ts
+            .programmes
+            .iter()
+            .find(|p| p.number == 1)
+            .expect("programme 1");
+        assert_eq!(p.name.as_deref(), Some("DecDVB test signal"));
+        assert_eq!(p.streams[0].pid, 0x100);
+        assert!(ts.udp.is_some_and(|(_, n)| n >= 10));
     }
 
     #[test]

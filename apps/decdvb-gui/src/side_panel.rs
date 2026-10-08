@@ -5,14 +5,16 @@ use std::collections::BTreeMap;
 use decdvb_core::Modulation;
 use decdvb_engine::{
     CarrierState, ConstellationGuess, DecoderKind, FecStats, GseView, Identification, LockState,
-    RateSource, Verdict, VfoId, VfoStatus,
+    RateSource, TsView, Verdict, VfoId, VfoStatus,
 };
 use decdvb_gse::{Source, Variant};
+use decdvb_ts::stream_type_name;
 use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, Ui, vec2};
 use egui_plot::{Line, Plot, PlotPoints, Points};
 
 use crate::band_view::{Action, UiVfo, badge, default_record_dir, paint_x, vfo_color};
 use crate::format;
+use crate::player::{self, Player};
 
 /// Constellations the generic PSK decoder can be told to use.
 const PSK_CHOICES: [Modulation; 5] = [
@@ -288,6 +290,67 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                 ui.end_row();
             }
 
+            if s.decoder == DecoderKind::Dvbs2Ts {
+                let ts = st.fec.as_ref().and_then(|f| f.ts.as_ref());
+                ui.label("TS file");
+                ui.horizontal(|ui| {
+                    let (label, tip) = if s.record {
+                        ("⏹ Stop", "Close the .ts file")
+                    } else {
+                        ("● Record", "Write the transport stream to a .ts file")
+                    };
+                    if ui
+                        .add(egui::Button::new(label).selected(s.record))
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        s.record = !s.record;
+                    }
+                });
+                ui.end_row();
+
+                ui.label("UDP");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut s.ts_udp_on, "");
+                    address_field(ui, &mut s.ts_udp);
+                })
+                .response
+                .on_hover_text(udp_hint(&s.ts_udp));
+                ui.end_row();
+
+                ui.label("TCP / HTTP");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut s.ts_tcp_on, "");
+                    address_field(ui, &mut s.ts_tcp);
+                })
+                .response
+                .on_hover_text(
+                    "A server players connect to: http://<address>/ in VLC or PotPlayer \
+                     (VLC also tcp://<address>). 127.0.0.1 is this machine only; \
+                     0.0.0.0 lets other machines on the network connect.",
+                );
+                ui.end_row();
+
+                ui.label("Play");
+                ui.horizontal(|ui| {
+                    for p in [Player::Vlc, Player::PotPlayer] {
+                        if ui
+                            .button(format!("▶ {}", p.name()))
+                            .on_hover_text(
+                                "Start the TCP server if needed and open the stream in the player",
+                            )
+                            .clicked()
+                        {
+                            actions.push(Action::Play(v.id, p));
+                        }
+                    }
+                    if let Some((addr, _)) = ts.and_then(|t| t.tcp.as_ref()) {
+                        ui.label(RichText::new(player::http_url(*addr)).small().weak());
+                    }
+                });
+                ui.end_row();
+            }
+
             if s.decoder == DecoderKind::Dvbs2Ip {
                 ui.label("GSE");
                 let txt = s.gse_variant.map_or("auto (from the data)", |v| v.label());
@@ -411,6 +474,9 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
             fec_card(ui, f);
             if let Some(g) = &f.gse {
                 gse_card(ui, g);
+            }
+            if let Some(t) = &f.ts {
+                ts_card(ui, t);
             }
         }
     }
@@ -562,6 +628,150 @@ fn fec_card(ui: &mut Ui, f: &FecStats) {
             ui.end_row();
         }
     });
+}
+
+/// A "host:port" text box, red while it does not parse.
+fn address_field(ui: &mut Ui, text: &mut String) {
+    let ok = text.trim().parse::<std::net::SocketAddr>().is_ok();
+    let mut edit = egui::TextEdit::singleline(text).desired_width(150.0);
+    if !ok {
+        edit = edit.text_color(Color32::from_rgb(230, 110, 110));
+    }
+    ui.add(edit);
+}
+
+/// How to open a UDP stream sent to `addr` in the players.
+fn udp_hint(addr: &str) -> String {
+    let port = addr.rsplit(':').next().unwrap_or("1234");
+    format!(
+        "Sends the TS to this address, 7 packets per datagram.\n\
+         VLC: udp://@:{port}   PotPlayer: udp://127.0.0.1:{port}\n\
+         A multicast address (239.x.x.x) reaches several players."
+    )
+}
+
+/// The transport stream: what it carries, its health, and where it goes.
+fn ts_card(ui: &mut Ui, t: &TsView) {
+    ui.add_space(6.0);
+    ui.label(RichText::new("MPEG-TS").strong());
+    egui::Grid::new("ts").num_columns(2).show(ui, |ui| {
+        ui.label("Packets");
+        ui.label(format!("{} · {}", t.packets, format::bitrate(t.ts_bps)));
+        ui.end_row();
+        ui.label("Errors");
+        let col = if t.crc_errors + t.cc_errors == 0 {
+            Color32::from_rgb(110, 220, 110)
+        } else {
+            Color32::from_rgb(240, 200, 80)
+        };
+        ui.colored_label(
+            col,
+            format!(
+                "{} CRC · {} continuity · {} resyncs",
+                t.crc_errors, t.cc_errors, t.resyncs
+            ),
+        );
+        ui.end_row();
+        if t.nulls_reinserted > 0 {
+            ui.label("Null packets");
+            ui.label(format!("{} re-inserted (NPD)", t.nulls_reinserted));
+            ui.end_row();
+        }
+        if t.issy {
+            ui.label("ISSY");
+            ui.colored_label(
+                Color32::from_rgb(240, 200, 80),
+                "in use — not read yet; packets are not extracted",
+            );
+            ui.end_row();
+        }
+        if let Some((path, n)) = &t.file {
+            ui.label("File");
+            if t.file_active {
+                ui.colored_label(Color32::from_rgb(230, 90, 90), format!("● {n} packets"));
+            } else {
+                ui.label(format!("stopped, {n} packets"));
+            }
+            ui.end_row();
+            ui.label("");
+            ui.label(RichText::new(path.display().to_string()).small());
+            ui.end_row();
+        }
+        if let Some((addr, n)) = &t.udp {
+            ui.label("UDP");
+            ui.label(format!("→ {addr} · {n} datagrams"));
+            ui.end_row();
+        }
+        if let Some((addr, clients)) = &t.tcp {
+            ui.label("TCP");
+            let who = if clients.is_empty() {
+                "no players connected".to_string()
+            } else {
+                let v: Vec<String> = clients.iter().map(|c| c.to_string()).collect();
+                format!("{} connected: {}", clients.len(), v.join(", "))
+            };
+            ui.label(format!("{} · {who}", player::http_url(*addr)));
+            ui.end_row();
+        }
+        if let Some(e) = &t.error {
+            ui.label("Output");
+            ui.colored_label(Color32::from_rgb(230, 110, 110), e);
+            ui.end_row();
+        }
+    });
+    let scrambled = |pid: u16| t.pids.iter().any(|(p, s)| *p == pid && s.scrambled > 0);
+    if !t.programmes.is_empty() {
+        ui.add_space(4.0);
+        ui.label(RichText::new("Services").small().strong());
+        for p in &t.programmes {
+            let name = p.name.as_deref().unwrap_or("(no name)");
+            let provider = p
+                .provider
+                .as_deref()
+                .map(|s| format!(" — {s}"))
+                .unwrap_or_default();
+            let encrypted = p.streams.iter().any(|e| scrambled(e.pid));
+            ui.label(
+                RichText::new(format!(
+                    "{} {name}{provider}{}",
+                    p.number,
+                    if encrypted { "  🔒 scrambled" } else { "" }
+                ))
+                .strong(),
+            );
+            for e in &p.streams {
+                ui.label(
+                    RichText::new(format!(
+                        "    PID {:#06x}  {}",
+                        e.pid,
+                        stream_type_name(e.stream_type)
+                    ))
+                    .small()
+                    .monospace(),
+                );
+            }
+        }
+    }
+    egui::CollapsingHeader::new(format!("PIDs ({})", t.pid_count))
+        .id_salt("ts_pids")
+        .show(ui, |ui| {
+            egui::Grid::new("pids")
+                .num_columns(4)
+                .striped(true)
+                .show(ui, |ui| {
+                    for h in ["PID", "packets", "CC errors", "scrambled"] {
+                        ui.label(RichText::new(h).small());
+                    }
+                    ui.end_row();
+                    for (pid, s) in &t.pids {
+                        ui.label(RichText::new(format!("{pid:#06x}")).small().monospace());
+                        ui.label(RichText::new(s.packets.to_string()).small());
+                        ui.label(RichText::new(s.cc_errors.to_string()).small());
+                        ui.label(RichText::new(if s.scrambled > 0 { "yes" } else { "" }).small());
+                        ui.end_row();
+                    }
+                });
+        });
 }
 
 /// IP out of GSE: where it comes from, how much, who is talking, and the

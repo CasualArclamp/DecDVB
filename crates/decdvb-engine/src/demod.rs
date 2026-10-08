@@ -84,6 +84,9 @@ pub struct PlFrame {
     pub gain: f32,
     /// Noise power per complex symbol in `payload`, measured the same way.
     pub noise_var: f32,
+    /// The first frame after (re)acquiring lock: whatever came before it was
+    /// lost, so a stream reassembled across frames must start over.
+    pub after_gap: bool,
 }
 
 impl PlFrame {
@@ -410,6 +413,7 @@ impl Demod {
                             corr,
                             gain,
                             noise_var,
+                            after_gap: confirmed == 0,
                         });
                         self.frames += 1;
                         // Frames on the grid: the timing loop can go quiet.

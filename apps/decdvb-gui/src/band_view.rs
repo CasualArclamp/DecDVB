@@ -37,6 +37,8 @@ pub enum Action {
     Remove(VfoId),
     /// Move the radio's centre frequency by this many Hz.
     Retune(f64),
+    /// Open a media player on a VFO's TS stream (starting its TCP server).
+    Play(VfoId, crate::player::Player),
 }
 
 /// Everything the view draws from.
@@ -138,7 +140,8 @@ pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
                     .unwrap_or_else(|| "dummy".into());
                 match &st.fec {
                     Some(f) if f.ok > 0 && f.payload_bps > 0.0 => {
-                        let rec = f.gse.as_ref().is_some_and(|g| g.pcap_active);
+                        let rec = f.gse.as_ref().is_some_and(|g| g.pcap_active)
+                            || f.ts.as_ref().is_some_and(|t| t.file_active);
                         format!(
                             "LOCK {mc} · {}{}",
                             format::bitrate(f.payload_bps),

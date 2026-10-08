@@ -8,10 +8,14 @@
 //! frames are dropped and counted rather than stalling it. Good GS-mode
 //! BBFRAMEs then go through GSE to IP (every GSE variant tried, the one
 //! yielding valid IP kept — `decdvb_gse::GseIp`), into live statistics and,
-//! while recording, a PCAP file.
+//! while recording, a PCAP file. Good TS-mode BBFRAMEs become MPEG-TS
+//! (`decdvb_ts`): analysed (programmes, PIDs, continuity) and sent to a
+//! `.ts` file, UDP, and/or a TCP/HTTP server for VLC or PotPlayer.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -23,6 +27,7 @@ use decdvb_fec::{Bch, BchError, Constellation, DecodeOutcome, FecParams, LdpcCod
 use decdvb_frame::{BBHEADER_LEN, BbHeader, BbHeaderError, PlsInfo, StreamFormat, bb_scramble};
 use decdvb_gse::{GseIp, IpPacket, Source, Variant, VariantReport};
 use decdvb_ip::{Flow, IpStats, PcapWriter};
+use decdvb_ts::{PidStats, Programme, TS_LEN, TcpSink, TsAnalyser, TsDeframer, TsFile, UdpSink};
 
 use crate::demod::{PILOT_AFTER, PILOT_PERIOD, PlFrame};
 
@@ -180,10 +185,40 @@ pub struct FecStats {
     pub payload_bps: f64,
     /// Fraction of real time the FEC thread is busy.
     pub load: f32,
-    /// Good TS-mode frames (MPEG-TS output arrives with M4's TS work).
+    /// Good TS-mode frames.
     pub ts_frames: u64,
     /// What GSE and IP have made of the GS-mode frames.
     pub gse: Option<GseView>,
+    /// The MPEG-TS from the TS-mode frames (MPEG-TS decoders).
+    pub ts: Option<TsView>,
+}
+
+/// The transport stream and its outputs, for display.
+#[derive(Debug, Clone, Default)]
+pub struct TsView {
+    pub packets: u64,
+    /// Packets whose CRC-8 failed (flagged with the transport error bit).
+    pub crc_errors: u64,
+    /// Continuity counter jumps, all PIDs.
+    pub cc_errors: u64,
+    pub nulls_reinserted: u64,
+    pub resyncs: u64,
+    /// The stream uses ISSY, which is not read yet.
+    pub issy: bool,
+    /// TS rate over the last couple of seconds of signal, bits per second.
+    pub ts_bps: f64,
+    pub programmes: Vec<Programme>,
+    /// The busiest PIDs, most packets first.
+    pub pids: Vec<(u16, PidStats)>,
+    pub pid_count: usize,
+    pub file: Option<(PathBuf, u64)>,
+    pub file_active: bool,
+    /// UDP target and datagrams sent.
+    pub udp: Option<(SocketAddr, u64)>,
+    /// TCP server address and the players connected.
+    pub tcp: Option<(SocketAddr, Vec<SocketAddr>)>,
+    /// The last output error (a file that will not open, a port in use…).
+    pub error: Option<String>,
 }
 
 /// IP out of GSE, for display.
@@ -223,6 +258,14 @@ pub struct FecOutput {
     pub carrier_hz: f64,
     /// Read GSE this way instead of detecting it.
     pub gse_variant: Option<Variant>,
+    /// The VFO's decoder is the MPEG-TS one: run the TS stage.
+    pub ts: bool,
+    /// Write the MPEG-TS to a `.ts` file.
+    pub ts_record: bool,
+    /// Send the MPEG-TS by UDP here.
+    pub ts_udp: Option<SocketAddr>,
+    /// Serve the MPEG-TS over TCP/HTTP here.
+    pub ts_tcp: Option<SocketAddr>,
 }
 
 /// Runs a [`FecDecoder`] on its own thread.
@@ -230,6 +273,9 @@ pub(crate) struct FecWorker {
     tx: Option<SyncSender<PlFrame>>,
     stats: Arc<Mutex<FecStats>>,
     output: Arc<Mutex<FecOutput>>,
+    /// A frame was dropped since the thread last looked: streams that span
+    /// frames (TS) must start over.
+    gap: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -239,15 +285,17 @@ impl FecWorker {
         let (tx, rx) = mpsc::sync_channel(QUEUE);
         let stats = Arc::new(Mutex::new(FecStats::default()));
         let output = Arc::new(Mutex::new(output));
-        let (s, o) = (stats.clone(), output.clone());
+        let gap = Arc::new(AtomicBool::new(false));
+        let (s, o, g) = (stats.clone(), output.clone(), gap.clone());
         let join = std::thread::Builder::new()
             .name("decdvb-fec".into())
-            .spawn(move || run(rx, s, o, symbol_rate))
+            .spawn(move || run(rx, s, o, g, symbol_rate))
             .expect("spawn FEC thread");
         FecWorker {
             tx: Some(tx),
             stats,
             output,
+            gap,
             join: Some(join),
         }
     }
@@ -258,6 +306,7 @@ impl FecWorker {
             && let Err(TrySendError::Full(_)) = tx.try_send(f)
         {
             self.stats.lock().unwrap().dropped += 1;
+            self.gap.store(true, Ordering::Relaxed);
         }
     }
 
@@ -407,14 +456,174 @@ impl Drop for IpStage {
     }
 }
 
+/// The MPEG-TS end of the FEC thread.
+struct TsStage {
+    deframer: TsDeframer,
+    analyser: TsAnalyser,
+    packets: Vec<[u8; TS_LEN]>,
+    file: Option<TsFile>,
+    file_path: Option<PathBuf>,
+    udp: Option<UdpSink>,
+    tcp: Option<TcpSink>,
+    /// What the outputs were last set to, so they are rebuilt only on change.
+    udp_want: Option<SocketAddr>,
+    tcp_want: Option<SocketAddr>,
+    error: Option<String>,
+    win: (f64, f64),
+    ts_bps: f64,
+    issy: bool,
+}
+
+impl TsStage {
+    fn new() -> Self {
+        TsStage {
+            deframer: TsDeframer::new(),
+            analyser: TsAnalyser::new(),
+            packets: Vec::new(),
+            file: None,
+            file_path: None,
+            udp: None,
+            tcp: None,
+            udp_want: None,
+            tcp_want: None,
+            error: None,
+            win: (0.0, 0.0),
+            ts_bps: 0.0,
+            issy: false,
+        }
+    }
+
+    /// Open, close or move the outputs to match `o`.
+    fn follow(&mut self, o: &FecOutput) {
+        match (o.ts_record, self.file.is_some()) {
+            (true, false) if self.file_path.is_none() || self.error.is_none() => {
+                let stamp = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let path = o.dir.join(format!(
+                    "decdvb-{}-{:+.0}Hz-{stamp}.ts",
+                    o.name.replace(' ', "_"),
+                    o.carrier_hz
+                ));
+                let _ = std::fs::create_dir_all(&o.dir);
+                match TsFile::create(&path) {
+                    Ok(f) => self.file = Some(f),
+                    Err(e) => self.error = Some(format!("{}: {e}", path.display())),
+                }
+                self.file_path = Some(path);
+            }
+            (false, true) => {
+                if let Some(mut f) = self.file.take() {
+                    let _ = f.flush();
+                }
+            }
+            _ => {}
+        }
+        if o.ts_udp != self.udp_want {
+            self.udp_want = o.ts_udp;
+            self.udp = None;
+            if let Some(a) = o.ts_udp {
+                match UdpSink::new(a) {
+                    Ok(u) => self.udp = Some(u),
+                    Err(e) => self.error = Some(format!("UDP {a}: {e}")),
+                }
+            }
+        }
+        if o.ts_tcp != self.tcp_want {
+            self.tcp_want = o.ts_tcp;
+            self.tcp = None; // closes the old server and its clients
+            if let Some(a) = o.ts_tcp {
+                match TcpSink::bind(a) {
+                    Ok(t) => self.tcp = Some(t),
+                    Err(e) => self.error = Some(format!("TCP {a}: {e}")),
+                }
+            }
+        }
+    }
+
+    fn data_field(&mut self, field: &[u8], h: &BbHeader) {
+        self.issy |= h.issyi;
+        self.packets.clear();
+        self.deframer
+            .data_field(field, h.syncd, h.npd, h.issyi, &mut self.packets);
+        for p in &self.packets {
+            self.analyser.packet(p);
+        }
+        self.win.0 += (self.packets.len() * TS_LEN) as f64;
+        if let Some(f) = &mut self.file
+            && let Err(e) = f.write(&self.packets)
+        {
+            self.error = Some(e.to_string());
+            self.file = None;
+        }
+        if let Some(u) = &mut self.udp {
+            u.write(&self.packets);
+        }
+        if let Some(t) = &mut self.tcp {
+            t.write(&self.packets);
+        }
+    }
+
+    fn tick(&mut self, secs: f64) {
+        self.win.1 += secs;
+        if self.win.1 >= 2.0 || (self.ts_bps == 0.0 && self.win.1 > 0.2) {
+            self.ts_bps = self.win.0 * 8.0 / self.win.1;
+            if self.win.1 >= 2.0 {
+                self.win = (0.0, 0.0);
+            }
+        }
+    }
+
+    fn view(&self) -> TsView {
+        let d = &self.deframer.stats;
+        let mut pids: Vec<(u16, PidStats)> =
+            self.analyser.pids.iter().map(|(&p, &s)| (p, s)).collect();
+        let cc_errors = pids.iter().map(|(_, s)| s.cc_errors).sum();
+        pids.sort_unstable_by_key(|(_, s)| std::cmp::Reverse(s.packets));
+        let pid_count = pids.len();
+        pids.truncate(12);
+        TsView {
+            packets: d.packets,
+            crc_errors: d.crc_errors,
+            cc_errors,
+            nulls_reinserted: d.nulls_reinserted,
+            resyncs: d.resyncs,
+            issy: self.issy,
+            ts_bps: self.ts_bps,
+            programmes: self.analyser.programmes.values().cloned().collect(),
+            pids,
+            pid_count,
+            file: self
+                .file_path
+                .clone()
+                .map(|p| (p, self.file.as_ref().map_or(0, |f| f.packets))),
+            file_active: self.file.is_some(),
+            udp: self.udp.as_ref().map(|u| (u.target, u.datagrams)),
+            tcp: self.tcp.as_ref().map(|t| (t.addr, t.clients())),
+            error: self.error.clone(),
+        }
+    }
+}
+
+impl Drop for TsStage {
+    fn drop(&mut self) {
+        if let Some(f) = &mut self.file {
+            let _ = f.flush();
+        }
+    }
+}
+
 fn run(
     rx: Receiver<PlFrame>,
     stats: Arc<Mutex<FecStats>>,
     output: Arc<Mutex<FecOutput>>,
+    gap: Arc<AtomicBool>,
     symbol_rate: f64,
 ) {
     let mut dec = FecDecoder::new();
     let mut ip: Option<IpStage> = None;
+    let mut ts: Option<TsStage> = None;
     // Payload rate window: DFL bits and signal seconds.
     let (mut win_bits, mut win_secs) = (0f64, 0f64);
     let mut busy = 0f64;
@@ -422,6 +631,34 @@ fn run(
         let t0 = Instant::now();
         let secs = f.pls.plframe_len as f64 / symbol_rate;
         let out = dec.decode(&f);
+
+        // A stream reassembled across frames breaks at any frame missing in
+        // between: one the demodulator never saw (lock regained), one dropped
+        // from the queue, or one that would not decode.
+        let broken = f.after_gap
+            || gap.swap(false, Ordering::Relaxed)
+            || out.as_ref().is_some_and(|b| !b.ok());
+        if broken && let Some(t) = &mut ts {
+            t.deframer.discontinuity();
+        }
+        let wants_ts = output.lock().unwrap().ts;
+        if let Some(b) = &out
+            && let Ok(h) = &b.header
+            && b.ok()
+            && h.format == StreamFormat::Transport
+            && wants_ts
+        {
+            let end = (BBHEADER_LEN + h.dfl as usize / 8).min(b.bytes.len());
+            let stage = ts.get_or_insert_with(TsStage::new);
+            stage.follow(&output.lock().unwrap());
+            stage.data_field(&b.bytes[BBHEADER_LEN..end], h);
+        } else if let Some(t) = &mut ts {
+            // Keep Record/UDP/TCP responsive between TS frames.
+            t.follow(&output.lock().unwrap());
+        }
+        if let Some(t) = &mut ts {
+            t.tick(secs);
+        }
 
         // GSE/IP on good generic-stream frames (UPL 0: continuous; GSE also
         // turns up flagged as packetized with UPL 0).
@@ -485,6 +722,9 @@ fn run(
         }
         if let Some(stage) = &mut ip {
             s.gse = Some(stage.view());
+        }
+        if let Some(t) = &ts {
+            s.ts = Some(t.view());
         }
     }
 }
