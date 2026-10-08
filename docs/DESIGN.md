@@ -90,6 +90,7 @@ IqSource (HackRF 20 MS/s, or a wideband file)
 | **Identify** ("what is this?") | Blind: measures symbol rate and roll-off, estimates constellation order, and identifies the standard. See §3b. | nothing beyond M1 |
 | **DVB-S2/S2X → GSE/IP** | Full ACM demod → LDPC/BCH → GSE → IP → PCAP + stream stats | M2–M4 |
 | **DVB-S2/S2X → MPEG-TS** | Same demod, TS-mode BBFRAMEs → `.ts` or UDP | M2, Appendix C |
+| **Generic PSK → symbols** | Any linearly modulated carrier: blind rate, carrier lock, hard decisions to a `.bin`, one byte per symbol | done |
 | **IQ recorder** | That VFO's narrowband IQ to a file | M1 |
 | **Spectrum only** | Zoomed spectrum, level, occupied bandwidth; no decode | done |
 
@@ -191,7 +192,7 @@ After BBFRAMEs exist, GS-mode payload is GSE. Implement:
 ## 9. Milestones
 
 - **M0 — skeleton**: workspace builds; core types + MODCOD/FECFRAME tables; config; IQ-file + HackRF source; CLI prints samples; GUI shows raw IQ constellation + spectrum. CI green. *(local git; create public repo at end of M0/M1.)*
-- **M1 — acquisition & PL**: RRC + timing (Gardner) + carrier recovery; SOF/PLS correlation; PLHEADER decode (MODCOD, FECFRAME, pilots); PL descramble; pilot phase tracking. Output: locks on a signal, prints MODCOD per frame, clean constellation. *(PLHEADER, correlator and scrambler done.)*
+- **M1 — acquisition & PL**: RRC + timing (Gardner) + carrier recovery; SOF/PLS correlation; PLHEADER decode (MODCOD, FECFRAME, pilots); PL descramble; pilot phase tracking. Output: locks on a signal, prints MODCOD per frame, clean constellation. *(Done 2026-10-08.)*
 - **M1b — wideband + VFOs + Identify** *(added 2026-10-08, see §3a/§3b)*: DDC (NCO mix + decimating filter) and AGC; engine restructured into a wideband front end feeding N VFO worker threads behind a `Decoder` trait; carrier detection across the span; the **Identify** decoder (symbol rate, roll-off, constellation order, DVB-S2/S2X identification); an S2 PLFRAME generator in `synth` so all of it can be tested on realistic signals; GUI rebuilt around a big spectrum + waterfall with draggable VFOs and a side bar; live HackRF. Needs no FEC, so it lands first and is usable on its own as a carrier survey tool.
 - **M2 — FEC core**: demap→LLR + LDPC + BCH for the common MODCODs (QPSK/8PSK, normal+short); BBHEADER + CRC-8; emit valid BBFRAMEs. Verified vs reference vectors.
 - **M3 — full MODCOD coverage**: 16/32/64/128/256APSK, all S2 + S2X rates, medium frame, VL-SNR + pi/2-BPSK.

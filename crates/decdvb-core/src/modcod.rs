@@ -9,6 +9,9 @@ use std::fmt;
 /// Constellation / modulation order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Modulation {
+    /// Plain BPSK — not a DVB-S2 modulation, but common on generic carriers
+    /// (telemetry, SCPC data), so the generic PSK decoder handles it.
+    Bpsk,
     /// pi/2-BPSK (S2X VL-SNR).
     Pi2Bpsk,
     Qpsk,
@@ -24,7 +27,7 @@ impl Modulation {
     /// Bits carried per channel symbol.
     pub const fn bits_per_symbol(self) -> u8 {
         match self {
-            Modulation::Pi2Bpsk => 1,
+            Modulation::Bpsk | Modulation::Pi2Bpsk => 1,
             Modulation::Qpsk => 2,
             Modulation::Psk8 => 3,
             Modulation::Apsk16 => 4,
@@ -37,6 +40,7 @@ impl Modulation {
 
     pub const fn name(self) -> &'static str {
         match self {
+            Modulation::Bpsk => "BPSK",
             Modulation::Pi2Bpsk => "pi/2-BPSK",
             Modulation::Qpsk => "QPSK",
             Modulation::Psk8 => "8PSK",

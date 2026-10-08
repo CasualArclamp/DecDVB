@@ -9,6 +9,7 @@ pub mod demod;
 pub mod estimate;
 pub mod frontend;
 pub mod identify;
+pub mod psk;
 pub mod spectrum;
 pub mod vfo;
 
@@ -19,8 +20,9 @@ pub use frontend::{Engine, EngineOptions, FrontStatus, SourceState};
 pub use identify::{
     ConstellationGuess, Identification, RateSource, Verdict, identify, identify_in,
 };
+pub use psk::PskDemod;
 pub use spectrum::Spectrum;
-pub use vfo::{DecoderKind, VfoId, VfoSettings, VfoStatus};
+pub use vfo::{CarrierState, DecoderKind, VfoId, VfoSettings, VfoStatus};
 
 use decdvb_core::{Iq, Metrics, Result, RxConfig};
 use decdvb_io::IqSource;

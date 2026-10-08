@@ -16,4 +16,4 @@ pub use defs::*;
 pub use plsc::{PlsInfo, PlscDecoder, PlscDemap, PlscEncoder};
 pub use rm::ReedMuller;
 pub use scramble::PlScrambler;
-pub use sync::PlHeaderCorrelator;
+pub use sync::{PlHeaderCorrelator, sof_differential};

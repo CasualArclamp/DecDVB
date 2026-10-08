@@ -28,7 +28,7 @@ Workspace builds clean, tests and clippy green.
 Verified by hand: `synth` then `analyse` recovers the carrier offset and symbol
 rate of signals at 125 kS/s–1 MS/s with roll-offs 0.05–0.35.
 
-## M1 — acquisition and PL sync (in progress)
+## M1 — acquisition and PL sync (done, 2026-10-08)
 
 ### Done: the PLHEADER (`decdvb-frame`)
 
@@ -95,12 +95,49 @@ that holds most of the power; a region with a non-flat top is flagged `rough`
 under the 48-carrier cap. The same band now reads 6 carriers + 42 narrow lines,
 the comb as one lump. Six regression tests cover it.
 
+### Done: carrier recovery, generic PSK, narrow carriers (2026-10-08)
+
+From live Ku-band use:
+
+- **Carrier recovery** (`decdvb-dsp::carrier`): a second-order PLL,
+  decision-directed or data-aided. Lock is judged by *coherence*,
+  |⟨e^{jS·err}⟩| folded by the constellation's symmetry — MER alone cannot
+  tell (a rotating QPSK ring still reads ~7 dB, 8PSK ~13 dB).
+- **DVB-S2 VFOs** (`demod`): the loop runs over each frame as it is emitted.
+  Data-aided over the PLHEADER and pilots, so the absolute phase is resolved;
+  decision-directed over the data against that frame's MODCOD constellation,
+  so ACM stays locked across QPSK/8PSK/APSK. Seeded at acquisition from the
+  two confirming headers (lag-1/8/32 cascade on the de-modulated header, near
+  the CRB) or from Identify's offset when the headers agree. `PlFrame.payload`
+  is now carrier-corrected — ready for M2.
+- **Identify** shows a locked constellation and MER: SOF-summed coarse offset
+  for DVB-S2 (else the power line), then the same PLL.
+- **Generic PSK → symbols** (`psk`): blind acquisition through Identify, then
+  MF → AGC → Gardner → PLL; hard decisions to a `.bin`, one byte per symbol.
+- **Narrow carriers**: VFOs down to 500 Hz; demodulator acquisition now takes
+  Identify's first look (≤ 2 s) instead of a fixed 300 000 samples, which on a
+  10 kBd VFO had meant 6–12 s before anything happened. Identify's in-band
+  floor moved to the 3rd percentile — a carrier filling its VFO had read as
+  "no signal".
+- **GUI**: SDR++-style frequency readout across the top; ✕ on VFO labels and
+  list rows. egui's proportional font lacks →, ✕ and ●, which rendered as
+  boxes: the X is now drawn, and the bundled monospace font is a fallback.
+
+Tests: a 10 kBd QPSK carrier with 150 Hz LNB error and phase noise through a
+narrow VFO; 8PSK through a VFO to a `.bin`; an ACM sequence locked frame by
+frame with pilots on their true phase; a wrong seed overruled by the headers.
+
+### M1 complete
+
+Every M1 item is in: RRC, timing, carrier recovery, PLHEADER sync and decode,
+descrambling, pilot tracking, a locked constellation.
+
 ### Still to do
 
-1. Carrier recovery: coarse from the 4th-power line / header phase, fine from
-   pilots and a decision-directed loop — the payload still rotates.
-2. DC/IQ-imbalance correction for the HackRF's DC spur.
-3. NCO mixing per VFO in f32 / lane-parallel (it is f64 per sample now).
+1. DC/IQ-imbalance correction for the HackRF's DC spur.
+2. NCO mixing per VFO in f32 / lane-parallel (it is f64 per sample now).
+3. The carrier loop's nearest-point search is linear in the constellation
+   size; a sector lookup would cut 32APSK's cost.
 
 ## M1b — wideband waterfall + VFOs + Identify (done, 2026-10-08)
 

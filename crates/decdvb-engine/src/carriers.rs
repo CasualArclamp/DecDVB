@@ -44,6 +44,11 @@ impl Carrier {
         if self.rough {
             return self.bandwidth_hz * 1.1;
         }
+        if self.narrow {
+            // Unresolved at this FFT size: its symbol-rate estimate means
+            // little, so leave generous room (callers add a floor in bins).
+            return self.bandwidth_hz * 2.0;
+        }
         (self.bandwidth_hz * 1.25).max(self.symbol_rate_hz * 1.5)
     }
 

@@ -6,6 +6,8 @@
 //! end — the waterfall and the other VFOs keep running in real time.
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -19,6 +21,7 @@ use decdvb_io::IqFileWriter;
 
 use crate::demod::{Demod, LockState};
 use crate::identify::{Identification, Verdict, identify_in};
+use crate::psk::PskDemod;
 use crate::spectrum::Spectrum;
 
 pub type VfoId = u32;
@@ -32,6 +35,9 @@ pub enum DecoderKind {
     Dvbs2Ip,
     /// DVB-S2/S2X → MPEG-TS.
     Dvbs2Ts,
+    /// Generic PSK/APSK: lock any linearly modulated carrier and write its
+    /// hard-decided symbols to a `.bin` file, one byte per symbol.
+    PskSymbols,
     /// Record the VFO's narrowband IQ.
     IqRecord,
     /// Zoomed spectrum and level only.
@@ -39,10 +45,11 @@ pub enum DecoderKind {
 }
 
 impl DecoderKind {
-    pub const ALL: [DecoderKind; 5] = [
+    pub const ALL: [DecoderKind; 6] = [
         DecoderKind::Identify,
         DecoderKind::Dvbs2Ip,
         DecoderKind::Dvbs2Ts,
+        DecoderKind::PskSymbols,
         DecoderKind::IqRecord,
         DecoderKind::Spectrum,
     ];
@@ -52,6 +59,7 @@ impl DecoderKind {
             DecoderKind::Identify => "Identify (what is this?)",
             DecoderKind::Dvbs2Ip => "DVB-S2/S2X → GSE/IP (PCAP)",
             DecoderKind::Dvbs2Ts => "DVB-S2/S2X → MPEG-TS",
+            DecoderKind::PskSymbols => "Generic PSK → symbols (.bin)",
             DecoderKind::IqRecord => "IQ recorder",
             DecoderKind::Spectrum => "Spectrum only",
         }
@@ -62,6 +70,7 @@ impl DecoderKind {
             DecoderKind::Identify => "ID",
             DecoderKind::Dvbs2Ip => "S2→IP",
             DecoderKind::Dvbs2Ts => "S2→TS",
+            DecoderKind::PskSymbols => "PSK",
             DecoderKind::IqRecord => "REC",
             DecoderKind::Spectrum => "SPEC",
         }
@@ -81,7 +90,9 @@ pub struct VfoSettings {
     pub symbol_rate: Option<f64>,
     /// PL scrambling gold-code index.
     pub gold_code: u32,
-    /// Where the IQ recorder writes.
+    /// Generic PSK: the constellation to decide on; `None` takes Identify's.
+    pub psk_modulation: Option<decdvb_core::Modulation>,
+    /// Where the IQ recorder and the symbol writer write.
     pub record_dir: PathBuf,
 }
 
@@ -100,6 +111,7 @@ impl VfoSettings {
             enabled: true,
             symbol_rate: None,
             gold_code: 0,
+            psk_modulation: None,
             record_dir: std::env::temp_dir(),
         }
     }
@@ -132,7 +144,21 @@ pub struct VfoStatus {
     pub last_modcod: Option<u8>,
     pub symbol_rate: Option<f64>,
     pub message: String,
+    /// File being written and its size so far: bytes of IQ for the recorder,
+    /// symbols (one byte each) for the generic PSK decoder.
     pub recording: Option<(PathBuf, u64)>,
+    /// Carrier loop of a running demodulator.
+    pub carrier: Option<CarrierState>,
+}
+
+/// A running demodulator's carrier loop, for display.
+#[derive(Debug, Clone, Copy)]
+pub struct CarrierState {
+    pub locked: bool,
+    pub mer_db: f32,
+    /// Residual offset the loop is tracking, Hz.
+    pub offset_hz: f64,
+    pub modulation: decdvb_core::Modulation,
 }
 
 /// Messages on a worker's queue. Settings do not travel here: the queue is
@@ -218,23 +244,20 @@ pub(crate) fn spawn(in_rate: f64, settings: VfoSettings) -> VfoHandle {
     }
 }
 
-/// How much baseband to gather before identifying: enough for several normal
-/// QPSK frames at any sensible samples-per-symbol, but bounded in time.
-fn gather_target(out_rate: f64) -> usize {
-    ((out_rate * 0.6) as usize).clamp(300_000, 2_000_000)
-}
-
-/// A first look for Identify: ~0.6 s, but never more than 2 s of signal, so a
-/// narrow VFO answers quickly. Whether that was long enough to judge DVB-S2 is
-/// decided afterwards, from the symbol rate it measured.
+/// A first look: ~0.6 s, but never more than 2 s of signal, so a narrow VFO
+/// answers quickly (a 10 kBd carrier gives 20 000 symbols, plenty for the
+/// symbol rate). For Identify, whether that was long enough to judge DVB-S2 is
+/// decided afterwards, from the symbol rate it measured; the demodulators
+/// only need the symbol rate from it, and find frames themselves.
 fn first_look(out_rate: f64) -> usize {
     ((out_rate * 0.6) as usize).clamp((out_rate * 2.0).min(300_000.0) as usize, 2_000_000)
 }
 
-/// Samples holding three of the longest PLFRAMEs at `rs` — what it takes to
-/// see a header confirmed on its frame grid, with margin.
-fn three_frames(out_rate: f64, rs: f64) -> usize {
-    let symbols = 3.0 * decdvb_frame::MAX_PLFRAME_LEN as f64 * 1.2;
+/// Samples holding two of the longest PLFRAMEs at `rs`, with margin — what it
+/// takes to see one header confirmed on its frame grid wherever in the frame
+/// the listen happens to start.
+fn enough_frames(out_rate: f64, rs: f64) -> usize {
+    let symbols = 2.2 * decdvb_frame::MAX_PLFRAME_LEN as f64;
     (symbols * out_rate / rs) as usize
 }
 
@@ -260,6 +283,13 @@ enum Decoder {
         buf: Vec<Iq>,
         demod: Option<Box<Demod>>,
     },
+    Psk {
+        buf: Vec<Iq>,
+        demod: Option<Box<PskDemod>>,
+        writer: Option<BufWriter<File>>,
+        path: Option<PathBuf>,
+        written: u64,
+    },
 }
 
 struct Worker {
@@ -273,6 +303,8 @@ struct Worker {
     load: f32,
     bb: Vec<Iq>,
     frames: Vec<crate::demod::PlFrame>,
+    syms: Vec<(u8, Iq)>,
+    sym_bytes: Vec<u8>,
     modcods: BTreeMap<u8, u64>,
     last_modcod: Option<u8>,
     identification: Option<Identification>,
@@ -302,6 +334,8 @@ impl Worker {
             load: 0.0,
             bb: Vec::new(),
             frames: Vec::new(),
+            syms: Vec::new(),
+            sym_bytes: Vec::new(),
             modcods: BTreeMap::new(),
             last_modcod: None,
             identification: None,
@@ -318,15 +352,12 @@ impl Worker {
             },
             DecoderKind::Spectrum => Decoder::Spectrum,
             DecoderKind::IqRecord => {
-                let stamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
                 let path = s.record_dir.join(format!(
-                    "decdvb-{}-{:+.0}Hz-{:.0}Sps-{stamp}.cf32",
+                    "decdvb-{}-{:+.0}Hz-{:.0}Sps-{}.cf32",
                     s.name.replace(' ', "_"),
                     s.offset_hz,
-                    ddc.out_rate()
+                    ddc.out_rate(),
+                    unix_stamp()
                 ));
                 let _ = std::fs::create_dir_all(&s.record_dir);
                 let writer = IqFileWriter::create(&path, SampleFormat::Cf32).ok();
@@ -340,6 +371,13 @@ impl Worker {
                 buf: Vec::new(),
                 demod: None,
             },
+            DecoderKind::PskSymbols => Decoder::Psk {
+                buf: Vec::new(),
+                demod: None,
+                writer: None,
+                path: None,
+                written: 0,
+            },
         }
     }
 
@@ -348,7 +386,8 @@ impl Worker {
         let retuned = new.offset_hz != self.settings.offset_hz;
         let new_decoder = new.decoder != self.settings.decoder
             || new.symbol_rate != self.settings.symbol_rate
-            || new.gold_code != self.settings.gold_code;
+            || new.gold_code != self.settings.gold_code
+            || new.psk_modulation != self.settings.psk_modulation;
         if rebuild_ddc {
             self.ddc = Ddc::new(
                 self.in_rate,
@@ -406,11 +445,19 @@ impl Worker {
                 }
             }
         }
-        if let Decoder::Record {
-            writer: Some(w), ..
-        } = std::mem::replace(&mut self.decoder, Decoder::Spectrum)
-        {
-            let _ = w.finish();
+        match std::mem::replace(&mut self.decoder, Decoder::Spectrum) {
+            Decoder::Record {
+                writer: Some(w), ..
+            } => {
+                let _ = w.finish();
+            }
+            Decoder::Psk {
+                writer: Some(mut w),
+                ..
+            } => {
+                let _ = w.flush();
+            }
+            _ => {}
         }
     }
 
@@ -444,9 +491,9 @@ impl Worker {
                 if buf.len() >= *target {
                     let id = identify_in(buf, out_rate, Some(self.settings.bandwidth_hz));
                     let is_s2 = matches!(id.verdict, Verdict::DvbS2(_));
-                    let needed = id.symbol_rate.map(|rs| three_frames(out_rate, rs));
+                    let needed = id.symbol_rate.map(|rs| enough_frames(out_rate, rs));
                     match needed {
-                        // Not DVB-S2, but the listen was too short to see three
+                        // Not DVB-S2, but the listen was too short to see two
                         // frames at this symbol rate: say so, and listen longer
                         // straight away.
                         Some(n) if !is_s2 && buf.len() < n => {
@@ -477,14 +524,19 @@ impl Worker {
                 }
                 None => {
                     buf.extend_from_slice(&self.bb);
-                    if buf.len() >= gather_target(out_rate) {
+                    if buf.len() >= first_look(out_rate) {
                         let id = identify_in(buf, out_rate, Some(self.settings.bandwidth_hz));
                         let rs = self.settings.symbol_rate.or(id.symbol_rate);
                         let alpha = id.roll_off.map_or(0.35, |r| r.as_f64());
                         if let Some(rs) = rs.filter(|&r| out_rate / r >= 2.0) {
                             // Start demodulating, from the gathered signal on.
-                            let mut d =
-                                Box::new(Demod::new(out_rate, rs, alpha, self.settings.gold_code));
+                            let mut d = Demod::new(out_rate, rs, alpha, self.settings.gold_code);
+                            // Identify's offset is averaged over every header
+                            // it saw: the best seed for the carrier loop.
+                            if let Some(f) = id.carrier_offset_hz {
+                                d = d.with_carrier_offset(f / rs);
+                            }
+                            let mut d = Box::new(d);
                             // The carrier may sit off the VFO centre; the
                             // demodulator expects it at DC. Shift what was
                             // gathered, and retune the DDC onto the carrier so
@@ -495,6 +547,64 @@ impl Worker {
                                 .set_offset(self.settings.offset_hz + id.center_offset_hz);
                             self.frames.clear();
                             d.process(&shifted, &mut self.frames);
+                            *demod = Some(d);
+                        } else {
+                            buf.clear();
+                        }
+                        self.identification = Some(id);
+                    }
+                }
+            },
+            Decoder::Psk {
+                buf,
+                demod,
+                writer,
+                path,
+                written,
+            } => match demod {
+                Some(d) => {
+                    self.syms.clear();
+                    d.process(&self.bb, &mut self.syms);
+                    write_symbols(writer, written, &self.syms, &mut self.sym_bytes);
+                }
+                None => {
+                    buf.extend_from_slice(&self.bb);
+                    if buf.len() >= first_look(out_rate) {
+                        let id = identify_in(buf, out_rate, Some(self.settings.bandwidth_hz));
+                        let rs = self.settings.symbol_rate.or(id.symbol_rate);
+                        let alpha = id.roll_off.map_or(0.35, |r| r.as_f64());
+                        let usable = !matches!(id.verdict, Verdict::NoSignal);
+                        if let Some(rs) = rs.filter(|&r| usable && out_rate / r >= 2.0) {
+                            let modulation = self
+                                .settings
+                                .psk_modulation
+                                .or(id.constellation.map(|c| c.modulation()))
+                                .unwrap_or(decdvb_core::Modulation::Qpsk);
+                            // Identify's residual offset seeds the carrier loop.
+                            let seed = id.carrier_offset_hz.unwrap_or(0.0) / rs;
+                            let mut d =
+                                Box::new(PskDemod::new(out_rate, rs, alpha, modulation, seed));
+                            // Centre the carrier, as for DVB-S2 above.
+                            let mut shifted = std::mem::take(buf);
+                            shift(&mut shifted, out_rate, id.center_offset_hz);
+                            self.ddc
+                                .set_offset(self.settings.offset_hz + id.center_offset_hz);
+
+                            let p = self.settings.record_dir.join(format!(
+                                "decdvb-{}-{:+.0}Hz-{:.0}Bd-{}-{}.bin",
+                                self.settings.name.replace(' ', "_"),
+                                self.settings.offset_hz + id.center_offset_hz,
+                                rs,
+                                d.modulation().name().replace('/', ""),
+                                unix_stamp()
+                            ));
+                            let _ = std::fs::create_dir_all(&self.settings.record_dir);
+                            *writer = File::create(&p).ok().map(BufWriter::new);
+                            *path = Some(p);
+
+                            self.syms.clear();
+                            d.process(&shifted, &mut self.syms);
+                            write_symbols(writer, written, &self.syms, &mut self.sym_bytes);
                             *demod = Some(d);
                         } else {
                             buf.clear();
@@ -537,6 +647,7 @@ impl Worker {
         st.progress = 0.0;
         st.lock = None;
         st.recording = None;
+        st.carrier = None;
 
         match &self.decoder {
             Decoder::Identify {
@@ -556,9 +667,19 @@ impl Worker {
                     None => "listening…".into(),
                 };
                 st.symbol_rate = self.identification.as_ref().and_then(|i| i.symbol_rate);
-                if new_samples > 0 {
-                    let stride = (self.bb.len() / 2000).max(1);
-                    st.scatter = self.bb.iter().step_by(stride).copied().collect();
+                // The carrier-locked symbols of the last identification; raw
+                // baseband only until there is one.
+                match self
+                    .identification
+                    .as_ref()
+                    .filter(|i| !i.symbols.is_empty())
+                {
+                    Some(id) => st.scatter = id.symbols.clone(),
+                    None if new_samples > 0 => {
+                        let stride = (self.bb.len() / 2000).max(1);
+                        st.scatter = self.bb.iter().step_by(stride).copied().collect();
+                    }
+                    None => {}
                 }
             }
             Decoder::Spectrum => {
@@ -582,7 +703,7 @@ impl Worker {
             }
             Decoder::Dvbs2 { buf, demod } => match demod {
                 None => {
-                    st.progress = buf.len() as f32 / gather_target(out_rate) as f32;
+                    st.progress = buf.len() as f32 / first_look(out_rate) as f32;
                     st.message = match &self.identification {
                         Some(id) if matches!(id.verdict, Verdict::NoSignal) => {
                             "no signal in this VFO".into()
@@ -596,13 +717,22 @@ impl Worker {
                     st.frames = d.frames();
                     st.lock_losses = d.losses();
                     st.symbol_rate = Some(d.symbol_rate());
-                    st.scatter = d.recent_symbols(2000).to_vec();
+                    st.scatter = d.recent_symbols(2000);
+                    if let (true, Some(m)) = (d.carrier_running(), d.modulation()) {
+                        st.carrier = Some(CarrierState {
+                            locked: d.carrier_locked(),
+                            mer_db: d.mer_db(),
+                            offset_hz: d.carrier_offset_hz(),
+                            modulation: m,
+                        });
+                    }
                     st.message = match d.lock_state() {
                         LockState::Searching => "searching for PLHEADERs".into(),
                         LockState::Found => "found a PLHEADER, confirming".into(),
                         LockState::Locked => format!(
-                            "locked, {} frames — FEC and {} output arrive in M2–M4",
+                            "locked, {} frames, MER {:.1} dB — FEC and {} output arrive in M2–M4",
                             d.frames(),
+                            d.mer_db(),
                             if self.settings.decoder == DecoderKind::Dvbs2Ts {
                                 "TS"
                             } else {
@@ -612,7 +742,75 @@ impl Worker {
                     };
                 }
             },
+            Decoder::Psk {
+                buf,
+                demod,
+                writer,
+                path,
+                written,
+            } => match demod {
+                None => {
+                    st.progress = buf.len() as f32 / first_look(out_rate) as f32;
+                    st.message = match &self.identification {
+                        Some(id) if matches!(id.verdict, Verdict::NoSignal) => {
+                            "no signal in this VFO".into()
+                        }
+                        Some(id) => format!("no symbol rate yet — {}", id.summary()),
+                        None => "acquiring: finding the symbol rate…".into(),
+                    };
+                }
+                Some(d) => {
+                    st.symbol_rate = Some(d.symbol_rate());
+                    st.scatter = d.recent();
+                    st.carrier = Some(CarrierState {
+                        locked: d.locked(),
+                        mer_db: d.mer_db(),
+                        offset_hz: d.carrier_offset_hz(),
+                        modulation: d.modulation(),
+                    });
+                    if let Some(p) = path {
+                        st.recording = Some((p.clone(), *written));
+                    }
+                    let lock = if d.locked() { "locked" } else { "not locked" };
+                    st.message = match (writer.is_some(), path) {
+                        (false, Some(p)) => format!("{lock} — cannot write {}", p.display()),
+                        _ => format!(
+                            "{} {lock}, MER {:.1} dB — {} symbols written",
+                            d.modulation().name(),
+                            d.mer_db(),
+                            written
+                        ),
+                    };
+                }
+            },
         }
+    }
+}
+
+/// Seconds since the Unix epoch, for file names.
+fn unix_stamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Append hard decisions to the symbol file, one byte per symbol: the
+/// symbol's bit label under the DVB-S2 mapping (EN 302 307-1 §5.4; BPSK 0 ->
+/// +1). A write error closes the file rather than retrying every block.
+fn write_symbols(
+    writer: &mut Option<BufWriter<File>>,
+    written: &mut u64,
+    syms: &[(u8, Iq)],
+    scratch: &mut Vec<u8>,
+) {
+    let Some(w) = writer else { return };
+    scratch.clear();
+    scratch.extend(syms.iter().map(|&(i, _)| i));
+    if w.write_all(scratch).is_ok() {
+        *written += syms.len() as u64;
+    } else {
+        *writer = None;
     }
 }
 
@@ -625,5 +823,145 @@ fn shift(x: &mut [Iq], rate: f64, freq_hz: f64) {
     for (n, s) in x.iter_mut().enumerate() {
         let ph = w * n as f64;
         *s *= Iq::new(ph.cos() as f32, ph.sin() as f32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use decdvb_fec::Constellation;
+    use decdvb_mod::Shaper;
+
+    /// Drive a worker the way `run` does, without the thread.
+    fn feed(w: &mut Worker, x: &[Iq], block: usize) {
+        for c in x.chunks(block) {
+            w.bb.clear();
+            w.ddc.process(c, &mut w.bb);
+            let n = w.bb.len();
+            w.decode();
+            w.publish(n);
+        }
+    }
+
+    /// A carrier of `cst` symbols at `rs`, `sps` samples per symbol (the band
+    /// is `rs * sps` wide), `f_hz` off the band centre, with a random-walk
+    /// phase noise of `walk` rad per symbol (rms) and a little white noise.
+    fn carrier(
+        cst: &Constellation,
+        n_sym: usize,
+        sps: usize,
+        rs: f64,
+        f_hz: f64,
+        walk: f64,
+        seed: u64,
+    ) -> Vec<Iq> {
+        let mut s = seed | 1;
+        let mut uniform = move || {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            (s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let m = cst.points.len();
+        let syms: Vec<Iq> = (0..n_sym)
+            .map(|_| cst.map((uniform() * m as f64) as usize % m))
+            .collect();
+        let mut sh = Shaper::new(sps, 0.25, 16);
+        let mut x = Vec::new();
+        sh.process(&syms, &mut x);
+        let w = std::f64::consts::TAU * f_hz / (rs * sps as f64);
+        let mut drift = 0.0;
+        for (n, v) in x.iter_mut().enumerate() {
+            if n % sps == 0 {
+                drift += walk * 12f64.sqrt() * (uniform() - 0.5);
+            }
+            let ph = w * n as f64 + drift;
+            let noise = Iq::new(uniform() as f32 - 0.5, uniform() as f32 - 0.5) * 0.02;
+            *v = *v * Iq::new(ph.cos() as f32, ph.sin() as f32) + noise;
+        }
+        x
+    }
+
+    /// Run a generic PSK VFO over `x`; return its status and output folder.
+    fn psk_vfo(
+        rate: f64,
+        x: &[Iq],
+        offset_hz: f64,
+        bandwidth_hz: f64,
+        tag: &str,
+    ) -> (VfoStatus, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("decdvb-{tag}-{}", std::process::id()));
+        let mut settings =
+            VfoSettings::new("PSK test", offset_hz, bandwidth_hz, DecoderKind::PskSymbols);
+        settings.record_dir = dir.clone();
+        let status = Arc::new(Mutex::new(VfoStatus::default()));
+        let mut wk = Worker::new(rate, settings, status.clone(), Arc::new(AtomicU64::new(0)));
+        feed(&mut wk, x, 65_536);
+        drop(wk); // flushes the file
+        let st = status.lock().unwrap().clone();
+        (st, dir)
+    }
+
+    #[test]
+    fn psk_vfo_locks_and_writes_one_byte_per_symbol() {
+        // 8PSK at 62.5 kBd, 40 kHz off the band centre plus 310 Hz the VFO is
+        // not told about, in a 500 kS/s band.
+        let rs = 62_500.0;
+        let x = carrier(&Constellation::psk8(), 200_000, 8, rs, 40_310.0, 0.0, 7);
+        let (st, dir) = psk_vfo(500_000.0, &x, 38_000.0, 110_000.0, "psk-vfo");
+
+        let c = st.carrier.expect("demodulator running");
+        assert_eq!(
+            c.modulation,
+            decdvb_core::Modulation::Psk8,
+            "{}",
+            st.message
+        );
+        assert!(c.locked, "{}", st.message);
+        assert!(c.mer_db > 20.0, "{}", st.message);
+        let tracked = st.symbol_rate.unwrap();
+        assert!((tracked - rs).abs() < rs * 1e-3, "symbol rate {tracked}");
+        let (path, written) = st.recording.expect("symbol file");
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(written > 100_000, "only {written} symbols");
+        assert_eq!(bytes.len() as u64, written);
+        assert!(bytes.iter().all(|&b| b < 8));
+        assert!(path.to_string_lossy().ends_with(".bin"));
+    }
+
+    #[test]
+    fn psk_vfo_locks_a_10_kbaud_carrier_with_lnb_drift() {
+        // A narrow Ku-band SCPC carrier: QPSK at 10 kBd, 150 Hz from where the
+        // VFO was dropped (LNB error), with phase noise, in a 250 kS/s band.
+        let rs = 10_000.0;
+        let x = carrier(&Constellation::qpsk(), 50_000, 25, rs, 31_150.0, 0.01, 9);
+        let (st, dir) = psk_vfo(250_000.0, &x, 31_000.0, 20_000.0, "psk-narrow");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let Some(c) = st.carrier else {
+            panic!(
+                "not demodulating: {} (rate {:.0}, progress {}, {} samples in)",
+                st.message,
+                st.out_rate,
+                st.progress,
+                x.len()
+            )
+        };
+        assert_eq!(
+            c.modulation,
+            decdvb_core::Modulation::Qpsk,
+            "{}",
+            st.message
+        );
+        assert!(c.locked, "{}", st.message);
+        assert!(c.mer_db > 15.0, "{}", st.message);
+        let tracked = st.symbol_rate.unwrap();
+        assert!((tracked - rs).abs() < rs * 2e-3, "symbol rate {tracked}");
+        assert!(
+            st.recording.is_some_and(|(_, n)| n > 10_000),
+            "{}",
+            st.message
+        );
     }
 }

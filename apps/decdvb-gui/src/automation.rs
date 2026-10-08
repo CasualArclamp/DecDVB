@@ -24,6 +24,8 @@ pub struct Options {
     pub rate_msps: Option<f64>,
     /// LNB LO for the axis, MHz.
     pub lo_mhz: Option<f64>,
+    /// Decoder for claimed carriers (default Identify).
+    pub decoder: Option<decdvb_engine::DecoderKind>,
 }
 
 impl Options {
@@ -45,6 +47,14 @@ impl Options {
                     );
                 }
                 Some("--claim-carriers") => o.claim_carriers = true,
+                Some("--decoder") => {
+                    let v = args.next().ok_or("--decoder needs a name")?;
+                    let v = v.to_str().unwrap_or_default().to_ascii_lowercase();
+                    o.decoder = Some(
+                        decoder_by_name(&v)
+                            .ok_or("--decoder takes id, ip, ts, psk, rec or spec")?,
+                    );
+                }
                 Some("--select") => {
                     let v = args.next().ok_or("--select needs a VFO number")?;
                     o.select = Some(
@@ -73,6 +83,19 @@ impl Options {
         }
         Ok(o)
     }
+}
+
+fn decoder_by_name(name: &str) -> Option<decdvb_engine::DecoderKind> {
+    use decdvb_engine::DecoderKind::*;
+    Some(match name {
+        "id" | "identify" => Identify,
+        "ip" | "gse" => Dvbs2Ip,
+        "ts" => Dvbs2Ts,
+        "psk" => PskSymbols,
+        "rec" | "iq" => IqRecord,
+        "spec" | "spectrum" => Spectrum,
+        _ => return None,
+    })
 }
 
 /// Drives an unattended run.

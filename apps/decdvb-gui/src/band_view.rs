@@ -71,6 +71,14 @@ enum Drag {
     },
 }
 
+/// A delete cross, drawn rather than typed: egui's fonts have no ✕.
+pub fn paint_x(painter: &egui::Painter, center: Pos2, half: f32, color: Color32) {
+    let stroke = Stroke::new(1.6, color);
+    let (a, b) = (vec2(half, half), vec2(half, -half));
+    painter.line_segment([center - a, center + a], stroke);
+    painter.line_segment([center - b, center + b], stroke);
+}
+
 /// Distinct colours for VFOs, by id.
 pub fn vfo_color(id: VfoId) -> Color32 {
     const C: [Color32; 8] = [
@@ -128,6 +136,14 @@ pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
             }
             Some(LockState::Found) => "found".into(),
             Some(LockState::Searching) => "search".into(),
+            None => format!("acq {:.0} %", st.progress * 100.0),
+        },
+        DecoderKind::PskSymbols => match &st.carrier {
+            Some(c) => {
+                let lock = if c.locked { "LOCK" } else { "no lock" };
+                let rs = st.symbol_rate.map(format::rate).unwrap_or_default();
+                format!("{} {lock} {rs}", c.modulation.name())
+            }
             None => format!("acq {:.0} %", st.progress * 100.0),
         },
         DecoderKind::IqRecord => st
@@ -336,6 +352,8 @@ impl BandView {
             None
         };
 
+        // The ✕ on each VFO's label, for the click handler below.
+        let mut close_boxes: Vec<(VfoId, Rect)> = Vec::new();
         for v in inp.vfos {
             let s = &v.settings;
             let x0 = x_of(s.offset_hz - s.bandwidth_hz / 2.0);
@@ -382,7 +400,8 @@ impl BandView {
             );
             let font = FontId::proportional(11.5);
             let galley = painter.layout_no_wrap(label, font, Color32::BLACK);
-            let lw = galley.size().x + 10.0;
+            // Room for a ✕ at the right end that deletes the VFO.
+            let lw = galley.size().x + 10.0 + 16.0;
             let lx = xc.clamp(rect.left() + lw / 2.0, rect.right() - lw / 2.0);
             let lr = Rect::from_center_size(pos2(lx, spec.top() + 11.0), vec2(lw, 17.0));
             painter.rect_filled(
@@ -395,6 +414,18 @@ impl BandView {
                 galley,
                 Color32::BLACK,
             );
+            let xr = Rect::from_min_max(pos2(lr.right() - 16.0, lr.top()), lr.right_bottom());
+            let over = pointer.is_some_and(|p| xr.contains(p));
+            if over {
+                painter.rect_filled(xr, CornerRadius::same(4), Color32::from_rgb(170, 50, 50));
+            }
+            paint_x(
+                &painter,
+                xr.center(),
+                3.5,
+                if over { Color32::WHITE } else { Color32::BLACK },
+            );
+            close_boxes.push((v.id, xr));
         }
 
         // ---- detected carriers: brackets near the top of the spectrum
@@ -420,17 +451,20 @@ impl BandView {
             if hovered {
                 carrier_hit = Some(i);
             }
-            // A narrow line (CW, spur, comb tooth) is a small tick: shown, but
-            // not offered as a carrier to claim.
+            // A narrow line is a small tick. It may be a CW or a spur — or a
+            // slow carrier (10 kS/s is ~5 bins at 10 MS/s / 4096), so it can
+            // still be claimed; Identify then says which.
             if c.narrow {
                 let x = x_of(c.center_hz);
+                let col = if hovered {
+                    Color32::WHITE
+                } else {
+                    Color32::from_rgba_unmultiplied(200, 200, 200, 110)
+                };
                 painter.line_segment(
-                    [pos2(x, carrier_y - 3.0), pos2(x, carrier_y + 3.0)],
-                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(200, 200, 200, 110)),
+                    [pos2(x, carrier_y - 4.0), pos2(x, carrier_y + 4.0)],
+                    Stroke::new(if hovered { 2.0 } else { 1.0 }, col),
                 );
-                if carrier_hit == Some(i) {
-                    carrier_hit = None;
-                }
                 continue;
             }
             let taken = covered(c.center_hz);
@@ -506,13 +540,22 @@ impl BandView {
             }
             if let Some(i) = carrier_hit {
                 let c = &inp.front.carriers[i];
-                text = format!(
-                    "click: {} on {} carrier, ~{}, {:.0} dB S/N",
-                    inp.new_decoder.short(),
-                    format::freq(inp.rf_center + c.center_hz),
-                    format::rate(c.symbol_rate_hz),
-                    c.snr_db
-                );
+                text = if c.narrow {
+                    format!(
+                        "click: {} on narrow line at {} ({:.0} dB) — a CW, a spur, or a slow carrier",
+                        inp.new_decoder.short(),
+                        format::freq(inp.rf_center + c.center_hz),
+                        c.snr_db
+                    )
+                } else {
+                    format!(
+                        "click: {} on {} carrier, ~{}, {:.0} dB S/N",
+                        inp.new_decoder.short(),
+                        format::freq(inp.rf_center + c.center_hz),
+                        format::rate(c.symbol_rate_hz),
+                        c.snr_db
+                    )
+                };
             }
             let pos = pos2((p.x + 10.0).min(rect.right() - 4.0), spec.bottom() - 4.0);
             painter.text(
@@ -528,7 +571,13 @@ impl BandView {
         if !have_signal {
             return actions;
         }
-        let min_w = (self.span / inp.front.fft_size.max(1) as f64 * 24.0).max(1.0);
+        let bin_hz = self.span / inp.front.fft_size.max(1) as f64;
+        // Zoom stops at 32 bins across the view: past that the waterfall is
+        // all blocks. VFOs may be far narrower — two bins, and never under
+        // 500 Hz — so a 10 kS/s carrier gets a VFO that fits it rather than
+        // a forced 60 kHz (the old limit was 24 bins for both).
+        let min_view = (bin_hz * 32.0).max(1.0);
+        let min_vfo = (bin_hz * 2.0).max(500.0);
 
         // Zoom about the cursor.
         if let Some(p) = resp.hover_pos() {
@@ -536,7 +585,7 @@ impl BandView {
             if scroll != 0.0 {
                 let f = (-(scroll as f64) * 0.002).exp();
                 let c = hz_of(p.x);
-                let new_w = ((hi - lo) * f).clamp(min_w, self.span);
+                let new_w = ((hi - lo) * f).clamp(min_view, self.span);
                 let frac = (c - lo) / (hi - lo);
                 self.lo = c - frac * new_w;
                 self.hi = self.lo + new_w;
@@ -597,7 +646,7 @@ impl BandView {
                 Drag::Resize { id } => {
                     if let Some(v) = find(id) {
                         let mut s = v.settings.clone();
-                        s.bandwidth_hz = (2.0 * (h - s.offset_hz).abs()).clamp(min_w, self.span);
+                        s.bandwidth_hz = (2.0 * (h - s.offset_hz).abs()).clamp(min_vfo, self.span);
                         actions.push(Action::Update(id, s));
                     }
                     ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
@@ -614,7 +663,7 @@ impl BandView {
                     let mut s = VfoSettings::new(
                         inp.next_name.clone(),
                         (a + b) / 2.0,
-                        (b - a).max(min_w),
+                        (b - a).max(min_vfo),
                         inp.new_decoder,
                     );
                     s.record_dir = default_record_dir();
@@ -624,11 +673,18 @@ impl BandView {
             self.drag = Drag::None;
         }
 
+        let close_hit = |p: Pos2| {
+            close_boxes
+                .iter()
+                .find(|(_, r)| r.contains(p))
+                .map(|(id, _)| *id)
+        };
+
         // Hover cursor hints.
         if matches!(self.drag, Drag::None)
             && let Some(p) = resp.hover_pos()
         {
-            if carrier_hit.is_some() {
+            if carrier_hit.is_some() || close_hit(p).is_some() {
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
             } else {
                 match hit_vfo(p) {
@@ -642,12 +698,21 @@ impl BandView {
         if resp.clicked()
             && let Some(p) = resp.interact_pointer_pos()
         {
-            if let Some(i) = carrier_hit {
+            if let Some(id) = close_hit(p) {
+                // The ✕ on a VFO's label.
+                actions.push(Action::Remove(id));
+            } else if let Some(i) = carrier_hit {
                 let c = inp.front.carriers[i];
+                // A narrow line gets room for a slow carrier and its drift.
+                let bw = if c.narrow {
+                    c.suggested_vfo_bandwidth().max(bin_hz * 8.0)
+                } else {
+                    c.suggested_vfo_bandwidth()
+                };
                 let mut s = VfoSettings::new(
                     inp.next_name.clone(),
                     c.center_hz,
-                    c.suggested_vfo_bandwidth(),
+                    bw.max(min_vfo),
                     inp.new_decoder,
                 );
                 s.record_dir = default_record_dir();
@@ -669,7 +734,7 @@ impl BandView {
             && hit_vfo(p).is_none()
             && carrier_hit.is_none()
         {
-            let bw = ((hi - lo) / 25.0).max(min_w);
+            let bw = ((hi - lo) / 25.0).max(min_vfo);
             let mut s = VfoSettings::new(inp.next_name.clone(), hz_of(p.x), bw, inp.new_decoder);
             s.record_dir = default_record_dir();
             actions.push(Action::Create(s));

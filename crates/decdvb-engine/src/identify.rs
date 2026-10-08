@@ -53,6 +53,7 @@ pub enum RateSource {
 /// Constellation estimate from the recovered symbols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstellationGuess {
+    Bpsk,
     Qpsk,
     Psk8,
     Apsk16,
@@ -68,6 +69,7 @@ pub enum ConstellationGuess {
 impl ConstellationGuess {
     pub fn label(self) -> String {
         match self {
+            ConstellationGuess::Bpsk => "BPSK".into(),
             ConstellationGuess::Qpsk => "QPSK".into(),
             ConstellationGuess::Psk8 => "8PSK".into(),
             ConstellationGuess::Apsk16 => "16APSK".into(),
@@ -75,6 +77,19 @@ impl ConstellationGuess {
             ConstellationGuess::PskUnclear => "PSK (order unclear)".into(),
             ConstellationGuess::MultiRing(n) => format!("{n}-ring amplitude/phase"),
             ConstellationGuess::Unclear => "unclear".into(),
+        }
+    }
+
+    /// The modulation to steer a carrier loop with (QPSK when unsure: its
+    /// decisions still track the 4-fold structure most signals share).
+    pub fn modulation(self) -> decdvb_core::Modulation {
+        use decdvb_core::Modulation;
+        match self {
+            ConstellationGuess::Bpsk => Modulation::Bpsk,
+            ConstellationGuess::Psk8 => Modulation::Psk8,
+            ConstellationGuess::Apsk16 => Modulation::Apsk16,
+            ConstellationGuess::Apsk32 => Modulation::Apsk32,
+            _ => Modulation::Qpsk,
         }
     }
 }
@@ -92,6 +107,10 @@ pub struct Dvbs2Info {
     pub with_pilots: usize,
     pub short_frames: usize,
     pub dummy_frames: usize,
+    /// Confirmed frames as (index of the header's last symbol in the symbol
+    /// stream analysed, PLS code) — what carrier recovery needs to know which
+    /// constellation each stretch of payload uses.
+    pub frames: Vec<(usize, u8)>,
 }
 
 impl Dvbs2Info {
@@ -134,8 +153,17 @@ pub struct Identification {
     pub symbol_rate_source: Option<RateSource>,
     pub roll_off: Option<RollOff>,
     pub constellation: Option<ConstellationGuess>,
-    /// Residual carrier offset after centring, from the 4th/8th-power line, Hz.
+    /// Residual carrier offset after centring, Hz: from the PLHEADERs for
+    /// DVB-S2, else from the 2nd/4th/8th-power line.
     pub carrier_offset_hz: Option<f64>,
+    /// Carrier-locked symbols for the constellation display (the last few
+    /// thousand).
+    pub symbols: Vec<Iq>,
+    /// Modulation error ratio of the locked symbols, dB.
+    pub mer_db: Option<f32>,
+    /// Lock coherence, 0..1 (see `decdvb_dsp::lock_coherence`).
+    pub coherence: Option<f32>,
+    pub carrier_locked: bool,
 }
 
 impl Identification {
@@ -150,6 +178,10 @@ impl Identification {
             roll_off: None,
             constellation: None,
             carrier_offset_hz: None,
+            symbols: Vec::new(),
+            mer_db: None,
+            coherence: None,
+            carrier_locked: false,
         }
     }
 
@@ -420,6 +452,28 @@ pub fn classify_constellation(sym: &[Iq], rs: f64) -> (ConstellationGuess, Optio
         n.iter().map(|&x| x as f32 / t.max(1) as f32).collect()
     };
 
+    // APSK's inner ring is 4 points at π/4 + kπ/2, so the 4th power of the
+    // inner-ring symbols alone has a clean line at 4× the carrier offset; the
+    // outer rings (12- and 16-fold) would only smear it.
+    let half = rs / 2.0;
+    let inner_offset = |edge: f32| -> Option<f64> {
+        let p4: Vec<Iq> = sym
+            .iter()
+            .zip(&amp)
+            .map(|(s, &a)| {
+                if a < edge {
+                    let u = s / s.norm().max(1e-12);
+                    u * u * u * u
+                } else {
+                    Iq::new(0.0, 0.0)
+                }
+            })
+            .collect();
+        strongest_line(&p4, rs, -half, half)
+            .filter(|&(_, strength)| strength > 12.0)
+            .map(|(f, _)| f / 4.0)
+    };
+
     // A ring structure is real when adding it cuts the spread a lot AND the
     // rings are populated in the standard's proportions.
     let near = |a: f32, b: f32, tol: f32| (a - b).abs() < tol;
@@ -432,13 +486,19 @@ pub fn classify_constellation(sym: &[Iq], rs: f64) -> (ConstellationGuess, Optio
             && near(f3[2], 0.5, 0.08)
             && c3[2] / c3[0] > 3.0
         {
-            return (ConstellationGuess::Apsk32, None);
+            return (
+                ConstellationGuess::Apsk32,
+                inner_offset((c3[0] + c3[1]) / 2.0),
+            );
         }
         let f2 = frac(&n2);
         let gain2 = sse1 / sse2.max(1e-9);
         if gain2 > 3.0 && near(f2[0], 0.25, 0.07) && near(f2[1], 0.75, 0.07) && c2[1] / c2[0] > 2.0
         {
-            return (ConstellationGuess::Apsk16, None);
+            return (
+                ConstellationGuess::Apsk16,
+                inner_offset((c2[0] + c2[1]) / 2.0),
+            );
         }
         if gain2 > 3.0 {
             let rings = if gain3 > 2.5 { 3 } else { 2 };
@@ -446,14 +506,17 @@ pub fn classify_constellation(sym: &[Iq], rs: f64) -> (ConstellationGuess, Optio
         }
     }
 
-    // One ring: QPSK leaves a line in s⁴, 8PSK only in s⁸. The line sits at
-    // 4× (or 8×) the residual carrier offset, which this also measures.
-    let p4: Vec<Iq> = sym
-        .iter()
-        .map(|s| (s / rms) * (s / rms) * (s / rms) * (s / rms))
-        .collect();
+    // One ring: BPSK leaves a line in s², QPSK in s⁴ (but not s²), 8PSK only
+    // in s⁸. The line sits at 2× (4×, 8×) the residual carrier offset, which
+    // this also measures. BPSK first: it has an s⁴ line too.
+    let p2: Vec<Iq> = sym.iter().map(|s| (s / rms) * (s / rms)).collect();
+    let p4: Vec<Iq> = p2.iter().map(|s| s * s).collect();
     let p8: Vec<Iq> = p4.iter().map(|s| s * s).collect();
-    let half = rs / 2.0;
+    if let Some((f, s2)) = strongest_line(&p2, rs, -half, half)
+        && s2 > 20.0
+    {
+        return (ConstellationGuess::Bpsk, Some(f / 2.0));
+    }
     let l4 = strongest_line(&p4, rs, -half, half);
     let l8 = strongest_line(&p8, rs, -half, half);
     match (l4, l8) {
@@ -514,6 +577,7 @@ pub fn detect_dvbs2(sym: &[Iq]) -> Dvbs2Info {
             info.with_pilots += pls.has_pilots as usize;
             info.short_frames += pls.short_fecframe as usize;
             info.dummy_frames += pls.dummy_frame as usize;
+            info.frames.push((i, pls.plsc));
         }
     }
     info
@@ -529,6 +593,13 @@ pub fn identify(x: &[Iq], rate: f64) -> Identification {
 /// the VFO's width as drawn. Outside it, the DDC's stopband sits tens of dB
 /// below the real noise and would drag the floor estimate down (counting
 /// in-band noise as signal), so those bins are replaced by the in-band floor.
+///
+/// That floor is the in-band **3rd** percentile. It was the 20th, which sat on
+/// the carrier itself whenever the carrier filled most of the VFO, and the
+/// carrier then read as "no signal" (seen live on a 588 kS/s Ku carrier in a
+/// VFO drawn tight round it). With ~1000 averaged segments per bin the noise
+/// bins scatter only ~0.15 dB, so a low percentile is the true floor whenever
+/// the VFO has any noise at its edges.
 pub fn identify_in(x: &[Iq], rate: f64, bandwidth: Option<f64>) -> Identification {
     // 1. Where is the energy?
     let mut spec = Spectrum::new(FFT_SIZE);
@@ -539,7 +610,7 @@ pub fn identify_in(x: &[Iq], rate: f64, bandwidth: Option<f64>) -> Identificatio
         let mut band: Vec<f32> = (0..n).filter(|&k| inside(k)).map(|k| db[k]).collect();
         if band.len() >= 16 {
             band.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let floor = band[band.len() / 5];
+            let floor = band[band.len() * 3 / 100];
             for (k, d) in db.iter_mut().enumerate() {
                 if !inside(k) {
                     *d = floor;
@@ -626,25 +697,123 @@ pub fn identify_in(x: &[Iq], rate: f64, bandwidth: Option<f64>) -> Identificatio
     // 5. Constellation (a guess unless DVB-S2 overrides it below).
     let (cst, cfo) = classify_constellation(&sym, rs);
     id.constellation = Some(cst);
-    id.carrier_offset_hz = cfo;
 
-    // 6. DVB-S2?
+    // 6. DVB-S2? One confirmation means two headers exactly one PLS-predicted
+    //    frame length apart; a chance correlation above threshold landing on
+    //    that grid to within ±2 symbols is vanishingly unlikely. Asking for
+    //    one rather than two halves the listen a slow carrier needs (a normal
+    //    QPSK frame lasts 3.3 s at 10 kS/s).
     let s2 = detect_dvbs2(&sym);
-    if s2.headers_confirmed >= 2 {
-        id.verdict = Verdict::DvbS2(s2);
-        return id;
-    }
+    let is_s2 = s2.headers_confirmed >= 1;
 
-    id.verdict = Verdict::NotDvbS2 {
-        hint: match cst {
-            ConstellationGuess::Qpsk => {
-                "QPSK, no DVB-S2 PLHEADER — possibly DVB-S (not verified)".into()
-            }
-            ConstellationGuess::Unclear => "modulated, no DVB-S2 PLHEADER".into(),
-            other => format!("{}, no DVB-S2 PLHEADER", other.label()),
-        },
+    // 7. Carrier lock, so the constellation shows points rather than a ring.
+    let lock = lock_carrier(&sym, cst, cfo.map(|hz| hz / rs), is_s2.then_some(&s2));
+    id.carrier_offset_hz = Some(lock.freq_cycles * rs);
+    let tail = lock.symbols.len().saturating_sub(DISPLAY_SYMBOLS);
+    id.symbols = lock.symbols[tail..].to_vec();
+    id.mer_db = Some(lock.mer_db);
+    id.coherence = Some(lock.coherence);
+    id.carrier_locked = lock.coherence > decdvb_dsp::LOCK_COHERENCE;
+
+    id.verdict = if is_s2 {
+        Verdict::DvbS2(s2)
+    } else {
+        Verdict::NotDvbS2 {
+            hint: match cst {
+                ConstellationGuess::Qpsk => {
+                    "QPSK, no DVB-S2 PLHEADER — possibly DVB-S (not verified)".into()
+                }
+                ConstellationGuess::Unclear => "modulated, no DVB-S2 PLHEADER".into(),
+                other => format!("{}, no DVB-S2 PLHEADER", other.label()),
+            },
+        }
     };
     id
+}
+
+/// Locked symbols kept for the constellation display.
+const DISPLAY_SYMBOLS: usize = 3000;
+
+/// What carrier recovery produced.
+pub struct CarrierLock {
+    /// All symbols, de-rotated by the loop.
+    pub symbols: Vec<Iq>,
+    /// Final frequency estimate, cycles per symbol.
+    pub freq_cycles: f64,
+    pub mer_db: f32,
+    pub coherence: f32,
+}
+
+/// Lock the carrier on timing-recovered symbols.
+///
+/// Coarse frequency first: for DVB-S2 from the SOF of every confirmed header
+/// (coherently summed, so it is good even at low SNR and whatever the payload
+/// MODCODs), otherwise from `coarse_cycles` (the power-line estimate). Then a
+/// decision-directed PLL, deciding each symbol against its own constellation:
+/// for DVB-S2 the MODCOD of the frame it belongs to — so an ACM carrier stays
+/// locked across QPSK, 8PSK and APSK frames — and QPSK for headers, pilots and
+/// anything outside a confirmed frame (pi/2-BPSK and pilot symbols sit on the
+/// QPSK diagonals). Quality is measured over the second half, after pull-in.
+pub fn lock_carrier(
+    sym: &[Iq],
+    guess: ConstellationGuess,
+    coarse_cycles: Option<f64>,
+    dvbs2: Option<&Dvbs2Info>,
+) -> CarrierLock {
+    use decdvb_fec::Constellation;
+
+    // Constellations in use, and which one each symbol is decided against.
+    let mut sets: Vec<Constellation> = vec![Constellation::qpsk()];
+    let mut which = vec![0u8; sym.len()];
+    let mut freq0 = coarse_cycles.unwrap_or(0.0);
+
+    match dvbs2 {
+        Some(s2) if !s2.frames.is_empty() => {
+            let mut index: BTreeMap<u8, u8> = BTreeMap::new();
+            let mut sof_sum = Iq::new(0.0, 0.0);
+            for &(hdr_end, plsc) in &s2.frames {
+                let pls = PlsInfo::parse(plsc);
+                // The SOF is the header's first 26 symbols.
+                let sof_start = hdr_end + 1 - decdvb_frame::PLHEADER_LEN;
+                sof_sum += decdvb_frame::sof_differential(&sym[sof_start..sof_start + SOF_LEN]);
+
+                let cst = decdvb_core::s2_modcod(pls.modcod, decdvb_core::FecFrame::Normal)
+                    .and_then(|mc| Constellation::for_modcod(mc.modulation, mc.rate));
+                let Some(cst) = cst else { continue };
+                let k = *index.entry(pls.modcod).or_insert_with(|| {
+                    sets.push(cst);
+                    (sets.len() - 1) as u8
+                });
+                let p0 = hdr_end + 1;
+                let p1 = (p0 + pls.payload_len as usize).min(sym.len());
+                which[p0..p1].fill(k);
+            }
+            if sof_sum.norm() > 0.0 {
+                freq0 = -(sof_sum.arg() as f64) / std::f64::consts::TAU;
+            }
+        }
+        _ => {
+            sets[0] = Constellation::generic(guess.modulation());
+        }
+    }
+
+    let mut pll = decdvb_dsp::CarrierPll::new(0.01, freq0);
+    let symbols: Vec<Iq> = sym
+        .iter()
+        .zip(&which)
+        .map(|(&s, &w)| pll.step(s, &sets[w as usize].points))
+        .collect();
+
+    let half = symbols.len() / 2;
+    let (mer_db, coherence) =
+        decdvb_dsp::quality(&symbols[half..], |i| &sets[which[half + i] as usize].points);
+
+    CarrierLock {
+        symbols,
+        freq_cycles: pll.freq_cycles(),
+        mer_db,
+        coherence,
+    }
 }
 
 // Keep the SOF length import meaningful for readers of `detect_dvbs2`'s slice
@@ -749,6 +918,157 @@ mod tests {
             "centre {}",
             id.center_offset_hz
         );
+    }
+
+    /// A generic (non-DVB) carrier: random points of `cst`, RRC-shaped at
+    /// `sps`, offset by `offset` cycles per symbol, at `noise` amplitude.
+    fn generic_signal(
+        cst: &decdvb_fec::Constellation,
+        n_sym: usize,
+        sps: usize,
+        offset: f64,
+        noise: f32,
+        seed: u64,
+    ) -> Vec<Iq> {
+        let mut nz = Noise(seed);
+        let m = cst.points.len();
+        let syms: Vec<Iq> = (0..n_sym)
+            .map(|_| cst.map((nz.uniform() * m as f64) as usize % m))
+            .collect();
+        let mut sh = Shaper::new(sps, 0.25, 16);
+        let mut x = Vec::new();
+        sh.process(&syms, &mut x);
+        x.iter()
+            .enumerate()
+            .map(|(n, &s)| {
+                let ph = std::f64::consts::TAU * offset * n as f64 / sps as f64 + 0.4;
+                s * Iq::new(ph.cos() as f32, ph.sin() as f32) + nz.gauss() * noise
+            })
+            .collect()
+    }
+
+    #[test]
+    fn locks_the_constellation_of_a_dvbs2_carrier() {
+        // 2 % of the symbol rate off; the SOF-based estimate and the PLL must
+        // turn the ring into four points.
+        let x = dvbs2_signal(
+            &[FrameSpec::new(4, false, true)],
+            150_000,
+            4,
+            0.20,
+            0.005,
+            14.0,
+            41,
+        );
+        let id = identify(&x, 4.0);
+        assert!(matches!(id.verdict, Verdict::DvbS2(_)), "{}", id.summary());
+        assert!(
+            id.carrier_locked,
+            "not locked: coherence {:?}",
+            id.coherence
+        );
+        assert!(id.mer_db.unwrap() > 10.0, "MER {:?}", id.mer_db);
+        assert!(!id.symbols.is_empty());
+    }
+
+    #[test]
+    fn locks_an_acm_carrier_across_its_modcods() {
+        let schedule = [
+            FrameSpec::new(4, false, true),
+            FrameSpec::new(13, false, true),
+            FrameSpec::new(18, true, true),
+        ];
+        let x = dvbs2_signal(&schedule, 220_000, 4, 0.25, -0.004, 18.0, 42);
+        let id = identify(&x, 4.0);
+        assert!(matches!(id.verdict, Verdict::DvbS2(_)), "{}", id.summary());
+        assert!(id.carrier_locked, "coherence {:?}", id.coherence);
+        assert!(id.mer_db.unwrap() > 10.0, "MER {:?}", id.mer_db);
+    }
+
+    #[test]
+    fn locks_generic_qpsk_bpsk_and_16apsk() {
+        use decdvb_fec::Constellation;
+        for (cst, want) in [
+            (Constellation::qpsk(), ConstellationGuess::Qpsk),
+            (Constellation::bpsk(), ConstellationGuess::Bpsk),
+            (Constellation::apsk16(2.75), ConstellationGuess::Apsk16),
+        ] {
+            // 1.5 % of the symbol rate off.
+            let x = generic_signal(&cst, 60_000, 4, 0.015, 0.06, 43);
+            let id = identify(&x, 4.0);
+            assert_eq!(id.constellation, Some(want), "{}", id.summary());
+            assert!(
+                id.carrier_locked,
+                "{want:?} not locked: coherence {:?}, MER {:?}",
+                id.coherence, id.mer_db
+            );
+            assert!(id.mer_db.unwrap() > 12.0, "{want:?}: MER {:?}", id.mer_db);
+        }
+    }
+
+    #[test]
+    fn carrier_filling_its_vfo_is_not_no_signal() {
+        // Regression (live, Ku band): a 588 kS/s carrier in a VFO drawn tight
+        // round it read "no signal", because the in-band floor estimate (the
+        // 20th percentile) sat on the carrier. Here the carrier occupies 1.2
+        // of a 1.3-wide VFO.
+        let x = dvbs2_signal(
+            &[FrameSpec::new(4, true, true)],
+            60_000,
+            10,
+            0.20,
+            0.0,
+            14.0,
+            21,
+        );
+        let mut ddc = decdvb_dsp::Ddc::new(10.0, 0.0, 1.3);
+        let mut bb = Vec::new();
+        ddc.process(&x, &mut bb);
+        let id = identify_in(&bb, ddc.out_rate(), Some(1.3));
+        assert!(
+            matches!(id.verdict, Verdict::DvbS2(_)),
+            "{:?} — {}",
+            id.verdict,
+            id.summary()
+        );
+        assert!(id.snr_db > 8.0, "S/N {}", id.snr_db);
+    }
+
+    #[test]
+    fn narrow_carrier_with_lnb_offset_and_phase_noise() {
+        // Shaped like a ~10 kS/s Ku carrier in a 58 kHz VFO: ~14 samples per
+        // symbol, a residual offset of 3 % of the symbol rate, and a random
+        // walk of phase as a cheap LNB adds. Short frames, as low-rate links
+        // tend to use.
+        let sps = 14;
+        let syms = PlFramer::new(0, 31).build_schedule(&[FrameSpec::new(4, true, true)], 30_000);
+        let mut sh = Shaper::new(sps, 0.35, 16);
+        let mut x = Vec::new();
+        sh.process(&syms, &mut x);
+        let mut nz = Noise(0xBEEF);
+        let mut walk = 0.0f64;
+        let rate = sps as f64; // symbol rate 1
+        let x: Vec<Iq> = x
+            .iter()
+            .enumerate()
+            .map(|(n, &s)| {
+                walk += 0.004 * nz.gauss().re as f64;
+                let ph = std::f64::consts::TAU * 0.03 * n as f64 / rate + walk;
+                s * Iq::new(ph.cos() as f32, ph.sin() as f32) + nz.gauss() * 0.15
+            })
+            .collect();
+        let id = identify_in(&x, rate, Some(5.9));
+        match &id.verdict {
+            Verdict::DvbS2(d) => assert!(d.modcods.contains_key(&4), "{d:?}"),
+            v => panic!("expected DVB-S2, got {v:?} — {}", id.summary()),
+        }
+        assert!(
+            id.carrier_locked,
+            "phase noise broke lock: {:?}",
+            id.coherence
+        );
+        let rs = id.symbol_rate.unwrap();
+        assert!((rs - 1.0).abs() < 0.01, "Rs {rs}");
     }
 
     #[test]

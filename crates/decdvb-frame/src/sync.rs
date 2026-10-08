@@ -42,6 +42,26 @@ const WINDOW: usize = SOF_LEN + PLSC_LEN - 1;
 /// Peak magnitude of the unnormalised metric with noiseless unit-power input.
 const TAPS: usize = SOF_CORR_LEN + PLSC_CORR_LEN;
 
+/// The SOF's differential correlation for 26 symbols starting at an SOF:
+/// `Σ x[n]·conj(x[n+1]) · conj(expected[n])` over its 25 differentials.
+///
+/// A carrier offset of `f0` cycles per symbol multiplies every differential by
+/// `exp(-j2πf0)`, so `-arg(result) / 2π` **is** the offset — unambiguous
+/// within ±0.5 cycles per symbol, independent of payload and MODCOD, and
+/// summable coherently over many headers for precision.
+pub fn sof_differential(sof: &[Iq]) -> Iq {
+    assert!(sof.len() >= SOF_LEN, "need the 26 SOF symbols");
+    let mut expected = [Iq::new(0.0, 0.0); SOF_LEN];
+    map_bpsk(SOF_BIG_ENDIAN, &mut expected, SOF_LEN);
+    let mut acc = Iq::new(0.0, 0.0);
+    for n in 0..SOF_CORR_LEN {
+        let d = sof[n] * sof[n + 1].conj();
+        let e = expected[n] * expected[n + 1].conj();
+        acc += d * e.conj();
+    }
+    acc
+}
+
 /// Differential correlator over the PLHEADER.
 ///
 /// Feed symbols one at a time with [`Self::push`]. The returned metric is
@@ -304,6 +324,23 @@ mod tests {
         assert_eq!(idx, offset + PLHEADER_LEN - 1);
         assert!(peak > 0.7, "peak {peak}");
         assert!(peak > 1.5 * runner, "peak {peak} vs runner-up {runner}");
+    }
+
+    #[test]
+    fn sof_differential_measures_the_frequency_offset() {
+        for &f in &[0.0f64, 0.004, -0.012, 0.21] {
+            let h = plheader(4, false, false);
+            let rotated: Vec<Iq> = h
+                .iter()
+                .enumerate()
+                .map(|(n, s)| {
+                    let th = std::f64::consts::TAU * f * n as f64 + 0.9;
+                    s * Iq::new(th.cos() as f32, th.sin() as f32)
+                })
+                .collect();
+            let est = -(sof_differential(&rotated).arg() as f64) / std::f64::consts::TAU;
+            assert!((est - f).abs() < 1e-5, "offset {f}: measured {est}");
+        }
     }
 
     #[test]

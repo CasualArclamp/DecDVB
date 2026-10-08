@@ -11,14 +11,26 @@
 //! because the correlation for every symbol is already computed — re-acquisition
 //! happens on the very next good header.
 //!
-//! Carrier recovery is not here yet (the remaining M1 item), so payload symbols
-//! still carry the residual frequency offset. Everything above needs none: the
-//! correlator and the PLS code are read differentially.
+//! **Carrier recovery** needs none of the above (the correlator and the PLS
+//! code are read differentially), so it runs over each frame as the frame is
+//! emitted, in stream order: data-aided over the PLHEADER and the pilot blocks
+//! (known symbols, so the absolute phase is resolved with no 90° ambiguity)
+//! and decision-directed over the data against the frame's own MODCOD
+//! constellation, so an ACM carrier stays locked as QPSK, 8PSK and APSK frames
+//! alternate. At (re)acquisition the loop is seeded from the two headers that
+//! confirmed the first frame: with their modulation removed they are a pure
+//! tone at the carrier offset.
 
-use decdvb_core::Iq;
-use decdvb_dsp::{Agc, Fir, SymbolSync, rrc_taps};
+use std::collections::{BTreeMap, VecDeque};
+use std::f64::consts::TAU;
+
+use decdvb_core::{FecFrame, Iq, Modulation, s2_modcod};
+use decdvb_dsp::{Agc, CarrierPll, Fir, LOCK_COHERENCE, SymbolSync, rrc_taps};
+use decdvb_fec::Constellation;
+use decdvb_frame::pi2bpsk::map_bpsk;
 use decdvb_frame::{
-    PLHEADER_LEN, PlHeaderCorrelator, PlScrambler, PlsInfo, PlscDecoder, PlscDemap,
+    PILOT_BLK_LEN, PLHEADER_LEN, PlHeaderCorrelator, PlScrambler, PlsInfo, PlscDecoder, PlscDemap,
+    PlscEncoder, SLOT_LEN, SLOTS_PER_PILOT_BLK, SOF_BIG_ENDIAN, SOF_LEN,
 };
 
 /// Correlation needed to start tracking a header from scratch.
@@ -30,12 +42,29 @@ const CONFIRM_THRESHOLD: f32 = 0.3;
 const TOLERANCE: usize = 2;
 /// Symbols either side a candidate must beat to count as a peak.
 const PEAK_HALF_WIDTH: usize = 3;
+/// Carrier loop noise bandwidth, normalised to the symbol rate.
+const CARRIER_BN: f64 = 0.01;
+/// Carrier-locked data symbols kept for display.
+const RECENT: usize = 3000;
+/// Pilots and dummy-frame payload: `(1 + j)/sqrt(2)` before scrambling
+/// (§5.5.3).
+const PILOT: Iq = Iq::new(
+    std::f32::consts::FRAC_1_SQRT_2,
+    std::f32::consts::FRAC_1_SQRT_2,
+);
+/// Data symbols before each pilot block, and the block-to-block period.
+const PILOT_AFTER: usize = SLOTS_PER_PILOT_BLK * SLOT_LEN;
+const PILOT_PERIOD: usize = PILOT_AFTER + PILOT_BLK_LEN;
+/// How far an outside frequency hint may be from the headers' own estimate
+/// and still be used, cycles per symbol: far past that estimate's noise, so a
+/// stale hint is caught but a good one is kept at low SNR.
+const SEED_TRUST: f64 = 0.02;
 
 /// One demodulated PLFRAME.
 #[derive(Debug, Clone)]
 pub struct PlFrame {
     pub pls: PlsInfo,
-    /// Payload after the PLHEADER, pilots included, descrambled. Not yet
+    /// Payload after the PLHEADER, pilots included, descrambled and
     /// carrier-corrected.
     pub payload: Vec<Iq>,
     /// Header correlation, 0..1.
@@ -85,6 +114,24 @@ pub struct Demod {
     // Counters.
     frames: u64,
     lost: u64,
+    // Carrier recovery.
+    plsc_enc: PlscEncoder,
+    pll: CarrierPll,
+    /// The loop has been seeded since the last acquisition.
+    pll_live: bool,
+    /// Frequency hint, cycles per symbol: from outside, then the last value
+    /// the loop held while locked.
+    seed: Option<f64>,
+    /// Constellation per MODCOD and frame size (the PLS code less its pilot
+    /// bit).
+    csts: BTreeMap<u8, Constellation>,
+    hdr_ref: [Iq; PLHEADER_LEN],
+    data: Vec<Iq>,
+    recent: VecDeque<Iq>,
+    mer: f32,
+    coherence: f32,
+    fresh: bool,
+    modulation: Option<Modulation>,
 }
 
 impl Demod {
@@ -110,7 +157,51 @@ impl Demod {
             new_sym: Vec::new(),
             frames: 0,
             lost: 0,
+            plsc_enc: PlscEncoder::new(),
+            pll: CarrierPll::new(CARRIER_BN, 0.0),
+            pll_live: false,
+            seed: None,
+            csts: BTreeMap::new(),
+            hdr_ref: [Iq::new(0.0, 0.0); PLHEADER_LEN],
+            data: Vec::new(),
+            recent: VecDeque::with_capacity(RECENT),
+            mer: 0.0,
+            coherence: 0.0,
+            fresh: true,
+            modulation: None,
         }
+    }
+
+    /// Hint the carrier offset, cycles per symbol (e.g. Identify's, averaged
+    /// over many headers). Used at acquisition if the headers agree with it.
+    pub fn with_carrier_offset(mut self, cycles: f64) -> Self {
+        self.seed = Some(cycles);
+        self
+    }
+
+    /// The carrier loop is running (frames are flowing since acquisition).
+    pub fn carrier_running(&self) -> bool {
+        self.pll_live
+    }
+
+    /// The carrier loop is running and the data symbols sit on their points.
+    pub fn carrier_locked(&self) -> bool {
+        self.pll_live && self.coherence > LOCK_COHERENCE
+    }
+
+    /// MER of the data symbols, dB, smoothed over frames.
+    pub fn mer_db(&self) -> f32 {
+        self.mer
+    }
+
+    /// Residual carrier offset the loop is tracking, Hz.
+    pub fn carrier_offset_hz(&self) -> f64 {
+        self.pll.freq_cycles() * self.symbol_rate()
+    }
+
+    /// Modulation of the last frame that carried data.
+    pub fn modulation(&self) -> Option<Modulation> {
+        self.modulation
     }
 
     pub fn lock_state(&self) -> LockState {
@@ -136,9 +227,15 @@ impl Demod {
         self.lost
     }
 
-    /// The most recent recovered symbols (for a constellation display).
-    pub fn recent_symbols(&self, n: usize) -> &[Iq] {
-        &self.sym[self.sym.len().saturating_sub(n)..]
+    /// The most recent symbols for a constellation display: carrier-locked
+    /// data symbols while frames flow, else the raw recovered symbols.
+    pub fn recent_symbols(&self, n: usize) -> Vec<Iq> {
+        if self.pll_live && !self.recent.is_empty() {
+            let skip = self.recent.len().saturating_sub(n);
+            self.recent.iter().skip(skip).copied().collect()
+        } else {
+            self.sym[self.sym.len().saturating_sub(n)..].to_vec()
+        }
     }
 
     /// Feed baseband; completed, grid-confirmed frames are appended to `out`.
@@ -212,13 +309,14 @@ impl Demod {
 
                     if best_m > CONFIRM_THRESHOLD {
                         // The grid held: this frame is real. Emit it.
+                        let next_pls = self.decode_at(best);
                         let p0 = hdr_end + 1;
                         let mut payload = self.sym[p0..p0 + pls.payload_len as usize].to_vec();
                         self.scrambler.descramble(&mut payload);
+                        self.recover_carrier(hdr_end, pls, &mut payload, best, next_pls);
                         out.push(PlFrame { pls, payload, corr });
                         self.frames += 1;
 
-                        let next_pls = self.decode_at(best);
                         self.state = State::Tracking {
                             hdr_end: best,
                             pls: next_pls,
@@ -229,12 +327,118 @@ impl Demod {
                         if confirmed > 0 {
                             self.lost += 1;
                         }
+                        // Remember where the carrier was for re-acquisition.
+                        if self.carrier_locked() {
+                            self.seed = Some(self.pll.freq_cycles());
+                        }
+                        self.pll_live = false;
                         self.state = State::Searching {
                             scan_from: hdr_end + 1,
                         };
                     }
                 }
             }
+        }
+    }
+
+    /// The 90 PLHEADER symbols as sent, for a PLS code, into `hdr_ref`.
+    fn header_reference(&mut self, plsc: u8) {
+        map_bpsk(SOF_BIG_ENDIAN, &mut self.hdr_ref[..SOF_LEN], SOF_LEN);
+        self.plsc_enc.encode(plsc, &mut self.hdr_ref[SOF_LEN..]);
+    }
+
+    /// Seed the loop from two confirmed headers (first symbols at `h0`, `h1`):
+    /// with their modulation removed they are a pure tone at the offset.
+    fn acquire(&mut self, h0: usize, plsc0: u8, h1: usize, plsc1: u8) {
+        let mut z = [[Iq::new(0.0, 0.0); PLHEADER_LEN]; 2];
+        for (zk, (h, plsc)) in z.iter_mut().zip([(h0, plsc0), (h1, plsc1)]) {
+            self.header_reference(plsc);
+            for (n, v) in zk.iter_mut().enumerate() {
+                *v = self.sym[h + n] * self.hdr_ref[n].conj();
+            }
+        }
+        let f_hdr = tone_freq(&z);
+        let f = match self.seed {
+            Some(s) if (s - f_hdr).abs() < SEED_TRUST => s,
+            _ => f_hdr,
+        };
+        // Phase at the first header's first symbol.
+        let acc: Iq = z[0]
+            .iter()
+            .enumerate()
+            .map(|(n, &v)| {
+                let ph = -TAU * f * n as f64;
+                v * Iq::new(ph.cos() as f32, ph.sin() as f32)
+            })
+            .sum();
+        self.pll.set_freq_cycles(f);
+        self.pll.set_phase(acc.arg() as f64);
+        self.pll_live = true;
+        self.fresh = true;
+    }
+
+    /// Take the carrier off one frame: its header (ending at `hdr_end`) then
+    /// its descrambled `payload`, in place. `next_end`/`next_pls` are the
+    /// header that confirmed it, used to seed the loop at acquisition.
+    fn recover_carrier(
+        &mut self,
+        hdr_end: usize,
+        pls: PlsInfo,
+        payload: &mut [Iq],
+        next_end: usize,
+        next_pls: PlsInfo,
+    ) {
+        let h0 = hdr_end + 1 - PLHEADER_LEN;
+        if !self.pll_live {
+            self.acquire(h0, pls.plsc, next_end + 1 - PLHEADER_LEN, next_pls.plsc);
+        }
+        self.header_reference(pls.plsc);
+        for n in 0..PLHEADER_LEN {
+            self.pll.step_known(self.sym[h0 + n], self.hdr_ref[n]);
+        }
+
+        let cst = if pls.dummy_frame {
+            None
+        } else {
+            Some(
+                &*self
+                    .csts
+                    .entry(pls.plsc >> 1)
+                    .or_insert_with(|| frame_constellation(pls)),
+            )
+        };
+        self.data.clear();
+        for (i, x) in payload.iter_mut().enumerate() {
+            let pilot = pls.has_pilots && i % PILOT_PERIOD >= PILOT_AFTER;
+            *x = match cst {
+                Some(c) if !pilot => {
+                    let y = self.pll.step(*x, &c.points);
+                    self.data.push(y);
+                    y
+                }
+                _ => self.pll.step_known(*x, PILOT),
+            };
+        }
+
+        let Some(c) = cst else { return };
+        let (mer, coh) = decdvb_dsp::quality(&self.data, |_| &c.points);
+        if self.fresh {
+            (self.mer, self.coherence) = (mer, coh);
+            self.fresh = false;
+        } else {
+            self.mer += 0.3 * (mer - self.mer);
+            self.coherence += 0.3 * (coh - self.coherence);
+        }
+        self.modulation = Some(c.modulation);
+        for &y in self
+            .data
+            .iter()
+            .skip(self.data.len().saturating_sub(RECENT))
+        {
+            if self.recent.len() == RECENT {
+                self.recent.pop_front();
+            }
+            self.recent.push_back(y);
         }
     }
 
@@ -255,6 +459,40 @@ impl Demod {
             }
         }
     }
+}
+
+/// The constellation a frame's data is decided against; QPSK for MODCODs
+/// outside the S2 table (its decisions still track the 4-fold symmetry every
+/// S2 constellation has).
+fn frame_constellation(pls: PlsInfo) -> Constellation {
+    let size = if pls.short_fecframe {
+        FecFrame::Short
+    } else {
+        FecFrame::Normal
+    };
+    s2_modcod(pls.modcod, size)
+        .and_then(|mc| Constellation::for_modcod(mc.modulation, mc.rate))
+        .unwrap_or_else(Constellation::qpsk)
+}
+
+/// Frequency of a pure tone in noise, cycles per symbol, from blocks of it: a
+/// lag-1 differential for an unambiguous coarse value, refined at lags 8 and
+/// 32 (each lag's phase is read only after the coarser estimate is removed,
+/// so it never wraps).
+fn tone_freq(blocks: &[[Iq; PLHEADER_LEN]]) -> f64 {
+    let mut f = 0.0;
+    for lag in [1usize, 8, 32] {
+        let mut acc = Iq::new(0.0, 0.0);
+        for b in blocks {
+            for n in 0..PLHEADER_LEN - lag {
+                acc += b[n + lag] * b[n].conj();
+            }
+        }
+        let w = -TAU * f * lag as f64;
+        let resid = (acc * Iq::new(w.cos() as f32, w.sin() as f32)).arg() as f64;
+        f += resid / (TAU * lag as f64);
+    }
+    f
 }
 
 #[cfg(test)]
@@ -366,5 +604,106 @@ mod tests {
             "{} false frames from noise",
             frames.len()
         );
+    }
+
+    /// `x` offset by `cycles` per sample, rotated by `phase`, plus complex
+    /// Gaussian noise of power `10^(-snr_db/10)` per sample (unit signal).
+    fn impair(x: &[Iq], cycles: f64, phase: f64, snr_db: f64, seed: u64) -> Vec<Iq> {
+        let mut s = seed | 1;
+        let mut uniform = move || {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            (s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let sigma = 10f64.powf(-snr_db / 20.0) * std::f64::consts::FRAC_1_SQRT_2;
+        x.iter()
+            .enumerate()
+            .map(|(n, &v)| {
+                let ph = TAU * cycles * n as f64 + phase;
+                let r = (-2.0 * uniform().max(1e-300).ln()).sqrt() * sigma;
+                let t = TAU * uniform();
+                v * Iq::new(ph.cos() as f32, ph.sin() as f32)
+                    + Iq::new((r * t.cos()) as f32, (r * t.sin()) as f32)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn locks_the_carrier_of_an_acm_sequence() {
+        // QPSK, 8PSK, short 16APSK, dummy and short QPSK frames, 0.3 % of the
+        // symbol rate off and rotated: every data frame must come out on its
+        // own constellation, and the pilots on their true phase (the header
+        // resolves the 90° ambiguity a blind loop would be left with).
+        let schedule = [
+            FrameSpec::new(4, false, true),
+            FrameSpec::new(14, false, true),
+            FrameSpec::new(20, true, false),
+            FrameSpec::new(0, false, false),
+            FrameSpec::new(9, true, true),
+        ];
+        let x = signal(&schedule, 300_000, 4, 0.25, 11);
+        let x = impair(&x, 0.003 / 4.0, 2.2, 20.0, 12);
+
+        let mut d = Demod::new(4.0, 1.0, 0.25, 0);
+        let mut frames = Vec::new();
+        for chunk in x.chunks(20_000) {
+            d.process(chunk, &mut frames);
+        }
+        assert!(frames.len() >= 8, "only {} frames", frames.len());
+        assert_eq!(d.losses(), 0);
+        assert!(d.carrier_locked(), "MER {:.1} dB", d.mer_db());
+        assert!(d.mer_db() > 14.0, "MER {:.1} dB", d.mer_db());
+        let f = d.carrier_offset_hz();
+        assert!((f - 0.003).abs() < 2e-4, "offset {f}");
+
+        // After the first frame, every pilot block sits on (1 + j)/sqrt(2).
+        for fr in frames.iter().skip(1).filter(|f| f.pls.has_pilots) {
+            let p = &fr.payload[PILOT_AFTER..PILOT_PERIOD];
+            let mean = p.iter().sum::<Iq>() / PILOT_BLK_LEN as f32;
+            assert!(
+                (mean - PILOT).norm() < 0.15,
+                "MODCOD {} pilots at {mean}",
+                fr.pls.modcod
+            );
+        }
+        // And the data of each frame on its own constellation.
+        for fr in frames.iter().skip(1).filter(|f| !f.pls.dummy_frame) {
+            let c = frame_constellation(fr.pls);
+            let data: Vec<Iq> = fr
+                .payload
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !fr.pls.has_pilots || i % PILOT_PERIOD < PILOT_AFTER)
+                .map(|(_, &v)| v)
+                .collect();
+            let mer = decdvb_dsp::mer_db(&data, &c.points);
+            assert!(mer > 14.0, "MODCOD {}: MER {mer:.1} dB", fr.pls.modcod);
+        }
+    }
+
+    #[test]
+    fn a_wrong_seed_is_overruled_by_the_headers() {
+        let x = signal(&[FrameSpec::new(4, false, true)], 150_000, 4, 0.2, 13);
+        let x = impair(&x, -0.01 / 4.0, 0.3, 20.0, 14);
+        let mut d = Demod::new(4.0, 1.0, 0.2, 0).with_carrier_offset(0.04);
+        let mut frames = Vec::new();
+        d.process(&x, &mut frames);
+        assert!(d.carrier_locked(), "MER {:.1} dB", d.mer_db());
+        assert!((d.carrier_offset_hz() + 0.01).abs() < 2e-4);
+    }
+
+    #[test]
+    fn tone_freq_is_unambiguous_and_fine() {
+        for f in [-0.2, -0.013, 0.0, 0.0047, 0.11] {
+            let mut b = [[Iq::new(0.0, 0.0); PLHEADER_LEN]; 2];
+            for (k, blk) in b.iter_mut().enumerate() {
+                for (n, v) in blk.iter_mut().enumerate() {
+                    let ph = TAU * f * (n + 1000 * k) as f64 + 0.7 * k as f64;
+                    *v = Iq::new(ph.cos() as f32, ph.sin() as f32);
+                }
+            }
+            assert!((tone_freq(&b) - f).abs() < 1e-6, "{f}");
+        }
     }
 }

@@ -8,6 +8,7 @@ mod automation;
 mod band_view;
 mod filename;
 mod format;
+mod freq_display;
 mod radio;
 mod side_panel;
 mod waterfall;
@@ -32,7 +33,8 @@ fn main() -> eframe::Result {
         Err(e) => {
             eprintln!("decdvb-gui: {e}");
             eprintln!(
-                "usage: decdvb-gui [capture] [--claim-carriers] [--after SECS] [--screenshot OUT.png]"
+                "usage: decdvb-gui [capture] [--claim-carriers] [--decoder id|ip|ts|psk|rec|spec] \
+                 [--select N] [--after SECS] [--screenshot OUT.png]"
             );
             std::process::exit(2);
         }
@@ -50,10 +52,21 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
+            // egui's proportional font has no arrows or ●; its bundled
+            // monospace font does, so let text fall back to it.
+            let mut fonts = egui::FontDefinitions::default();
+            if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                f.push("Hack".into());
+            }
+            cc.egui_ctx.set_fonts(fonts);
             let mut app = App {
                 automation: automation::Automation::new(&opts),
                 ..App::default()
             };
+            // Claimed VFOs keep `VfoSettings::new`'s temp-dir output folder.
+            if let Some(k) = opts.decoder {
+                app.new_decoder = k;
+            }
             if let Some(p) = opts.file.clone() {
                 app.open_file(p);
             }
@@ -136,9 +149,11 @@ impl App {
         format!("VFO {}", self.names)
     }
 
+    /// RF frequency at the span's centre. With no file open this is the
+    /// radio's tuning (plus LO), whether or not it is running yet.
     fn rf_center(&self) -> f64 {
         #[cfg(feature = "hackrf")]
-        if self.hackrf.is_some() {
+        if self.path.is_none() {
             return self.radio.rf_center();
         }
         self.rf_center_mhz * 1e6
@@ -291,6 +306,63 @@ impl App {
         }
     }
 
+    /// Set the RF frequency of the span's centre: retune a live HackRF (RF −
+    /// LO), relabel a file's axis, or pre-set the radio before Start.
+    fn set_rf_center(&mut self, rf: f64) {
+        #[cfg(feature = "hackrf")]
+        if self.path.is_none() {
+            let tuned = (rf - self.radio.lnb_lo_mhz * 1e6).clamp(1e6, 6e9).round() as u64;
+            self.radio.settings.center_hz = tuned;
+            if let Some(c) = &self.hackrf
+                && let Err(e) = c.set_center(tuned)
+            {
+                self.radio.error = Some(e.to_string());
+                self.note = e.to_string();
+            }
+            return;
+        }
+        self.rf_center_mhz = rf / 1e6;
+    }
+
+    /// The SDR++-style frequency bar: the span's centre in big digits.
+    fn freq_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let mut rf = self.rf_center();
+            if freq_display::show(ui, &mut rf, 0.0, 999_999_999_999.0, 34.0) {
+                self.set_rf_center(rf);
+            }
+            ui.add_space(12.0);
+            ui.vertical(|ui| {
+                ui.add_space(4.0);
+                #[cfg(feature = "hackrf")]
+                if self.path.is_none() {
+                    let live = self.hackrf.is_some();
+                    ui.label(
+                        RichText::new(format!(
+                            "{} {}  ·  LO {}",
+                            if live { "tuned" } else { "radio" },
+                            format::freq(self.radio.settings.center_hz as f64),
+                            format::freq(self.radio.lnb_lo_mhz * 1e6),
+                        ))
+                        .weak(),
+                    );
+                    ui.label(
+                        RichText::new("scroll or click a digit to tune · right-click rounds")
+                            .small()
+                            .weak(),
+                    );
+                    return;
+                }
+                ui.label(RichText::new("centre of the recording (labels the axis)").weak());
+                ui.label(
+                    RichText::new("scroll or click a digit to change · right-click rounds")
+                        .small()
+                        .weak(),
+                );
+            });
+        });
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             if ui.button("📂 Open IQ…").clicked()
@@ -360,14 +432,6 @@ impl App {
                     ui.selectable_value(&mut self.format, SampleFormat::Cs16, "cs16");
                     ui.selectable_value(&mut self.format, SampleFormat::Cf32, "cf32");
                 });
-            ui.label("RF centre");
-            ui.add(
-                egui::DragValue::new(&mut self.rf_center_mhz)
-                    .speed(0.01)
-                    .max_decimals(6)
-                    .suffix(" MHz"),
-            )
-            .on_hover_text("Only labels the axis; for a Ku LNB, the RF frequency (IF + LO).");
             egui::ComboBox::from_id_salt("fft")
                 .width(70.0)
                 .selected_text(format!("FFT {}", self.opts.fft_size))
@@ -404,7 +468,7 @@ impl App {
                     }
                 }
             }
-            if ui.button("⤢ Full span").clicked() {
+            if ui.button("⛶ Full span").clicked() {
                 self.band.reset_zoom();
             }
             ui.separator();
@@ -540,6 +604,7 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::Panel::top("freqbar").show(ui, |ui| self.freq_bar(ui));
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
 

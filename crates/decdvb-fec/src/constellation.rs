@@ -57,6 +57,15 @@ fn apsk32_gammas(rate: CodeRate) -> Option<(f32, f32)> {
 }
 
 impl Constellation {
+    /// BPSK: 0 → +1, 1 → −1. Not a DVB-S2 constellation; for generic carriers.
+    pub fn bpsk() -> Self {
+        Constellation {
+            modulation: Modulation::Bpsk,
+            points: vec![Iq::new(1.0, 0.0), Iq::new(-1.0, 0.0)],
+            rings: vec![1.0],
+        }
+    }
+
     /// Gray-mapped QPSK (§5.4.1).
     pub fn qpsk() -> Self {
         Constellation {
@@ -168,11 +177,24 @@ impl Constellation {
     /// standard does not define (and, for now, for the S2X-only ones).
     pub fn for_modcod(modulation: Modulation, rate: CodeRate) -> Option<Self> {
         match modulation {
+            Modulation::Bpsk => Some(Self::bpsk()),
             Modulation::Qpsk => Some(Self::qpsk()),
             Modulation::Psk8 => Some(Self::psk8()),
             Modulation::Apsk16 => apsk16_gamma(rate).map(Self::apsk16),
             Modulation::Apsk32 => apsk32_gammas(rate).map(|(g1, g2)| Self::apsk32(g1, g2)),
             _ => None,
+        }
+    }
+
+    /// A representative constellation for a modulation when the code rate is
+    /// unknown (generic carriers): APSK with the middle ring ratios of S2.
+    pub fn generic(modulation: Modulation) -> Self {
+        match modulation {
+            Modulation::Bpsk | Modulation::Pi2Bpsk => Self::bpsk(),
+            Modulation::Psk8 => Self::psk8(),
+            Modulation::Apsk16 => Self::apsk16(2.75),
+            Modulation::Apsk32 => Self::apsk32(2.72, 4.87),
+            _ => Self::qpsk(),
         }
     }
 

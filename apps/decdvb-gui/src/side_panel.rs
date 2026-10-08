@@ -2,15 +2,25 @@
 
 use std::collections::BTreeMap;
 
+use decdvb_core::Modulation;
 use decdvb_engine::{
-    ConstellationGuess, DecoderKind, Identification, LockState, RateSource, Verdict, VfoId,
-    VfoStatus,
+    CarrierState, ConstellationGuess, DecoderKind, Identification, LockState, RateSource, Verdict,
+    VfoId, VfoStatus,
 };
 use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, Ui, vec2};
 use egui_plot::{Line, Plot, PlotPoints, Points};
 
-use crate::band_view::{Action, UiVfo, badge, default_record_dir, vfo_color};
+use crate::band_view::{Action, UiVfo, badge, default_record_dir, paint_x, vfo_color};
 use crate::format;
+
+/// Constellations the generic PSK decoder can be told to use.
+const PSK_CHOICES: [Modulation; 5] = [
+    Modulation::Bpsk,
+    Modulation::Qpsk,
+    Modulation::Psk8,
+    Modulation::Apsk16,
+    Modulation::Apsk32,
+];
 
 pub struct SideInput<'a> {
     pub vfos: &'a [UiVfo],
@@ -99,15 +109,46 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
         } else {
             ui.visuals().weak_text_color()
         };
+        // ✕ at the far right deletes the VFO.
+        let x_rect =
+            egui::Rect::from_center_size(rect.right_center() - vec2(12.0, 0.0), vec2(20.0, 20.0));
+        let over_x = resp.hover_pos().is_some_and(|p| x_rect.contains(p));
+        if over_x {
+            ui.painter().rect_filled(
+                x_rect,
+                CornerRadius::same(3),
+                Color32::from_rgb(170, 50, 50),
+            );
+        }
+        paint_x(
+            ui.painter(),
+            x_rect.center(),
+            4.0,
+            if over_x {
+                Color32::WHITE
+            } else {
+                ui.visuals().weak_text_color()
+            },
+        );
         ui.painter().text(
-            rect.right_center() - vec2(6.0, 0.0),
+            x_rect.left_center() - vec2(6.0, 0.0),
             egui::Align2::RIGHT_CENTER,
             format!("CPU {:.0}%", load * 100.0),
             egui::FontId::monospace(11.0),
             load_col,
         );
         if resp.clicked() {
-            actions.push(Action::Select(Some(v.id)));
+            if resp
+                .interact_pointer_pos()
+                .is_some_and(|p| x_rect.contains(p))
+            {
+                actions.push(Action::Remove(v.id));
+            } else {
+                actions.push(Action::Select(Some(v.id)));
+            }
+        }
+        if over_x {
+            resp.on_hover_text("Delete this VFO");
         }
     }
 
@@ -171,7 +212,26 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
             }
             ui.end_row();
 
-            if matches!(s.decoder, DecoderKind::Dvbs2Ip | DecoderKind::Dvbs2Ts) {
+            if s.decoder == DecoderKind::PskSymbols {
+                ui.label("Constellation");
+                let txt = s
+                    .psk_modulation
+                    .map_or("auto (from Identify)", |m| m.name());
+                egui::ComboBox::from_id_salt("psk_modulation")
+                    .selected_text(txt)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut s.psk_modulation, None, "auto (from Identify)");
+                        for m in PSK_CHOICES {
+                            ui.selectable_value(&mut s.psk_modulation, Some(m), m.name());
+                        }
+                    });
+                ui.end_row();
+            }
+
+            if matches!(
+                s.decoder,
+                DecoderKind::Dvbs2Ip | DecoderKind::Dvbs2Ts | DecoderKind::PskSymbols
+            ) {
                 ui.label("Symbol rate");
                 ui.horizontal(|ui| {
                     let mut auto = s.symbol_rate.is_none();
@@ -198,7 +258,8 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                     }
                 });
                 ui.end_row();
-
+            }
+            if matches!(s.decoder, DecoderKind::Dvbs2Ip | DecoderKind::Dvbs2Ts) {
                 ui.label("Gold code");
                 ui.add(egui::DragValue::new(&mut s.gold_code).range(0..=262_141));
                 ui.end_row();
@@ -236,7 +297,13 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
     );
 
     // ---- results
-    if let Some(id) = &st.identification {
+    // A demodulating VFO leads with its own state and constellation; how it
+    // acquired (Identify's view) folds away below.
+    let demodulates = matches!(
+        v.settings.decoder,
+        DecoderKind::Dvbs2Ip | DecoderKind::Dvbs2Ts | DecoderKind::PskSymbols
+    );
+    if !demodulates && let Some(id) = &st.identification {
         ui.add_space(6.0);
         identification_card(ui, id, inp.rf_center + v.settings.offset_hz);
     }
@@ -260,13 +327,36 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
             ui.label("Frames");
             ui.label(format!("{} ({} lock losses)", st.frames, st.lock_losses));
             ui.end_row();
+            if let Some(c) = &st.carrier {
+                carrier_rows(ui, c);
+            }
             if let Some(rs) = st.symbol_rate {
                 ui.label("Symbol rate");
                 ui.label(format::rate(rs));
                 ui.end_row();
             }
         });
-        modcod_table(ui, &st.modcods);
+    }
+
+    if v.settings.decoder == DecoderKind::PskSymbols
+        && let Some(c) = &st.carrier
+    {
+        ui.add_space(6.0);
+        ui.label(RichText::new("Demodulator").strong());
+        egui::Grid::new("psk").num_columns(2).show(ui, |ui| {
+            carrier_rows(ui, c);
+            if let Some(rs) = st.symbol_rate {
+                ui.label("Symbol rate");
+                ui.label(format::rate(rs));
+                ui.end_row();
+            }
+            if let Some((_, n)) = &st.recording {
+                ui.label("Symbols");
+                ui.label(format!("{n} written ({:.1} MB)", *n as f64 / 1e6));
+                ui.end_row();
+            }
+        });
+        psk_note(ui);
     }
 
     // ---- plots
@@ -280,10 +370,63 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
     }
     if let Some((path, _)) = &st.recording {
         ui.add_space(4.0);
-        ui.label(RichText::new(format!("Recording to {}", path.display())).small());
+        let what = if v.settings.decoder == DecoderKind::PskSymbols {
+            "Symbols to"
+        } else {
+            "Recording to"
+        };
+        ui.label(RichText::new(format!("{what} {}", path.display())).small());
+    }
+
+    // MODCOD counts and acquisition details, after the plots.
+    if matches!(
+        v.settings.decoder,
+        DecoderKind::Dvbs2Ip | DecoderKind::Dvbs2Ts
+    ) {
+        modcod_table(ui, &st.modcods);
+    }
+    if demodulates && let Some(id) = &st.identification {
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("Acquisition (Identify)")
+            .id_salt(("acq", v.id))
+            .show(ui, |ui| {
+                identification_card(ui, id, inp.rf_center + v.settings.offset_hz);
+            });
     }
 
     actions
+}
+
+/// Carrier loop rows for a two-column grid.
+fn carrier_rows(ui: &mut Ui, c: &CarrierState) {
+    ui.label("Carrier");
+    if c.locked {
+        ui.colored_label(
+            Color32::from_rgb(110, 220, 110),
+            format!("{} locked · MER {:.1} dB", c.modulation.name(), c.mer_db),
+        );
+    } else {
+        ui.colored_label(
+            Color32::from_rgb(230, 150, 90),
+            format!("{} not locked", c.modulation.name()),
+        );
+    }
+    ui.end_row();
+    ui.label("Residual offset");
+    ui.label(format!("{:+.0} Hz", c.offset_hz));
+    ui.end_row();
+}
+
+fn psk_note(ui: &mut Ui) {
+    ui.label(
+        RichText::new(
+            "One byte per symbol: its DVB-S2 bit label (BPSK: 0 = +1). Without a \
+             preamble the phase is ambiguous by the constellation's symmetry, so the \
+             labels may be a fixed rotation of the sent ones.",
+        )
+        .weak()
+        .small(),
+    );
 }
 
 fn identification_card(ui: &mut Ui, id: &Identification, abs_center: f64) {
@@ -370,6 +513,21 @@ fn identification_card(ui: &mut Ui, id: &Identification, abs_center: f64) {
                 ui.label("S/N (spectrum)");
                 ui.label(format!("{:.1} dB", id.snr_db));
                 ui.end_row();
+                if let (Some(mer), Some(coh)) = (id.mer_db, id.coherence) {
+                    ui.label("Carrier");
+                    if id.carrier_locked {
+                        ui.colored_label(
+                            Color32::from_rgb(110, 220, 110),
+                            format!("locked · MER {mer:.1} dB"),
+                        );
+                    } else {
+                        ui.colored_label(
+                            Color32::from_rgb(230, 150, 90),
+                            format!("not locked (coherence {coh:.2})"),
+                        );
+                    }
+                    ui.end_row();
+                }
                 if let Some(f) = id.carrier_offset_hz {
                     ui.label("Residual offset");
                     ui.label(format!("{f:+.0} Hz"));

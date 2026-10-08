@@ -8,7 +8,7 @@ this?"** mode that finds a carrier's symbol rate and tells you what it is.
 Planned: adaptive coding and modulation (**ACM**) decoding, **GSE** to **IP**
 written as a PCAP, **MPEG-TS** extraction, and a matching modulator.
 
-![DecDVB: four carriers in an 8 MS/s span, each claimed by an Identify VFO; the selected one is a DVB-S2 ACM carrier broken down per MODCOD](docs/images/waterfall.png)
+![DecDVB: carriers in an 8 MS/s span, each claimed by a DVB-S2 VFO; the selected one is an ACM carrier, frame-locked, its 16APSK frames carrier-locked at 23.7 dB MER](docs/images/waterfall.png)
 
 *A synthetic 8 MS/s test scene (`decdvb scene`): two DVB-S2 carriers — one
 CCM, one ACM switching QPSK 1/2 → 8PSK 3/5 → 16APSK 2/3 — a plain QPSK carrier
@@ -26,10 +26,12 @@ and a CW tone. Every carrier was found and identified blind.*
 | VFOs: draw, drag, resize, click a carrier to claim it; one thread each | ✅ |
 | **Identify** — blind symbol rate, roll-off, constellation, DVB-S2 detection | ✅ |
 | DVB-S2 PL demodulation: frame lock, MODCOD per frame (ACM) | ✅ |
+| Carrier recovery: a locked constellation and MER, for Identify and DVB-S2 VFOs | ✅ |
+| **Generic PSK/APSK → symbols** (`.bin`, one byte per symbol), for non-DVB carriers | ✅ |
+| Narrow carriers: VFOs down to 500 Hz, ~10 kBd SCPC carriers lock | ✅ |
 | IQ recorder and spectrum-only VFOs | ✅ |
 | IQ file replay (`cs8`, `cs16`, `cf32`), rate/centre from file names | ✅ |
 | **Live HackRF One**, 2–20 MS/s, pure Rust over USB (no DLLs), LNB LO | ✅ |
-| Carrier recovery (constellation de-rotation) | next |
 | LDPC + BCH → BBFRAMEs | M2 |
 | All S2X MODCODs, VL-SNR | M3 |
 | GSE → IP → PCAP, MPEG-TS | M4 |
@@ -56,11 +58,26 @@ On the waterfall:
 | **click a green bracket** | claim a detected carrier with a VFO sized to fit |
 | **drag a VFO** / **its edge** | move it / resize it |
 | **click** (VFO selected) | tune it there |
-| **Delete** | remove the selected VFO |
+| **✕** on a VFO's label, or **Delete** | remove it |
 
-The side bar lists the VFOs with their CPU load, and shows the selected one's
-settings, its Identify result or demodulator state, a constellation and a
-zoomed spectrum.
+The big readout at the top is the centre frequency, as in SDR++: wheel over a
+digit or click its upper/lower half to step it, right-click to round. With the
+HackRF running it retunes the radio.
+
+The side bar lists the VFOs with their CPU load (✕ removes one), and shows the
+selected one's settings, its Identify result or demodulator state (lock, MER,
+residual offset), a carrier-locked constellation and a zoomed spectrum.
+
+### Generic PSK → symbols
+
+For carriers that are not DVB-S2 — SCPC data, telemetry, DVB-S — a VFO can
+lock the carrier and write its hard-decided symbols to
+`decdvb-<VFO>-<freq>Hz-<rate>Bd-<modulation>-<time>.bin`, one byte per symbol:
+the symbol's bit label under the DVB-S2 mapping (BPSK: 0 = +1). The symbol rate
+and constellation come from Identify, or set them by hand. Without a preamble
+the carrier phase is ambiguous by the constellation's symmetry (90° for QPSK),
+so the labels may be a fixed rotation of the sent ones — a sync word found
+offline resolves it.
 
 ### What Identify reports
 
