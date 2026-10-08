@@ -28,7 +28,7 @@ and a CW tone. Every carrier was found and identified blind.*
 | DVB-S2 PL demodulation: frame lock, MODCOD per frame (ACM) | ✅ |
 | IQ recorder and spectrum-only VFOs | ✅ |
 | IQ file replay (`cs8`, `cs16`, `cf32`), rate/centre from file names | ✅ |
-| Live HackRF front end | next |
+| **Live HackRF One**, 2–20 MS/s, pure Rust over USB (no DLLs), LNB LO | ✅ |
 | Carrier recovery (constellation de-rotation) | next |
 | LDPC + BCH → BBFRAMEs | M2 |
 | All S2X MODCODs, VL-SNR | M3 |
@@ -89,12 +89,17 @@ Rust 1.95 or newer:
 cargo build --release
 ```
 
-The live HackRF front end is behind a feature flag, so building needs no SDR
-SDK:
+### HackRF One
 
-```bash
-cargo run --release -p decdvb-gui --features hackrf
-```
+Click **📡 HackRF** in the toolbar, set the frequency, sample rate and gains,
+and **Start**. Frequency and gains apply live. **LNB LO** only labels the axis
+(RF = tuned + LO): 9750 MHz for a QO-100 or Ku low-band LNB, 0 without one.
+
+The driver is pure Rust over USB ([`seify-hackrfone`](https://crates.io/crates/seify-hackrfone)
+on `nusb`): no libhackrf, no libusb, nothing to install beyond the WinUSB driver
+the HackRF already uses on Windows (Zadig, or the official tools). DecDVB only
+ever **receives**, and keeps the antenna-port power **off** — feed an LNB from
+an external inserter.
 
 ## Scope
 

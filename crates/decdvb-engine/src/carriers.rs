@@ -7,6 +7,15 @@
 //! The symbol-rate figure is the equivalent-noise-bandwidth estimate (a few
 //! percent); dropping a VFO with Identify on the carrier then pins it down to
 //! well under a percent.
+//!
+//! Real spectra are not tidy. A HackRF overloaded by strong broadcast signals
+//! (first seen live on the FM band, where a naive detector reported 168
+//! "carriers") shows a dense comb of ripple; spurs do similar things at L-band.
+//! So neighbouring peaks are merged when the trough between them stays within
+//! a few dB of the weaker peak — ripple and combs merge, genuinely separate
+//! carriers have deep troughs — and anything whose top is not flat is flagged
+//! [`Carrier::rough`]: a linearly modulated carrier has a flat top, a lump of
+//! other signals does not.
 
 /// One detected carrier.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -15,20 +24,32 @@ pub struct Carrier {
     pub center_hz: f64,
     /// 99 % occupied bandwidth, Hz.
     pub bandwidth_hz: f64,
-    /// Symbol-rate estimate from the equivalent noise bandwidth, Hz.
+    /// Symbol-rate estimate from the equivalent noise bandwidth, Hz. Only
+    /// meaningful when the carrier is neither narrow nor rough.
     pub symbol_rate_hz: f64,
     /// Peak above the noise floor, dB.
     pub snr_db: f32,
     /// Only a few bins wide: a CW tone, a spur, or a carrier too narrow to
     /// resolve at this FFT size.
     pub narrow: bool,
+    /// The top is not flat: a lump of several signals, overload products, or
+    /// something not linearly modulated. Not a clean single carrier.
+    pub rough: bool,
 }
 
 impl Carrier {
     /// A VFO bandwidth that comfortably fits the carrier: its occupied width
     /// plus margin for the skirts and some frequency error.
     pub fn suggested_vfo_bandwidth(&self) -> f64 {
+        if self.rough {
+            return self.bandwidth_hz * 1.1;
+        }
         (self.bandwidth_hz * 1.25).max(self.symbol_rate_hz * 1.5)
+    }
+
+    /// Looks like one clean carrier worth identifying.
+    pub fn is_clean(&self) -> bool {
+        !self.narrow && !self.rough
     }
 }
 
@@ -40,6 +61,16 @@ const DC_GUARD_BINS: usize = 3;
 const MERGE_GAP_BINS: usize = 2;
 /// A run narrower than this is flagged `narrow`.
 const NARROW_BINS: usize = 6;
+/// Neighbouring peaks merge when the trough between them is within this of the
+/// weaker peak.
+const MERGE_TROUGH_DB: f32 = 6.0;
+/// A plateau whose bins scatter more than this about a straight line
+/// (standard deviation, dB) is rough. A smoothed linearly modulated carrier
+/// sits around 0.2 dB, ±0.5 dB transponder ripple ~0.35; a comb of ±2 dB
+/// ripple ~1.4.
+const ROUGH_DB: f32 = 1.0;
+/// Most carriers reported; beyond this the weakest are dropped.
+const MAX_CARRIERS: usize = 48;
 
 /// `q`-quantile of `xs` (0..1), by sorting a copy.
 fn quantile(xs: &[f32], q: f64) -> f32 {
@@ -48,21 +79,129 @@ fn quantile(xs: &[f32], q: f64) -> f32 {
     v[((v.len() - 1) as f64 * q).round() as usize]
 }
 
+/// Split `s[a..=b]` at every valley deeper than `depth` dB below the peaks on
+/// both its sides, recursively; push the pieces to `out`.
+///
+/// Valley depth at `k` is `min(max(s[a..k]), max(s[k..=b])) - s[k]`, computed
+/// from running maxima in one pass. A split is only made where **both** sides
+/// have a carrier-like top (see [`top_run`]): two carriers whose skirts overlap
+/// — so the spectrum never returns to the floor between them — split at their
+/// trough, but a comb of single-bin teeth (seen live on the FM band, ~10 dB
+/// deep) is never chopped into a row of fake carriers.
+fn split_at_valleys(s: &[f32], a: usize, b: usize, depth: f32, out: &mut Vec<(usize, usize)>) {
+    if b <= a + 2 * NARROW_BINS {
+        out.push((a, b));
+        return;
+    }
+    let len = b - a + 1;
+    let mut right_max = vec![f32::MIN; len];
+    let mut m = f32::MIN;
+    for i in (0..len).rev() {
+        m = m.max(s[a + i]);
+        right_max[i] = m;
+    }
+    let mut left_max = f32::MIN;
+    let mut valleys: Vec<(usize, f32)> = Vec::new();
+    for i in 0..len {
+        if i > 0 && i + 1 < len {
+            let d = left_max.min(right_max[i + 1]) - s[a + i];
+            if d > depth {
+                valleys.push((a + i, d));
+            }
+        }
+        left_max = left_max.max(s[a + i]);
+    }
+    // The running maxima above only find candidates. Confirm each against the
+    // sides' robust top levels (95th percentile), the same reference
+    // `top_run` uses: measured from the maxima, a stretch of hump between two
+    // comb teeth looks like a deep valley; measured from the hump it is none.
+    valleys.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+    valleys.truncate(64);
+    let p95 = |a: usize, b: usize| {
+        let mut v = s[a..=b].to_vec();
+        v.sort_unstable_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        v[(v.len() - 1) * 95 / 100]
+    };
+    let carrier_like = |a: usize, b: usize| top_run(s, a, b).1 >= NARROW_BINS;
+    match valleys.iter().find(|&&(k, _)| {
+        p95(a, k).min(p95(k + 1, b)) - s[k] > depth && carrier_like(a, k) && carrier_like(k + 1, b)
+    }) {
+        Some(&(k, _)) => {
+            split_at_valleys(s, a, k, depth, out);
+            split_at_valleys(s, k + 1, b, depth, out);
+        }
+        None => out.push((a, b)),
+    }
+}
+
+/// The longest contiguous run of bins in `s[a..=b]` within 6 dB of the
+/// region's 95th-percentile level, as (start, length).
+///
+/// The 95th percentile rather than the maximum, so one spur riding on a
+/// carrier does not set the reference. A carrier's top run is its flat top; a
+/// CW's is its main lobe; a comb's is a single tooth.
+fn top_run(s: &[f32], a: usize, b: usize) -> (usize, usize) {
+    let mut v = s[a..=b].to_vec();
+    v.sort_unstable_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    let level = v[(v.len() - 1) * 95 / 100] - 6.0;
+    let (mut best, mut cur_start, mut cur) = ((a, 0usize), a, 0usize);
+    for (k, &x) in s.iter().enumerate().take(b + 1).skip(a) {
+        if x >= level {
+            if cur == 0 {
+                cur_start = k;
+            }
+            cur += 1;
+            if cur > best.1 {
+                best = (cur_start, cur);
+            }
+        } else {
+            cur = 0;
+        }
+    }
+    best
+}
+
+/// Standard deviation of `v` after removing its least-squares straight line,
+/// so a tilted but smooth top (a transponder's slope) does not count as rough.
+fn detrended_std(v: &[f32]) -> f32 {
+    let n = v.len() as f32;
+    let mx = (n - 1.0) / 2.0;
+    let my = v.iter().sum::<f32>() / n;
+    let (mut sxy, mut sxx) = (0.0f32, 0.0f32);
+    for (i, &y) in v.iter().enumerate() {
+        let dx = i as f32 - mx;
+        sxy += dx * (y - my);
+        sxx += dx * dx;
+    }
+    let slope = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+    let var = v
+        .iter()
+        .enumerate()
+        .map(|(i, &y)| {
+            let r = y - (my + slope * (i as f32 - mx));
+            r * r
+        })
+        .sum::<f32>()
+        / n;
+    var.sqrt()
+}
+
 /// Detect carriers in an FFT-shifted dB spectrum (bin 0 = −rate/2).
 ///
 /// `min_snr_db` is how far above the floor a carrier's peak must stand. The
 /// floor is the 20th percentile rather than the median, so a busy span — a
 /// transponder mostly full of carriers — still finds the true noise.
 pub fn detect_carriers(spectrum_db: &[f32], rate: f64, min_snr_db: f32) -> Vec<Carrier> {
-    let n = spectrum_db.len();
+    let s = spectrum_db;
+    let n = s.len();
     if n < 16 {
         return Vec::new();
     }
     let bin_hz = rate / n as f64;
-    let floor = quantile(spectrum_db, 0.2);
-    let above = |k: usize, margin: f32| spectrum_db[k] > floor + margin;
+    let floor = quantile(s, 0.2);
+    let above = |k: usize, margin: f32| s[k] > floor + margin;
 
-    // Runs of bins above the detection threshold, merging small gaps.
+    // 1. Runs of bins above the detection threshold, merging small gaps.
     let mut runs: Vec<(usize, usize)> = Vec::new(); // inclusive
     let mut k = 0;
     while k < n {
@@ -89,27 +228,50 @@ pub fn detect_carriers(spectrum_db: &[f32], rate: f64, min_snr_db: f32) -> Vec<C
         }
     }
 
-    // Grow each run outward over its skirts (anything 3 dB above the floor),
-    // without running into its neighbour.
+    // 2. Grow each run outward over its skirts (3 dB above the floor), up to
+    //    its neighbours.
     let mut grown: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
-    for (idx, &(s, e)) in runs.iter().enumerate() {
+    for (idx, &(a0, b0)) in runs.iter().enumerate() {
         let left_limit = if idx == 0 { 0 } else { runs[idx - 1].1 + 1 };
         let right_limit = runs.get(idx + 1).map_or(n - 1, |r| r.0 - 1);
-        let mut a = s;
+        let mut a = a0;
         while a > left_limit && above(a - 1, 3.0) {
             a -= 1;
         }
-        let mut b = e;
+        let mut b = b0;
         while b < right_limit && above(b + 1, 3.0) {
             b += 1;
         }
         grown.push((a, b));
     }
 
+    // 3. Join regions that touch (the spectrum never fell to the floor between
+    //    them), then split every region at its deep valleys. Ripple, combs and
+    //    lumps have shallow valleys and become one region instead of dozens of
+    //    "carriers"; carriers whose skirts overlap still split at the trough.
+    let mut joined: Vec<(usize, usize)> = Vec::with_capacity(grown.len());
+    for (a, b) in grown {
+        match joined.last_mut() {
+            Some(last) if a <= last.1 + 1 => last.1 = last.1.max(b),
+            _ => joined.push((a, b)),
+        }
+    }
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in joined {
+        split_at_valleys(s, a, b, MERGE_TROUGH_DB, &mut pieces);
+    }
+    // A piece that never reaches the detection threshold is a shoulder.
+    let merged: Vec<(usize, usize)> = pieces
+        .into_iter()
+        .filter(|&(a, b)| (a..=b).any(|i| above(i, min_snr_db)))
+        .collect();
+
+    // 4. Describe each region.
     let floor_lin = 10f64.powf(floor as f64 / 10.0);
     let dc = n / 2;
+    let freq = |k: usize| (k as f64 / n as f64 - 0.5) * rate;
     let mut out = Vec::new();
-    for (a, b) in grown {
+    for (a, b) in merged {
         let width = b - a + 1;
         // The DC spur on its own is not a carrier.
         if width <= 2 * DC_GUARD_BINS + 1 && a + DC_GUARD_BINS >= dc && b <= dc + DC_GUARD_BINS {
@@ -117,13 +279,12 @@ pub fn detect_carriers(spectrum_db: &[f32], rate: f64, min_snr_db: f32) -> Vec<C
         }
 
         let excess: Vec<f64> = (a..=b)
-            .map(|k| (10f64.powf(spectrum_db[k] as f64 / 10.0) - floor_lin).max(0.0))
+            .map(|k| (10f64.powf(s[k] as f64 / 10.0) - floor_lin).max(0.0))
             .collect();
         let total: f64 = excess.iter().sum();
         if total <= 0.0 {
             continue;
         }
-        let freq = |k: usize| (k as f64 / n as f64 - 0.5) * rate;
         let center = excess
             .iter()
             .enumerate()
@@ -145,24 +306,74 @@ pub fn detect_carriers(spectrum_db: &[f32], rate: f64, min_snr_db: f32) -> Vec<C
             }
         }
 
-        // Equivalent noise bandwidth over the plateau.
+        // Equivalent noise bandwidth over the plateau, and how flat it is.
         let max_e = excess.iter().copied().fold(0.0, f64::max);
-        let mut plateau: Vec<f64> = excess
-            .iter()
-            .copied()
-            .filter(|&p| p >= 0.5 * max_e)
+        let plateau_idx: Vec<usize> = (0..excess.len())
+            .filter(|&i| excess[i] >= 0.5 * max_e)
             .collect();
+        let mut plateau: Vec<f64> = plateau_idx.iter().map(|&i| excess[i]).collect();
         plateau.sort_unstable_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
         let p0 = plateau[plateau.len() / 2];
         let rs = if p0 > 0.0 { total * bin_hz / p0 } else { 0.0 };
 
-        let peak = spectrum_db[a..=b].iter().copied().fold(f32::MIN, f32::max);
+        // A narrow line has a short top run that also holds most of the power:
+        // a CW's main lobe, even with window leakage widening its region. A
+        // comb on a hump also has a short top run (one tooth), but the tooth
+        // holds little of the region's power, so the region is a rough lump
+        // rather than a line.
+        let (ts, tl) = top_run(s, a, b);
+        let top_power: f64 = excess[ts - a..ts - a + tl].iter().sum();
+        let narrow = width < NARROW_BINS || (tl < NARROW_BINS && top_power >= 0.5 * total);
+        // Flatness over the central 40 % of the region, in dB. That stays on
+        // the flat top of any legal roll-off (α = 0.35 is flat over 48 % of its
+        // width) yet spans many periods of any comb. Not over the half-power
+        // plateau: that clips a ripple's troughs out and hides it.
+        let core: Vec<f32> = if width >= 20 {
+            let lo = a + width * 3 / 10;
+            let hi = b - width * 3 / 10;
+            s[lo..=hi].to_vec()
+        } else {
+            Vec::new()
+        };
+        let rough = core.len() >= 6 && detrended_std(&core) > ROUGH_DB;
+
+        let peak = s[a..=b].iter().copied().fold(f32::MIN, f32::max);
         out.push(Carrier {
             center_hz: center,
             bandwidth_hz: best as f64 * bin_hz,
             symbol_rate_hz: rs,
             snr_db: peak - floor,
-            narrow: width < NARROW_BINS,
+            narrow,
+            rough,
+        });
+    }
+
+    // 5. If there are too many, keep clean carriers first, then rough lumps,
+    //    then narrow lines, strongest first within each — so a comb of spurs
+    //    (seen live: a regular ~100 kHz comb across the whole FM band) cannot
+    //    crowd a weaker real carrier out. Then back into frequency order.
+    if out.len() > MAX_CARRIERS {
+        let rank = |c: &Carrier| {
+            if c.is_clean() {
+                0
+            } else if c.rough {
+                1
+            } else {
+                2
+            }
+        };
+        out.sort_by(|x, y| {
+            rank(x).cmp(&rank(y)).then(
+                y.snr_db
+                    .partial_cmp(&x.snr_db)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+        });
+        out.truncate(MAX_CARRIERS);
+        out.sort_by(|x, y| {
+            x.center_hz
+                .partial_cmp(&y.center_hz)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
     out
@@ -200,6 +411,18 @@ mod tests {
         lin.iter().map(|&p| (10.0 * p.log10()) as f32).collect()
     }
 
+    /// Deterministic ±`amp` dB jitter, like a smoothed spectrum's noise.
+    fn jitter(s: &mut [f32], amp: f32, seed: u64) {
+        let mut x = seed | 1;
+        for v in s.iter_mut() {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            let u = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / (1u32 << 24) as f32;
+            *v += (u - 0.5) * 2.0 * amp;
+        }
+    }
+
     #[test]
     fn finds_two_carriers_and_ignores_the_dc_spur() {
         let rate = 20e6;
@@ -217,7 +440,7 @@ mod tests {
         let a = found[0];
         assert!((a.center_hz + 4.0e6).abs() < 3.0 * bin, "{a:?}");
         assert!((a.symbol_rate_hz - 2.0e6).abs() / 2.0e6 < 0.03, "{a:?}");
-        assert!(!a.narrow);
+        assert!(a.is_clean(), "{a:?}");
 
         let b = found[1];
         assert!((b.center_hz - 3.5e6).abs() < 3.0 * bin, "{b:?}");
@@ -227,7 +450,6 @@ mod tests {
 
     #[test]
     fn adjacent_carriers_stay_separate() {
-        // Two carriers with a small guard band: a busy transponder.
         let rate = 10e6;
         let n = 8192;
         let s = spectrum(
@@ -241,11 +463,65 @@ mod tests {
     }
 
     #[test]
+    fn tightly_packed_carriers_with_deep_troughs_stay_separate() {
+        // Skirts touching, so the spectrum never returns to the floor between
+        // them -- but the trough is far below both peaks, so they are two.
+        let rate = 10e6;
+        let n = 8192;
+        let s = spectrum(
+            n,
+            rate,
+            &[(-0.62e6, 1.0e6, 0.35, -50.0), (0.62e6, 1.0e6, 0.35, -50.0)],
+            false,
+        );
+        let found = detect_carriers(&s, rate, 6.0);
+        assert_eq!(found.len(), 2, "{found:#?}");
+    }
+
+    #[test]
+    fn a_comb_of_ripple_is_one_rough_lump_not_dozens_of_carriers() {
+        // Regression: the live FM band through an overloaded HackRF showed a
+        // dense comb, and every ripple peak was reported as a carrier (168).
+        let rate = 20e6;
+        let n = 4096;
+        let mut s = spectrum(n, rate, &[], false);
+        let bin = rate / n as f64;
+        for (k, v) in s.iter_mut().enumerate() {
+            let f = (k as f64 / n as f64 - 0.5) * rate;
+            if (-9.5e6..-2.5e6).contains(&f) {
+                // A hump 20 dB up with 4 dB ripple every ~130 kHz.
+                let ripple = 2.0 * (std::f64::consts::TAU * f / 130e3).cos();
+                *v = -60.0 + ripple as f32;
+            }
+        }
+        jitter(&mut s, 0.3, 7);
+        let found = detect_carriers(&s, rate, 6.0);
+        assert!(found.len() <= 3, "{} regions: {found:#?}", found.len());
+        let lump = found
+            .iter()
+            .max_by(|a, b| a.bandwidth_hz.partial_cmp(&b.bandwidth_hz).unwrap())
+            .unwrap();
+        assert!(lump.bandwidth_hz > 6.0e6, "{lump:?} (bin {bin})");
+        assert!(lump.rough, "a comb must be flagged rough: {lump:?}");
+    }
+
+    #[test]
+    fn a_noisy_but_clean_carrier_is_not_rough() {
+        let rate = 8e6;
+        let n = 4096;
+        let mut s = spectrum(n, rate, &[(1.0e6, 1.0e6, 0.2, -55.0)], false);
+        jitter(&mut s, 0.6, 3);
+        let found = detect_carriers(&s, rate, 6.0);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].is_clean(), "{:?}", found[0]);
+    }
+
+    #[test]
     fn cw_tone_is_flagged_narrow() {
         let rate = 2e6;
         let n = 4096;
         let mut s = spectrum(n, rate, &[], false);
-        s[3000] = -30.0; // a tone well away from DC
+        s[3000] = -30.0;
         let found = detect_carriers(&s, rate, 6.0);
         assert_eq!(found.len(), 1);
         assert!(found[0].narrow);
@@ -258,6 +534,103 @@ mod tests {
     }
 
     #[test]
+    fn too_many_keeps_the_strongest() {
+        // 80 well-separated tones of rising strength: only MAX_CARRIERS come
+        // back, the strongest ones, in frequency order.
+        let rate = 20e6;
+        let n = 8192;
+        let mut s = spectrum(n, rate, &[], false);
+        for i in 0..80usize {
+            s[200 + i * 95] = -60.0 + i as f32 * 0.2;
+        }
+        let found = detect_carriers(&s, rate, 6.0);
+        assert_eq!(found.len(), MAX_CARRIERS);
+        assert!(found.windows(2).all(|w| w[0].center_hz < w[1].center_hz));
+        let weakest = found.iter().map(|c| c.snr_db).fold(f32::MAX, f32::min);
+        assert!(
+            weakest > 20.0 + (80 - MAX_CARRIERS) as f32 * 0.2 - 0.3,
+            "{weakest}"
+        );
+    }
+
+    #[test]
+    fn a_deep_comb_on_a_hump_is_one_rough_lump_not_carriers() {
+        // Regression, from the live FM band: one-bin teeth 10 dB above a hump
+        // that is itself well above the floor. Splitting at those valleys
+        // would chop it into dozens of fake carriers; it must stay one rough
+        // region, and nothing in it may be offered as a clean carrier.
+        let rate = 20e6;
+        let n = 4096;
+        let mut s = spectrum(n, rate, &[], false);
+        let bin = rate / n as f64;
+        let period = (110e3 / bin).round() as usize; // ~22 bins
+        for (k, v) in s.iter_mut().enumerate() {
+            let f = (k as f64 / n as f64 - 0.5) * rate;
+            if (-9.0e6..-4.0e6).contains(&f) {
+                // Hump at -62 dB, with one-bin teeth 10 dB up.
+                *v = if k % period == 0 { -52.0 } else { -62.0 };
+            }
+        }
+        jitter(&mut s, 0.3, 11);
+        let found = detect_carriers(&s, rate, 6.0);
+        let clean: Vec<_> = found.iter().filter(|c| c.is_clean()).collect();
+        assert!(
+            clean.is_empty(),
+            "{} clean carriers in a comb: {clean:#?}",
+            clean.len()
+        );
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(
+            found[0].rough && found[0].bandwidth_hz > 4.0e6,
+            "{:?}",
+            found[0]
+        );
+    }
+
+    #[test]
+    fn a_cw_tone_with_window_leakage_is_narrow() {
+        // The scene's CW: Hann leakage widens its region past NARROW_BINS, but
+        // above its pedestal it is a line.
+        let rate = 8e6;
+        let n = 4096;
+        let mut s = spectrum(n, rate, &[], false);
+        for (d, v) in [
+            (0usize, -20.0f32),
+            (1, -26.0),
+            (2, -40.0),
+            (3, -55.0),
+            (4, -66.0),
+            (5, -74.0),
+        ] {
+            s[1000 + d] = v;
+            s[1000 - d] = v;
+        }
+        let found = detect_carriers(&s, rate, 6.0);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].narrow, "{:?}", found[0]);
+    }
+
+    #[test]
+    fn a_comb_of_spurs_cannot_crowd_out_a_real_carrier() {
+        // 90 strong narrow spurs plus one weaker clean carrier: the carrier
+        // must survive the cap.
+        let rate = 20e6;
+        let n = 8192;
+        let mut s = spectrum(n, rate, &[(6.0e6, 500e3, 0.2, -66.0)], false);
+        for i in 0..90usize {
+            s[100 + i * 60] = -40.0;
+        }
+        let found = detect_carriers(&s, rate, 6.0);
+        assert_eq!(found.len(), MAX_CARRIERS);
+        assert!(
+            found
+                .iter()
+                .any(|c| c.is_clean() && (c.center_hz - 6.0e6).abs() < 20e3),
+            "the real carrier was dropped"
+        );
+    }
+
+    #[test]
     fn suggested_vfo_fits_the_carrier() {
         let c = Carrier {
             center_hz: 0.0,
@@ -265,6 +638,7 @@ mod tests {
             symbol_rate_hz: 1.0e6,
             snr_db: 20.0,
             narrow: false,
+            rough: false,
         };
         assert!(c.suggested_vfo_bandwidth() >= 1.35e6);
     }

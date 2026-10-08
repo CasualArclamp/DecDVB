@@ -9,13 +9,14 @@ rust-version.workspace = true
 
 [features]
 default = []
-# Live HackRF One front end. Implemented in M1 by loading libhackrf at run time
-# (libloading), so building DecDVB never needs the HackRF SDK installed.
-hackrf = ["dep:libloading"]
+# Live HackRF One front end, in pure Rust over USB (nusb): no libhackrf, no
+# libusb, no DLLs — the portable exe stays a single file. On Windows the HackRF
+# must use the WinUSB driver (Zadig, or the in-box winusb.inf).
+hackrf = ["dep:seify-hackrfone"]
 
 [dependencies]
 decdvb-core = { path = "../decdvb-core" }
 num-complex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-libloading = { version = "0.8", optional = true }
+seify-hackrfone = { version = "0.2.2", optional = true }

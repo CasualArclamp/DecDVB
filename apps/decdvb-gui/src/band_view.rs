@@ -420,23 +420,49 @@ impl BandView {
             if hovered {
                 carrier_hit = Some(i);
             }
+            // A narrow line (CW, spur, comb tooth) is a small tick: shown, but
+            // not offered as a carrier to claim.
+            if c.narrow {
+                let x = x_of(c.center_hz);
+                painter.line_segment(
+                    [pos2(x, carrier_y - 3.0), pos2(x, carrier_y + 3.0)],
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(200, 200, 200, 110)),
+                );
+                if carrier_hit == Some(i) {
+                    carrier_hit = None;
+                }
+                continue;
+            }
             let taken = covered(c.center_hz);
+            // Green for a clean carrier; orange for a rough lump (overload
+            // products, several signals, or something not linearly
+            // modulated), whose "symbol rate" would mean nothing.
+            let base = if c.rough {
+                Color32::from_rgb(240, 170, 80)
+            } else {
+                Color32::from_rgb(130, 230, 150)
+            };
             let col = if hovered {
                 Color32::from_rgb(255, 255, 255)
             } else if taken {
-                Color32::from_rgba_unmultiplied(160, 220, 160, 90)
+                base.gamma_multiply(0.4)
             } else {
-                Color32::from_rgb(130, 230, 150)
+                base
             };
             let st = Stroke::new(if hovered { 2.0 } else { 1.3 }, col);
             painter.line_segment([pos2(x0, carrier_y), pos2(x1, carrier_y)], st);
             painter.line_segment([pos2(x0, carrier_y - 4.0), pos2(x0, carrier_y + 4.0)], st);
             painter.line_segment([pos2(x1, carrier_y - 4.0), pos2(x1, carrier_y + 4.0)], st);
             if !c.narrow && x1 - x0 > 28.0 {
+                let label = if c.rough {
+                    "lump".to_string()
+                } else {
+                    format::rate(c.symbol_rate_hz)
+                };
                 painter.text(
                     pos2((x0 + x1) / 2.0, carrier_y - 3.0),
                     Align2::CENTER_BOTTOM,
-                    format::rate(c.symbol_rate_hz),
+                    label,
                     FontId::proportional(10.5),
                     col,
                 );

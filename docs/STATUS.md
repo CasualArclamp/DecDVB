@@ -70,12 +70,37 @@ makes ACM possible at all, since every PLFRAME announces its own MODCOD.
   sequence with zero losses, re-acquires after a dropout, never invents frames
   from noise.
 
+### Done: live HackRF (2026-10-08)
+
+`decdvb-io::hackrf` — pure Rust over USB via `seify-hackrfone` (MIT, nusb):
+no libhackrf, no libusb, no DLLs, so the portable exe stays one file, and the
+feature is now on by default. Receive only; antenna-port power forced off on
+every configuration. A reader thread keeps three 256 KB transfers in flight and
+hands buffers over a bounded channel, dropping (and counting) whole buffers if
+the consumer falls behind. The driver's gain setters `panic!` on an unexpected
+reply, so gains are snapped to valid steps and calls run under `catch_unwind`.
+Verified on Rory's HackRF: 7.99 MS/s delivered at 8 MS/s, and the GUI running
+live at 20 MS/s with the front end at 1–2 % CPU. GUI: a HackRF panel with
+frequency, rate, LNA/VGA/amp and an LNB LO for the axis; frequency and gains
+apply live.
+
+**Carrier detection, hardened on real signal.** The live FM band first
+produced 168 "carriers": a regular ~100 kHz comb (likely switching-PSU or USB
+interference near the PC, or overload; not investigated) whose every tooth
+passed the threshold. Now: regions are split only at valleys that are deep
+relative to both sides' robust (95th-percentile) tops *and* where both sides
+have carrier-like flat tops; narrow lines are recognised by a short top run
+that holds most of the power; a region with a non-flat top is flagged `rough`
+(orange "lump"); spurs are ticks, not brackets; clean carriers outrank spurs
+under the 48-carrier cap. The same band now reads 6 carriers + 42 narrow lines,
+the comb as one lump. Six regression tests cover it.
+
 ### Still to do
 
-1. Live HackRF source (`libloading` over `libhackrf`), cs8 at up to ~20 MS/s.
-2. Carrier recovery: coarse from the 4th-power line / header phase, fine from
+1. Carrier recovery: coarse from the 4th-power line / header phase, fine from
    pilots and a decision-directed loop — the payload still rotates.
-3. DC/IQ-imbalance correction for the HackRF's DC spur.
+2. DC/IQ-imbalance correction for the HackRF's DC spur.
+3. NCO mixing per VFO in f32 / lane-parallel (it is f64 per sample now).
 
 ## M1b — wideband waterfall + VFOs + Identify (done, 2026-10-08)
 

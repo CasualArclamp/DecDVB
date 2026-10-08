@@ -11,6 +11,9 @@ pub mod hackrf;
 
 pub use file::{IqFileReader, IqFileWriter, format_from_path};
 
+#[cfg(feature = "hackrf")]
+pub use hackrf::{HackRfControl, HackRfGains, HackRfSettings, HackRfSource};
+
 use decdvb_core::{Iq, Result};
 
 /// A source of baseband complex samples.

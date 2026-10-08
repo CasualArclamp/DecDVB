@@ -18,6 +18,12 @@ pub struct Options {
     pub claim_carriers: bool,
     /// Select the n-th VFO (1-based) once claimed.
     pub select: Option<usize>,
+    /// Start the HackRF tuned here, MHz (receive only).
+    pub hackrf_mhz: Option<f64>,
+    /// HackRF sample rate, MS/s.
+    pub rate_msps: Option<f64>,
+    /// LNB LO for the axis, MHz.
+    pub lo_mhz: Option<f64>,
 }
 
 impl Options {
@@ -46,6 +52,17 @@ impl Options {
                             .and_then(|s| s.parse().ok())
                             .ok_or("--select needs a VFO number")?,
                     );
+                }
+                Some(flag @ ("--hackrf" | "--rate" | "--lo")) => {
+                    let v: f64 = args
+                        .next()
+                        .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
+                        .ok_or_else(|| format!("{flag} needs a number"))?;
+                    match flag {
+                        "--hackrf" => o.hackrf_mhz = Some(v),
+                        "--rate" => o.rate_msps = Some(v),
+                        _ => o.lo_mhz = Some(v),
+                    }
                 }
                 Some(s) if s.starts_with("--") => return Err(format!("unknown option {s}")),
                 _ => o.file = Some(a.into()),

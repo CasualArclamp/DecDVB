@@ -12,7 +12,8 @@ name = "decdvb"
 path = "src/main.rs"
 
 [features]
-default = []
+# The HackRF driver is pure Rust (no SDK, no DLLs), so it is on by default.
+default = ["hackrf"]
 hackrf = ["decdvb-io/hackrf"]
 
 [dependencies]

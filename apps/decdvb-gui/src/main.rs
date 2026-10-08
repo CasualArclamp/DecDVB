@@ -8,6 +8,7 @@ mod automation;
 mod band_view;
 mod filename;
 mod format;
+mod radio;
 mod side_panel;
 mod waterfall;
 
@@ -56,6 +57,15 @@ fn main() -> eframe::Result {
             if let Some(p) = opts.file.clone() {
                 app.open_file(p);
             }
+            #[cfg(feature = "hackrf")]
+            if let Some(mhz) = opts.hackrf_mhz {
+                app.radio.settings.center_hz = (mhz * 1e6).round() as u64;
+                if let Some(r) = opts.rate_msps {
+                    app.radio.settings.sample_rate = (r * 1e6).round() as u32;
+                }
+                app.radio.lnb_lo_mhz = opts.lo_mhz.unwrap_or(0.0);
+                app.start_hackrf();
+            }
             Ok(Box::new(app))
         }),
     )
@@ -83,6 +93,11 @@ struct App {
     paused: bool,
     note: String,
     automation: automation::Automation,
+    #[cfg(feature = "hackrf")]
+    radio: radio::RadioPanel,
+    /// Live controls while the HackRF is the source.
+    #[cfg(feature = "hackrf")]
+    hackrf: Option<decdvb_io::HackRfControl>,
 }
 
 impl Default for App {
@@ -108,6 +123,10 @@ impl Default for App {
             paused: false,
             note: String::new(),
             automation: automation::Automation::new(&automation::Options::default()),
+            #[cfg(feature = "hackrf")]
+            radio: radio::RadioPanel::default(),
+            #[cfg(feature = "hackrf")]
+            hackrf: None,
         }
     }
 }
@@ -118,7 +137,67 @@ impl App {
     }
 
     fn rf_center(&self) -> f64 {
+        #[cfg(feature = "hackrf")]
+        if self.hackrf.is_some() {
+            return self.radio.rf_center();
+        }
         self.rf_center_mhz * 1e6
+    }
+
+    /// Run `source` through a fresh engine, keeping the VFOs.
+    fn start_engine(&mut self, source: Box<dyn decdvb_io::IqSource>) {
+        let rate = source.sample_rate();
+        let mut eng = Engine::start(source, self.opts.clone());
+        if self.paused {
+            eng.set_paused(true);
+        }
+        // Re-create the VFOs; the new engine numbers them afresh.
+        let old = std::mem::take(&mut self.vfos);
+        let mut remap = BTreeMap::new();
+        for v in old {
+            let id = eng.add_vfo(v.settings.clone());
+            remap.insert(v.id, id);
+            self.vfos.push(UiVfo {
+                id,
+                settings: v.settings,
+            });
+        }
+        self.selected = self.selected.and_then(|s| remap.get(&s).copied());
+        self.statuses.clear();
+        self.engine = Some(eng);
+        self.history.reset();
+        self.last_seq = 0;
+        self.front = FrontStatus::default();
+        self.sample_rate = rate;
+        self.band.set_span(rate);
+    }
+
+    /// Stop whatever is running. The radio's control handle holds the USB
+    /// device open, so it goes first, then the engine (whose thread owns the
+    /// source); only then can the radio be opened again.
+    fn stop_source(&mut self) {
+        #[cfg(feature = "hackrf")]
+        {
+            self.hackrf = None;
+        }
+        self.engine = None;
+    }
+
+    /// Start the HackRF with the panel's settings.
+    #[cfg(feature = "hackrf")]
+    fn start_hackrf(&mut self) {
+        self.stop_source();
+        self.path = None;
+        match decdvb_io::HackRfSource::open(self.radio.settings) {
+            Ok(src) => {
+                self.hackrf = Some(src.control());
+                self.radio.error = None;
+                self.note = "Live from the HackRF.".into();
+                self.start_engine(Box::new(src));
+                self.applied = Some(self.source_key());
+            }
+            Err(e) => self.radio.error = Some(e.to_string()),
+        }
     }
 
     /// Open a capture, taking rate/centre/format from its name when it says.
@@ -145,38 +224,22 @@ impl App {
         self.restart();
     }
 
-    /// (Re)start the engine on the current file with the current settings,
+    /// (Re)start the engine on the current source with the current settings,
     /// keeping the VFOs.
     fn restart(&mut self) {
+        #[cfg(feature = "hackrf")]
+        if self.hackrf.is_some() {
+            self.start_hackrf();
+            return;
+        }
         let Some(path) = self.path.clone() else {
             return;
         };
-        self.engine = None; // stops the old threads first
+        self.stop_source();
         match IqFileReader::open(&path, self.format, self.sample_rate, 1 << 16) {
             Ok(reader) => {
                 let reader = reader.with_center_freq(self.rf_center());
-                let mut eng = Engine::start(Box::new(reader), self.opts.clone());
-                if self.paused {
-                    eng.set_paused(true);
-                }
-                // Re-create the VFOs; the new engine numbers them afresh.
-                let old = std::mem::take(&mut self.vfos);
-                let mut remap = BTreeMap::new();
-                for v in old {
-                    let id = eng.add_vfo(v.settings.clone());
-                    remap.insert(v.id, id);
-                    self.vfos.push(UiVfo {
-                        id,
-                        settings: v.settings,
-                    });
-                }
-                self.selected = self.selected.and_then(|s| remap.get(&s).copied());
-                self.statuses.clear();
-                self.engine = Some(eng);
-                self.history.reset();
-                self.last_seq = 0;
-                self.front = FrontStatus::default();
-                self.band.set_span(self.sample_rate);
+                self.start_engine(Box::new(reader));
                 self.applied = Some(self.source_key());
             }
             Err(e) => self.note = format!("Cannot open {}: {e}", path.display()),
@@ -243,8 +306,32 @@ impl App {
             {
                 self.open_file(p);
             }
+            #[cfg(feature = "hackrf")]
+            {
+                let live = self.hackrf.is_some();
+                let label = if live {
+                    "📡 HackRF ●"
+                } else {
+                    "📡 HackRF"
+                };
+                if ui
+                    .selectable_label(
+                        self.radio.open,
+                        RichText::new(label).color(if live {
+                            egui::Color32::from_rgb(110, 220, 110)
+                        } else {
+                            ui.visuals().text_color()
+                        }),
+                    )
+                    .on_hover_text("Live input from a HackRF One: frequency, rate, gains, LNB LO.")
+                    .clicked()
+                {
+                    self.radio.open = !self.radio.open;
+                }
+            }
+            #[cfg(not(feature = "hackrf"))]
             ui.add_enabled(false, egui::Button::new("📡 HackRF"))
-                .on_disabled_hover_text("Live HackRF input is the next step (M1).");
+                .on_disabled_hover_text("Built without the hackrf feature.");
             ui.separator();
 
             ui.label("Rate");
@@ -354,7 +441,15 @@ impl App {
             ui.separator();
             ui.label(state);
             ui.separator();
-            ui.label(format!("{} carriers", self.front.carriers.len()));
+            let narrow = self.front.carriers.iter().filter(|c| c.narrow).count();
+            let carriers = self.front.carriers.len() - narrow;
+            ui.label(format!("{carriers} carriers"))
+                .on_hover_text("Green brackets: clean carriers. Orange: rough lumps.");
+            if narrow > 0 {
+                let s = if narrow == 1 { "" } else { "s" };
+                ui.label(RichText::new(format!("{narrow} narrow line{s}")).weak())
+                    .on_hover_text("CW tones, spurs, comb teeth: the small ticks on the spectrum.");
+            }
             ui.separator();
             let secs = self.front.samples as f64 / self.sample_rate.max(1.0);
             ui.label(format!("{secs:.1} s"));
@@ -398,10 +493,29 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
-        // Unattended: claim every carrier once the detector has settled.
+        // Unattended: claim the carriers once the detector has settled — the
+        // eight strongest that are not rough lumps, in frequency order.
         if self.automation.claim_carriers && !self.automation.claimed && self.front.row_seq > 40 {
             self.automation.claimed = true;
-            for c in self.front.carriers.clone() {
+            let mut picks: Vec<_> = self
+                .front
+                .carriers
+                .iter()
+                .copied()
+                .filter(|c| c.is_clean())
+                .collect();
+            picks.sort_by(|a, b| {
+                b.snr_db
+                    .partial_cmp(&a.snr_db)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            picks.truncate(8);
+            picks.sort_by(|a, b| {
+                a.center_hz
+                    .partial_cmp(&b.center_hz)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for c in picks {
                 let bw = if c.narrow {
                     20e3
                 } else {
@@ -428,6 +542,19 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+
+        #[cfg(feature = "hackrf")]
+        {
+            let live = self.hackrf.clone();
+            match self.radio.show(ui.ctx(), live.as_ref()) {
+                Some(radio::RadioAction::Start) => self.start_hackrf(),
+                Some(radio::RadioAction::Stop) => {
+                    self.stop_source();
+                    self.note = "HackRF stopped.".into();
+                }
+                None => {}
+            }
+        }
 
         let mut actions = Vec::new();
         egui::Panel::right("side")
