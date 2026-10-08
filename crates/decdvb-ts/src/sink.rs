@@ -14,21 +14,16 @@
 //! unless pointed elsewhere on purpose.
 
 use std::fs::File;
-use std::io::{self, BufWriter, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::io::{self, BufWriter, Write};
+use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::Duration;
+
+use decdvb_ip::serve::StreamServer;
 
 use crate::deframe::TS_LEN;
 
 /// Packets per UDP datagram.
 const PER_DATAGRAM: usize = 7;
-/// Chunks a TCP client may have queued before new ones are dropped for it.
-const CLIENT_QUEUE: usize = 256;
 
 /// A `.ts` file.
 pub struct TsFile {
@@ -102,144 +97,31 @@ impl UdpSink {
     }
 }
 
-struct Client {
-    peer: SocketAddr,
-    tx: SyncSender<Arc<Vec<u8>>>,
-    alive: Arc<AtomicBool>,
-}
-
-/// A TCP server streaming TS to every connected client.
+/// A TCP server streaming TS to every connected client (HTTP-aware, see
+/// `decdvb_ip::serve`).
 pub struct TcpSink {
+    server: StreamServer,
     pub addr: SocketAddr,
-    clients: Arc<Mutex<Vec<Client>>>,
-    stop: Arc<AtomicBool>,
-    accept: Option<JoinHandle<()>>,
-    pub dropped_chunks: u64,
 }
 
 impl TcpSink {
     /// Listen on `addr` (port 0 picks a free one; see `addr` after).
     pub fn bind(addr: SocketAddr) -> io::Result<Self> {
-        let listener = TcpListener::bind(addr)?;
-        let addr = listener.local_addr()?;
-        listener.set_nonblocking(true)?;
-        let clients: Arc<Mutex<Vec<Client>>> = Arc::new(Mutex::new(Vec::new()));
-        let stop = Arc::new(AtomicBool::new(false));
-        let accept = {
-            let (clients, stop) = (clients.clone(), stop.clone());
-            std::thread::Builder::new()
-                .name("decdvb-ts-tcp".into())
-                .spawn(move || accept_loop(listener, clients, stop))?
-        };
+        let server = StreamServer::bind(addr, "video/mp2t")?;
         Ok(TcpSink {
-            addr,
-            clients,
-            stop,
-            accept: Some(accept),
-            dropped_chunks: 0,
+            addr: server.addr,
+            server,
         })
     }
 
     /// Addresses of the players connected now.
     pub fn clients(&self) -> Vec<SocketAddr> {
-        let mut c = self.clients.lock().unwrap();
-        c.retain(|c| c.alive.load(Ordering::Relaxed));
-        c.iter().map(|c| c.peer).collect()
+        self.server.clients()
     }
 
     pub fn write(&mut self, packets: &[[u8; TS_LEN]]) {
-        if packets.is_empty() {
-            return;
-        }
-        let mut c = self.clients.lock().unwrap();
-        if c.is_empty() {
-            return;
-        }
-        let chunk = Arc::new(packets.concat());
-        c.retain(|cl| {
-            if !cl.alive.load(Ordering::Relaxed) {
-                return false;
-            }
-            match cl.tx.try_send(chunk.clone()) {
-                Ok(()) => true,
-                Err(TrySendError::Full(_)) => {
-                    self.dropped_chunks += 1;
-                    true
-                }
-                Err(TrySendError::Disconnected(_)) => false,
-            }
-        });
-    }
-}
-
-impl Drop for TcpSink {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        // Dropping the senders ends the client threads.
-        self.clients.lock().unwrap().clear();
-        if let Some(j) = self.accept.take() {
-            let _ = j.join();
-        }
-    }
-}
-
-fn accept_loop(listener: TcpListener, clients: Arc<Mutex<Vec<Client>>>, stop: Arc<AtomicBool>) {
-    while !stop.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((stream, peer)) => {
-                let (tx, rx) = mpsc::sync_channel::<Arc<Vec<u8>>>(CLIENT_QUEUE);
-                let alive = Arc::new(AtomicBool::new(true));
-                let a = alive.clone();
-                let spawned = std::thread::Builder::new()
-                    .name("decdvb-ts-client".into())
-                    .spawn(move || {
-                        serve_client(stream, rx);
-                        a.store(false, Ordering::Relaxed);
-                    });
-                if spawned.is_ok() {
-                    clients.lock().unwrap().push(Client { peer, tx, alive });
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(200)),
-        }
-    }
-}
-
-/// Answer an HTTP request if the client sends one, then stream.
-fn serve_client(mut s: TcpStream, rx: mpsc::Receiver<Arc<Vec<u8>>>) {
-    let _ = s.set_nonblocking(false);
-    let _ = s.set_nodelay(true);
-    // A player speaking HTTP sends its request at once; a raw TCP client
-    // sends nothing. Wait briefly to tell which.
-    let _ = s.set_read_timeout(Some(Duration::from_millis(400)));
-    let mut req = Vec::new();
-    let mut buf = [0u8; 1024];
-    while req.len() < 8192 {
-        match s.read(&mut buf) {
-            Ok(0) => return,
-            Ok(n) => {
-                req.extend_from_slice(&buf[..n]);
-                if req.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            Err(_) => break, // timeout: a raw client
-        }
-    }
-    if req.starts_with(b"GET ") || req.starts_with(b"HEAD ") {
-        let head = "HTTP/1.0 200 OK\r\nContent-Type: video/mp2t\r\nCache-Control: no-cache\r\n\
-                    Connection: close\r\nServer: DecDVB\r\n\r\n";
-        if s.write_all(head.as_bytes()).is_err() || req.starts_with(b"HEAD ") {
-            return;
-        }
-    }
-    let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
-    while let Ok(chunk) = rx.recv() {
-        if s.write_all(&chunk).is_err() {
-            return;
+        if !packets.is_empty() {
+            self.server.write(packets.concat());
         }
     }
 }
@@ -247,6 +129,9 @@ fn serve_client(mut s: TcpStream, rx: mpsc::Receiver<Arc<Vec<u8>>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::net::TcpStream;
+    use std::time::Duration;
 
     fn pkts(n: usize) -> Vec<[u8; TS_LEN]> {
         (0..n)

@@ -109,6 +109,13 @@ struct App {
     names: u32,
     paused: bool,
     ts_viewer: ts_viewer::TsViewer,
+    /// A player to open on a multicast audio stream once it is relayed.
+    pending_audio: Option<(
+        VfoId,
+        std::net::SocketAddr,
+        player::Player,
+        std::time::Instant,
+    )>,
     /// A player to open once its VFO's TCP server is up.
     pending_player: Option<(VfoId, player::Player, std::time::Instant)>,
     note: String,
@@ -142,6 +149,7 @@ impl Default for App {
             names: 1,
             paused: false,
             pending_player: None,
+            pending_audio: None,
             ts_viewer: Default::default(),
             note: String::new(),
             automation: automation::Automation::new(&automation::Options::default()),
@@ -318,6 +326,22 @@ impl App {
                 }
             }
             Action::OpenTsViewer(id) => self.ts_viewer.open(id),
+            Action::PlayAudio(id, key, p) => {
+                if let Some(v) = self.vfos.iter().find(|v| v.id == id) {
+                    let mut s = v.settings.clone();
+                    s.audio_play = Some(key);
+                    self.apply(Action::Update(id, s));
+                    self.pending_audio = Some((id, key, p, std::time::Instant::now()));
+                }
+            }
+            Action::StopAudio(id) => {
+                if let Some(v) = self.vfos.iter().find(|v| v.id == id) {
+                    let mut s = v.settings.clone();
+                    s.audio_play = None;
+                    self.apply(Action::Update(id, s));
+                }
+                self.pending_audio = None;
+            }
             Action::Play(id, p) => {
                 // The server starts with the VFO's next TS frame; the player
                 // is launched once it is up (see `launch_pending_player`).
@@ -330,6 +354,36 @@ impl App {
                 }
                 self.pending_player = Some((id, p, std::time::Instant::now()));
             }
+        }
+    }
+
+    /// Launch a player on a multicast audio stream once its relay is ready.
+    fn launch_pending_audio(&mut self) {
+        let Some((id, key, p, since)) = self.pending_audio else {
+            return;
+        };
+        let g = self
+            .statuses
+            .get(&id)
+            .and_then(|st| st.fec.as_ref())
+            .and_then(|f| f.gse.as_ref());
+        let ready = g.filter(|g| g.audio_playing == Some(key));
+        if let Some(e) = ready.and_then(|g| g.audio_error.clone()) {
+            self.note = e;
+            self.pending_audio = None;
+        } else if let Some(t) = ready.and_then(|g| g.audio_target.clone()) {
+            let what = match t {
+                decdvb_ip::PlayTarget::Sdp(path) => path.display().to_string(),
+                decdvb_ip::PlayTarget::Http(addr) => player::http_url(addr),
+            };
+            self.note = match player::launch(p, &what) {
+                Ok(()) => format!("{} opening {what}", p.name()),
+                Err(e) => e,
+            };
+            self.pending_audio = None;
+        } else if since.elapsed().as_secs() > 15 {
+            self.note = format!("{}: the stream did not start", p.name());
+            self.pending_audio = None;
         }
     }
 
@@ -710,6 +764,7 @@ impl eframe::App for App {
             }
         }
         self.launch_pending_player();
+        self.launch_pending_audio();
         self.automation.handle_screenshot(ctx);
         self.automation.tick(ctx);
         if self.automation.active() {

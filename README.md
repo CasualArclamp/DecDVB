@@ -36,6 +36,8 @@ and a CW tone. Every carrier was found and identified blind.*
 | All S2X MODCODs, VL-SNR | M3 |
 | **GSE → IP → PCAP** + live IP stats; GSE variant detected from the data | ✅ |
 | **MPEG-TS**: services, PIDs, errors; `.ts` file, UDP, TCP/HTTP to VLC or PotPlayer | ✅ |
+| **TS analyser** (EBSPro-style): PIDs, services, now/next, network, tables | ✅ |
+| **Multicast audio** from GSE or MPE: SAP/SDP names, codecs, play in VLC/PotPlayer | ✅ |
 | Modulator (HackRF TX / IQ file) | M6 |
 
 ## Using it
@@ -113,6 +115,18 @@ Both network outputs start on 127.0.0.1, this machine only; use 0.0.0.0 (TCP)
 or another host's address (UDP) to reach the network. Several players can
 connect to the TCP server at once; one that stalls loses data rather than
 holding up the receiver.
+
+### Multicast audio
+
+Satellite links carry radio as IP multicast — in GSE, or in MPE inside a
+transport stream (both are read). Any DVB-S2 IP or TS VFO lists the audio
+streams it finds under **Multicast audio**: named from SAP/SDP announcements
+where there are any, with codec (AAC in ADTS, LATM/LOAS or RFC 3640, MPEG
+audio, PCM), bitrate and RTP payload type. **▶ VLC / ▶ PotPlayer** plays one:
+an RTP stream with a description is relayed to a local port and the player is
+given an SDP file (so it decodes HE-AAC, LATM and the rest itself); a bare
+elementary stream is served at a local HTTP address. After the
+[VK2SWL DVB-S/S2 Multicast Audio Receiver](https://github.com/VK2SWL/DVB-S-S2-Multicast-Audio-Receiver).
 
 ### Generic PSK → symbols
 

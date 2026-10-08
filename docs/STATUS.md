@@ -324,3 +324,32 @@ HTTP client on loopback. GUI on the scene: 5896 TS packets at 680 kbit/s.
 
 Also: the toolbar's 📁 Output folder (remembered in
 `%APPDATA%\DecDVB\prefs.txt`), LNB LO default 10700 MHz.
+
+## M4, part 3 — TS analyser, MPE, multicast audio (done, 2026-10-08)
+
+- **TS analyser** (`decdvb-ts::psi`, GUI `ts_viewer`): per-PID rate, PCR,
+  PES stream id, CC/TEI errors, scrambling; PAT, CAT (EMM), PMT (languages,
+  AC-3/E-AC-3/AAC, subtitles, teletext, CA systems → ECM PIDs), SDT, NIT
+  (network name, satellite transponders), EIT present/following, TDT/TOT.
+  An EBSPro-style window: sortable PID table with share bars, service tree
+  with now/next, NIT transponders, tables seen.
+- **MPE** (`decdvb-ts::mpe`, EN 301 192 §7): DSM-CC private sections found on
+  any unscrambled non-PES PID by their table id; IP datagrams (LLC/SNAP or
+  not) go to the same IP stage as GSE — statistics and multicast audio work
+  for TS carriers too. Section reassembly is shared (`section.rs`).
+- **Multicast audio** (`decdvb-ip::mcast`, `relay`): UDP multicast flows;
+  RTP recognised by a steady SSRC and counting sequence numbers; codecs from
+  sync words (ADTS, LOAS, MPEG audio) or RTP formats (RFC 3640, PT 14); SAP
+  announcements' SDP names and describes streams. Playback: described RTP is
+  relayed to a local port with an SDP file for VLC/PotPlayer; a bare
+  elementary stream is served over local HTTP. `decdvb-ip::serve` is the
+  shared HTTP/TCP streaming server (TS uses it too).
+- **Test signals**: a multicast "test radio" (RTP MPEG audio of silent layer
+  II frames, announced by SAP) on the GSE carrier, and in MPE on the TS one.
+
+Bugs found on the way, each with a test: a relay started before a stream was
+classified kept the wrong mode for good (now waits for 8 packets); stale
+audio and top-flow lists after a burst; and the demodulator ran its timing
+loop across a whole input block before frame logic could re-widen it after a
+lost lock — one call with everything after a dropout never re-acquired (it
+now works in 16 k-sample chunks).

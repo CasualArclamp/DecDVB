@@ -7,10 +7,13 @@
 //! - [`sink`]: a `.ts` file, UDP, or a TCP/HTTP server for VLC and PotPlayer.
 
 pub mod deframe;
+pub mod mpe;
 pub mod psi;
+pub mod section;
 pub mod sink;
 
 pub use deframe::{DeframeStats, TS_LEN, TsDeframer, null_packet};
+pub use mpe::{MpeExtractor, MpeStats};
 pub use psi::{
     EsInfo, Event, NetworkInfo, PidRow, PidStats, Programme, Transponder, TsAnalyser, TsReport,
     ca_system_name, service_type_name, stream_type_name,

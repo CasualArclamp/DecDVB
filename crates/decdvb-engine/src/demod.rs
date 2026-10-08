@@ -46,6 +46,8 @@ const TOLERANCE: usize = 2;
 const COHERENT_CONFIRM: f32 = 0.4;
 /// Symbols either side a candidate must beat to count as a peak.
 const PEAK_HALF_WIDTH: usize = 3;
+/// Samples processed at a time (see `Demod::process`).
+const CHUNK: usize = 16_384;
 /// Carrier loop noise bandwidth, normalised to the symbol rate.
 const CARRIER_BN: f64 = 0.01;
 /// Timing loop bandwidth while searching (pull-in) and once frames are
@@ -305,18 +307,25 @@ impl Demod {
 
     /// Feed baseband; completed, grid-confirmed frames are appended to `out`.
     pub fn process(&mut self, baseband: &[Iq], out: &mut Vec<PlFrame>) {
-        self.filtered.clear();
-        self.mf.process(baseband, &mut self.filtered);
-        self.agc.process(&mut self.filtered);
-        self.new_sym.clear();
-        self.sync.process(&self.filtered, &mut self.new_sym);
+        // In chunks, so what the frame logic decides — a lock lost or gained,
+        // and with it the timing loop's bandwidth — reaches the loops within
+        // a few thousand samples whatever block size the caller uses. (One
+        // call with everything after a dropout once ran the timing loop
+        // across all of it still narrowed for lock, and never re-acquired.)
+        for chunk in baseband.chunks(CHUNK) {
+            self.filtered.clear();
+            self.mf.process(chunk, &mut self.filtered);
+            self.agc.process(&mut self.filtered);
+            self.new_sym.clear();
+            self.sync.process(&self.filtered, &mut self.new_sym);
 
-        for &s in &self.new_sym {
-            self.sym.push(s);
-            self.metric.push(self.corr.push(s).unwrap_or(0.0));
+            for &s in &self.new_sym {
+                self.sym.push(s);
+                self.metric.push(self.corr.push(s).unwrap_or(0.0));
+            }
+            self.advance(out);
+            self.trim();
         }
-        self.advance(out);
-        self.trim();
     }
 
     fn decode_at(&mut self, hdr_end: usize) -> PlsInfo {

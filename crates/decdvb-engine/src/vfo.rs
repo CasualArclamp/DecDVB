@@ -105,6 +105,8 @@ pub struct VfoSettings {
     /// DVB-S2 → MPEG-TS: serve the TS over TCP/HTTP on `ts_tcp`.
     pub ts_tcp_on: bool,
     pub ts_tcp: String,
+    /// DVB-S2 → IP or TS: play this multicast audio stream (group:port).
+    pub audio_play: Option<std::net::SocketAddr>,
     /// Where the IQ recorder and the symbol writer write.
     pub record_dir: PathBuf,
 }
@@ -133,6 +135,7 @@ impl VfoSettings {
             ts_udp: "127.0.0.1:1234".into(),
             ts_tcp_on: false,
             ts_tcp: "127.0.0.1:8001".into(),
+            audio_play: None,
             record_dir: std::env::temp_dir(),
         }
     }
@@ -904,6 +907,7 @@ fn fec_output(s: &VfoSettings, ddc: &Ddc) -> FecOutput {
         ts_record: s.record && s.decoder == DecoderKind::Dvbs2Ts,
         ts_udp: s.ts_udp_on.then(|| s.ts_udp.trim().parse().ok()).flatten(),
         ts_tcp: s.ts_tcp_on.then(|| s.ts_tcp.trim().parse().ok()).flatten(),
+        audio_play: s.audio_play,
     }
 }
 
@@ -1325,7 +1329,12 @@ mod tests {
         assert_eq!(found.length, LengthMode::HeaderIncluded);
         assert!(gse.packets >= 10, "{gse:?}");
         assert_eq!(gse.ipv4, gse.packets);
-        assert!(gse.top[0].dst.to_string().starts_with("198.51.100."));
+        // The test flows (the test radio shares the link with them).
+        assert!(
+            gse.top
+                .iter()
+                .any(|f| f.dst.to_string().starts_with("198.51.100."))
+        );
         let (path, written) = gse.pcap.clone().expect("no PCAP");
         let bytes = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1403,6 +1412,99 @@ mod tests {
         assert_eq!(p.name.as_deref(), Some("DecDVB test signal"));
         assert_eq!(p.streams[0].pid, 0x100);
         assert!(ts.udp.is_some_and(|(_, n)| n >= 10));
+    }
+
+    /// A DVB-S2 VFO on a test carrier from `framer`, run until `done` holds
+    /// for its FEC stats (or 20 s pass).
+    fn s2_vfo(
+        framer: decdvb_mod::PlFramer,
+        settings: VfoSettings,
+        done: impl Fn(&FecStats) -> bool,
+    ) -> FecStats {
+        use decdvb_mod::FrameSpec;
+        let mut framer = framer;
+        let syms = framer.build_schedule(&[FrameSpec::new(4, false, true)], 1_000_000);
+        let mut sh = Shaper::new(4, 0.35, 16);
+        let mut x = Vec::new();
+        sh.process(&syms, &mut x);
+        let w = std::f64::consts::TAU * 40_000.0 / 500_000.0;
+        for (n, v) in x.iter_mut().enumerate() {
+            let ph = w * n as f64;
+            *v *= Iq::new(ph.cos() as f32, ph.sin() as f32);
+        }
+        let status = Arc::new(Mutex::new(VfoStatus::default()));
+        let mut wk = Worker::new(
+            500_000.0,
+            settings,
+            status.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        feed(&mut wk, &x, 65_536);
+        let t0 = Instant::now();
+        loop {
+            wk.publish(0);
+            let f = status.lock().unwrap().fec.clone();
+            if let Some(f) = f
+                && (done(&f) || t0.elapsed().as_secs() > 20)
+            {
+                return f;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn finds_and_plays_multicast_radio_over_gse() {
+        use decdvb_gse::Variant;
+        use decdvb_mod::{GseBbFramer, PlFramer};
+        let group: std::net::SocketAddr = "239.255.1.1:5004".parse().unwrap();
+        let mut settings = VfoSettings::new("IP", 40_000.0, 190_000.0, DecoderKind::Dvbs2Ip);
+        settings.audio_play = Some(group);
+        let framer =
+            PlFramer::new(0, 6).with_source(Box::new(GseBbFramer::new(9, Variant::STANDARD)));
+        let f = s2_vfo(framer, settings, |f| {
+            f.gse.as_ref().is_some_and(|g| g.audio_forwarded >= 5)
+        });
+        let g = f.gse.expect("no IP");
+        let radio = g
+            .audio
+            .iter()
+            .find(|a| a.group == group.ip())
+            .expect("no radio found");
+        assert_eq!(radio.name(), "DecDVB test radio");
+        assert!(radio.rtp);
+        assert_eq!(radio.codec, decdvb_ip::Codec::MpegAudio);
+        assert!(g.sap_packets > 0);
+        let Some(decdvb_ip::PlayTarget::Sdp(path)) = &g.audio_target else {
+            panic!("target {:?} ({:?})", g.audio_target, g.audio_error)
+        };
+        let sdp = std::fs::read_to_string(path).unwrap();
+        assert!(
+            sdp.contains("c=IN IP4 127.0.0.1") && sdp.contains("RTP/AVP 14"),
+            "{sdp}"
+        );
+        assert!(g.audio_forwarded >= 5);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn finds_multicast_radio_in_mpe_on_a_ts_carrier() {
+        use decdvb_mod::PlFramer;
+        let settings = VfoSettings::new("TS", 40_000.0, 190_000.0, DecoderKind::Dvbs2Ts);
+        let f = s2_vfo(PlFramer::new(0, 8), settings, |f| {
+            f.gse
+                .as_ref()
+                .is_some_and(|g| g.audio.iter().any(|a| a.sdp.is_some()))
+        });
+        let g = f.gse.expect("no IP from MPE");
+        let mpe = g.mpe.as_ref().expect("no MPE");
+        assert!(
+            mpe.pids.contains_key(&decdvb_mod::fec::TEST_MPE_PID),
+            "{mpe:?}"
+        );
+        let radio = g.audio.first().expect("no radio");
+        assert_eq!(radio.name(), "DecDVB test radio (MPE)");
+        assert_eq!(radio.codec, decdvb_ip::Codec::MpegAudio);
     }
 
     #[test]

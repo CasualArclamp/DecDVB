@@ -26,8 +26,13 @@ use decdvb_fec::demap::{demap_llr, quantize};
 use decdvb_fec::{Bch, BchError, Constellation, DecodeOutcome, FecParams, LdpcCode, LdpcDecoder};
 use decdvb_frame::{BBHEADER_LEN, BbHeader, BbHeaderError, PlsInfo, StreamFormat, bb_scramble};
 use decdvb_gse::{GseIp, IpPacket, Source, Variant, VariantReport};
-use decdvb_ip::{Flow, IpStats, PcapWriter};
-use decdvb_ts::{TS_LEN, TcpSink, TsAnalyser, TsDeframer, TsFile, TsReport, UdpSink};
+use decdvb_ip::mcast::udp_payload;
+use decdvb_ip::{
+    AudioRelay, AudioStream, Flow, IpInfo, IpStats, McastScanner, PcapWriter, PlayTarget,
+};
+use decdvb_ts::{
+    MpeExtractor, MpeStats, TS_LEN, TcpSink, TsAnalyser, TsDeframer, TsFile, TsReport, UdpSink,
+};
 
 use crate::demod::{PILOT_AFTER, PILOT_PERIOD, PlFrame};
 
@@ -243,6 +248,17 @@ pub struct GseView {
     pub pcap: Option<(PathBuf, u64)>,
     pub pcap_active: bool,
     pub pcap_error: Option<String>,
+    /// IP that came by MPE from a transport stream rather than GSE.
+    pub mpe: Option<MpeStats>,
+    /// Multicast audio streams found, busiest first.
+    pub audio: Vec<AudioStream>,
+    pub sap_packets: u64,
+    /// The stream being played, and what to open in the player.
+    pub audio_playing: Option<SocketAddr>,
+    pub audio_target: Option<PlayTarget>,
+    pub audio_error: Option<String>,
+    /// Packets passed to the player so far.
+    pub audio_forwarded: u64,
 }
 
 /// Where and whether a VFO's FEC writes its output.
@@ -264,6 +280,8 @@ pub struct FecOutput {
     pub ts_udp: Option<SocketAddr>,
     /// Serve the MPEG-TS over TCP/HTTP here.
     pub ts_tcp: Option<SocketAddr>,
+    /// Play this multicast audio stream (group:port) in a local player.
+    pub audio_play: Option<SocketAddr>,
 }
 
 /// Runs a [`FecDecoder`] on its own thread.
@@ -341,11 +359,24 @@ struct IpStage {
     ip_bps: f64,
     last_top: Instant,
     top: Vec<Flow>,
+    mcast: McastScanner,
+    audio: Vec<AudioStream>,
+    relay: Option<AudioRelay>,
+    relay_error: Option<String>,
+    /// The stream asked for (it may not have been heard yet).
+    audio_want: Option<SocketAddr>,
+    mpe: Option<MpeStats>,
 }
 
 impl IpStage {
     fn new() -> Self {
         IpStage {
+            mcast: McastScanner::new(),
+            audio: Vec::new(),
+            relay: None,
+            relay_error: None,
+            audio_want: None,
+            mpe: None,
             gse: GseIp::new(),
             stats: IpStats::default(),
             packets: Vec::new(),
@@ -359,9 +390,33 @@ impl IpStage {
         }
     }
 
-    /// Open or close the PCAP to match `o.record` (a new file per recording).
+    /// Open or close the PCAP to match `o.record` (a new file per
+    /// recording), and start or stop playing audio to match `o.audio_play`.
     fn follow(&mut self, o: &FecOutput) {
         self.gse.forced = o.gse_variant;
+        if o.audio_play != self.audio_want {
+            self.audio_want = o.audio_play;
+            self.relay = None;
+            self.relay_error = None;
+        }
+        // Start playing once the stream has been seen enough to tell RTP
+        // from raw and to know its codec: started early, it would be served
+        // the wrong way for good.
+        if let Some(want) = self.audio_want
+            && self.relay.is_none()
+            && self.relay_error.is_none()
+            && let Some(st) = self
+                .mcast
+                .streams()
+                .into_iter()
+                .find(|a| a.group == want.ip() && a.port == want.port() && a.packets >= 8)
+        {
+            let dir = std::env::temp_dir().join("DecDVB");
+            match AudioRelay::start(&st, &dir) {
+                Ok(r) => self.relay = Some(r),
+                Err(e) => self.relay_error = Some(format!("{}: {e}", st.name())),
+            }
+        }
         match (o.record, self.pcap.is_some()) {
             (true, false) if self.error.is_none() => {
                 let stamp = SystemTime::now()
@@ -392,23 +447,46 @@ impl IpStage {
 
     /// One good GS-mode frame's data field.
     fn data_field(&mut self, field: &[u8]) {
-        self.packets.clear();
-        self.gse.data_field(field, &mut self.packets);
-        let now = SystemTime::now();
-        for p in &self.packets {
-            self.stats.add(&p.info);
-            self.win.0 += p.data.len() as f64;
-            if let Some(w) = &mut self.pcap
-                && let Err(e) = w.write(now, &p.data)
-            {
-                self.error = Some(e.to_string());
-                self.pcap = None;
-            }
+        let mut packets = std::mem::take(&mut self.packets);
+        packets.clear();
+        self.gse.data_field(field, &mut packets);
+        for p in &packets {
+            self.ip(&p.data, &p.info);
+        }
+        self.packets = packets;
+    }
+
+    /// IP datagrams from MPE (a transport stream).
+    fn mpe(&mut self, datagrams: &[(Vec<u8>, IpInfo)], stats: &MpeStats) {
+        for (d, info) in datagrams {
+            self.ip(d, info);
+        }
+        self.mpe = Some(stats.clone());
+    }
+
+    /// One IP packet, wherever it came from.
+    fn ip(&mut self, data: &[u8], info: &IpInfo) {
+        self.stats.add(info);
+        self.win.0 += data.len() as f64;
+        self.mcast.packet(data, info);
+        if let Some(r) = &mut self.relay
+            && info.dst == r.group
+            && let Some((payload, _, dport)) = udp_payload(data, info)
+            && dport == r.port
+        {
+            r.packet(payload);
+        }
+        if let Some(w) = &mut self.pcap
+            && let Err(e) = w.write(SystemTime::now(), data)
+        {
+            self.error = Some(e.to_string());
+            self.pcap = None;
         }
     }
 
     /// Signal time passes (every frame, good or not).
     fn tick(&mut self, secs: f64) {
+        self.mcast.tick(secs);
         self.win.1 += secs;
         if self.win.1 >= 2.0 || (self.ip_bps == 0.0 && self.win.1 > 0.2) {
             self.ip_bps = self.win.0 * 8.0 / self.win.1;
@@ -420,10 +498,15 @@ impl IpStage {
 
     fn view(&mut self) -> GseView {
         // Ranking flows sorts the table: twice a second is plenty.
-        if self.last_top.elapsed().as_millis() >= 500 || self.top.is_empty() {
+        // Re-ranking sorts the flow table: twice a second, or at once while
+        // new flows are still appearing in a short list.
+        let new_flows = self.top.len() < 8 && self.stats.flow_count() != self.top.len();
+        if self.last_top.elapsed().as_millis() >= 500 || new_flows {
             self.top = self.stats.top_flows(8);
             self.last_top = Instant::now();
         }
+        // Few flows, cheap to list: always current.
+        self.audio = self.mcast.streams();
         GseView {
             source: self.gse.source(),
             variants: self.gse.reports(),
@@ -442,6 +525,13 @@ impl IpStage {
                 .map(|p| (p, self.pcap.as_ref().map_or(0, |w| w.packets()))),
             pcap_active: self.pcap.is_some(),
             pcap_error: self.error.clone(),
+            mpe: self.mpe.clone(),
+            audio: self.audio.clone(),
+            sap_packets: self.mcast.sap_packets,
+            audio_playing: self.audio_want,
+            audio_target: self.relay.as_ref().map(|r| r.target.clone()),
+            audio_error: self.relay_error.clone(),
+            audio_forwarded: self.relay.as_ref().map_or(0, |r| r.forwarded),
         }
     }
 }
@@ -473,6 +563,9 @@ struct TsStage {
     /// The analyser's last report, rebuilt at most every 250 ms.
     report: TsReport,
     report_at: Option<Instant>,
+    /// IP in MPE sections, and the datagrams from the last field.
+    mpe: MpeExtractor,
+    datagrams: Vec<(Vec<u8>, IpInfo)>,
 }
 
 impl TsStage {
@@ -493,6 +586,8 @@ impl TsStage {
             issy: false,
             report: TsReport::default(),
             report_at: None,
+            mpe: MpeExtractor::new(),
+            datagrams: Vec::new(),
         }
     }
 
@@ -550,8 +645,10 @@ impl TsStage {
         self.packets.clear();
         self.deframer
             .data_field(field, h.syncd, h.npd, h.issyi, &mut self.packets);
+        self.datagrams.clear();
         for p in &self.packets {
             self.analyser.packet(p);
+            self.mpe.packet(p, &mut self.datagrams);
         }
         self.win.0 += (self.packets.len() * TS_LEN) as f64;
         if let Some(f) = &mut self.file
@@ -658,6 +755,12 @@ fn run(
             let stage = ts.get_or_insert_with(TsStage::new);
             stage.follow(&output.lock().unwrap());
             stage.data_field(&b.bytes[BBHEADER_LEN..end], h);
+            // IP by MPE joins the IP stage (statistics, multicast audio).
+            if !stage.datagrams.is_empty() || ip.is_some() {
+                let ipst = ip.get_or_insert_with(IpStage::new);
+                ipst.follow(&output.lock().unwrap());
+                ipst.mpe(&stage.datagrams, &stage.mpe.stats);
+            }
         } else if let Some(t) = &mut ts {
             // Keep Record/UDP/TCP responsive between TS frames.
             t.follow(&output.lock().unwrap());

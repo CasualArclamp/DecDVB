@@ -588,6 +588,7 @@ dependencies = [
  "decdvb-engine",
  "decdvb-gse",
  "decdvb-io",
+ "decdvb-ip",
  "decdvb-ts",
  "eframe",
  "egui_plot",
@@ -636,6 +637,7 @@ version = "0.0.0"
 dependencies = [
  "decdvb-core",
  "decdvb-frame",
+ "decdvb-ip",
  "thiserror 2.0.21",
 ]
 

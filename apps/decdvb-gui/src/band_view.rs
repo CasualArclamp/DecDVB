@@ -41,6 +41,10 @@ pub enum Action {
     Play(VfoId, crate::player::Player),
     /// Open the TS analyser window on a VFO.
     OpenTsViewer(VfoId),
+    /// Play a VFO's multicast audio stream (group:port) in a player.
+    PlayAudio(VfoId, std::net::SocketAddr, crate::player::Player),
+    /// Stop playing a VFO's multicast audio.
+    StopAudio(VfoId),
 }
 
 /// Everything the view draws from.

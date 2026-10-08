@@ -425,6 +425,11 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
     );
 
     // ---- results
+    // Radio stations found in the IP come first: they are what one is
+    // usually after on a carrier that has them.
+    if let Some(g) = st.fec.as_ref().and_then(|f| f.gse.as_ref()) {
+        audio_card(ui, g, v.id, &mut actions);
+    }
     // A demodulating VFO leads with its own state and constellation; how it
     // acquired (Identify's view) folds away below.
     let demodulates = matches!(
@@ -629,6 +634,75 @@ fn fec_card(ui: &mut Ui, f: &FecStats) {
     });
 }
 
+/// Multicast audio found in the IP: name (from SAP), codec, rate, and
+/// buttons to play it in a player.
+fn audio_card(ui: &mut Ui, g: &GseView, id: VfoId, actions: &mut Vec<Action>) {
+    if g.audio.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    ui.label(RichText::new(format!("Multicast audio ({})", g.audio.len())).strong());
+    for a in &g.audio {
+        let key = std::net::SocketAddr::new(a.group, a.port);
+        let playing = g.audio_playing == Some(key);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let name = RichText::new(a.name()).strong();
+                ui.label(if playing {
+                    name.color(Color32::from_rgb(110, 220, 110))
+                } else {
+                    name
+                });
+                ui.label(
+                    RichText::new(format!(
+                        "{}:{} · {} · {}{}",
+                        a.group,
+                        a.port,
+                        a.codec.label(),
+                        format::bitrate(a.rate_bps),
+                        if a.rtp {
+                            format!(" · RTP PT {}", a.pt.unwrap_or(0))
+                        } else {
+                            " · raw UDP".into()
+                        }
+                    ))
+                    .small()
+                    .weak(),
+                );
+            });
+            ui.horizontal(|ui| {
+                for p in [Player::Vlc, Player::PotPlayer] {
+                    if ui.button(format!("▶ {}", p.name())).clicked() {
+                        actions.push(Action::PlayAudio(id, key, p));
+                    }
+                }
+                if playing {
+                    if ui.button("⏹ Stop").clicked() {
+                        actions.push(Action::StopAudio(id));
+                    }
+                    let state = match (&g.audio_target, &g.audio_error) {
+                        (_, Some(e)) => e.clone(),
+                        (Some(_), None) => format!("relaying · {} packets", g.audio_forwarded),
+                        (None, None) => "waiting for the stream…".into(),
+                    };
+                    ui.label(RichText::new(state).small());
+                }
+            });
+            if let Some(info) = a.sdp.as_ref().and_then(|s| s.info.clone()) {
+                ui.label(RichText::new(info).small().weak());
+            }
+        });
+    }
+    if g.sap_packets > 0 {
+        ui.label(
+            RichText::new(format!("{} SAP announcements heard", g.sap_packets))
+                .small()
+                .weak(),
+        );
+    }
+}
+
 /// A "host:port" text box, red while it does not parse.
 fn address_field(ui: &mut Ui, text: &mut String) {
     let ok = text.trim().parse::<std::net::SocketAddr>().is_ok();
@@ -753,13 +827,17 @@ fn ts_card(ui: &mut Ui, t: &TsView, id: VfoId, actions: &mut Vec<Action>) {
 /// PCAP.
 fn gse_card(ui: &mut Ui, g: &GseView) {
     ui.add_space(6.0);
-    ui.label(RichText::new("GSE / IP").strong());
+    ui.label(RichText::new("IP").strong());
     egui::Grid::new("gse").num_columns(2).show(ui, |ui| {
         ui.label("Source");
-        let txt = match g.source {
-            Some(Source::Gse(v)) => format!("GSE, {}", v.label()),
-            Some(Source::Blind) => "blind IPv4 search (no GSE variant fits)".into(),
-            None => "no IP found yet".into(),
+        let txt = match (g.source, &g.mpe) {
+            (Some(Source::Gse(v)), _) => format!("GSE, {}", v.label()),
+            (Some(Source::Blind), _) => "blind IPv4 search (no GSE variant fits)".into(),
+            (None, Some(m)) => {
+                let pids: Vec<String> = m.pids.keys().map(|p| format!("{p:#06x}")).collect();
+                format!("MPE on PID {} · {} datagrams", pids.join(", "), m.datagrams)
+            }
+            (None, None) => "no IP found yet".into(),
         };
         ui.label(txt);
         ui.end_row();
@@ -844,6 +922,9 @@ fn gse_card(ui: &mut Ui, g: &GseView) {
                     ui.end_row();
                 }
             });
+    }
+    if g.mpe.is_some() && g.source.is_none() {
+        return; // no GSE to compare variants of
     }
     egui::CollapsingHeader::new("GSE variants")
         .id_salt("gse_variants")

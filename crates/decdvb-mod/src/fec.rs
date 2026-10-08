@@ -78,7 +78,14 @@ pub struct TsBbFramer {
     pub roll_off: RollOff,
     /// CCM (one MODCOD) or ACM/VCM, for MATYPE.
     pub ccm: bool,
+    /// A multicast radio in MPE on TEST_MPE_PID, and its packets queued.
+    radio: TestRadio,
+    mpe_queue: std::collections::VecDeque<[u8; TS_LEN]>,
+    mpe_cc: u8,
 }
+
+/// The PID carrying IP (the test radio) in MPE.
+pub const TEST_MPE_PID: u16 = 0x0FA0;
 
 /// The test stream's data PID and its programme's PMT PID.
 pub const TEST_PID: u16 = 0x0100;
@@ -104,6 +111,9 @@ impl TsBbFramer {
             prev_crc: 0,
             roll_off: RollOff::R35,
             ccm: true,
+            radio: TestRadio::new([239, 255, 1, 2], "DecDVB test radio (MPE)"),
+            mpe_queue: Default::default(),
+            mpe_cc: 0,
         }
     }
 
@@ -128,6 +138,19 @@ impl TsBbFramer {
             let p = decdvb_ts::psi::section_packet(pid, *cc, sec);
             *cc = cc.wrapping_add(1) & 0x0F;
             return p;
+        }
+        // Every fourth packet: the radio, in MPE.
+        if n.is_multiple_of(4) {
+            if self.mpe_queue.is_empty() {
+                let ip = self.radio.next_packet();
+                let sec = decdvb_ts::mpe::mpe_section([0x01, 0x00, 0x5E, 0x7F, 0x01, 0x02], &ip);
+                self.mpe_queue.extend(decdvb_ts::mpe::packetize(
+                    TEST_MPE_PID,
+                    &mut self.mpe_cc,
+                    &sec,
+                ));
+            }
+            return self.mpe_queue.pop_front().unwrap();
         }
         let mut p = [0u8; TS_LEN];
         p[0] = TS_SYNC;
@@ -205,6 +228,7 @@ impl BbFrameSource for TsBbFramer {
 /// 9000 bytes so that some fragment across frames, in any GSE [`Variant`].
 pub struct GseBbFramer {
     enc: GseEncapsulator,
+    radio: TestRadio,
     rng: u64,
     seq: u32,
     pub roll_off: RollOff,
@@ -215,6 +239,7 @@ impl GseBbFramer {
     pub fn new(seed: u64, variant: Variant) -> Self {
         GseBbFramer {
             enc: GseEncapsulator::new(variant),
+            radio: TestRadio::new([239, 255, 1, 1], "DecDVB test radio"),
             rng: seed | 1,
             seq: 0,
             roll_off: RollOff::R35,
@@ -231,10 +256,14 @@ impl GseBbFramer {
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
-    /// The `n`-th test packet: flow `n % 5`, a size from a fixed cycle.
+    /// The `n`-th test packet: every third one the test radio, else flow
+    /// `n % 5` with a size from a fixed cycle.
     fn packet(&mut self) -> Vec<u8> {
         let n = self.seq;
         self.seq += 1;
+        if n.is_multiple_of(3) {
+            return self.radio.next_packet();
+        }
         let flow = (n % 5) as u8;
         let len = [64usize, 1400, 512, 9000, 40, 1200, 200][n as usize % 7];
         let mut payload = vec![0u8; len];
@@ -289,6 +318,64 @@ impl BbFrameSource for GseBbFramer {
         frame.extend_from_slice(&data);
         bb_scramble(&mut frame);
         frame
+    }
+}
+
+/// A multicast "radio" for test signals: RTP MPEG audio (payload type 14)
+/// of silent layer II frames, announced by SAP every 50 packets.
+pub struct TestRadio {
+    group: [u8; 4],
+    name: &'static str,
+    n: u64,
+    seq: u16,
+    ts: u32,
+}
+
+impl TestRadio {
+    pub fn new(group: [u8; 4], name: &'static str) -> Self {
+        TestRadio {
+            group,
+            name,
+            n: 0,
+            seq: 0,
+            ts: 0,
+        }
+    }
+
+    /// The next IP packet: a SAP announcement or an RTP packet.
+    pub fn next_packet(&mut self) -> Vec<u8> {
+        use decdvb_ip::mcast::{rtp_packet, sap_packet, silent_mp2_frame};
+        use decdvb_ip::packet::udp_v4;
+        let src = [192, 0, 2, 99];
+        let n = self.n;
+        self.n += 1;
+        if n.is_multiple_of(50) {
+            let g = self.group;
+            let sdp = format!(
+                "v=0\r\no=- 1 1 IN IP4 192.0.2.99\r\ns={}\r\nc=IN IP4 {}.{}.{}.{}/32\r\nt=0 0\r\n\
+                 m=audio 5004 RTP/AVP 14\r\n",
+                self.name, g[0], g[1], g[2], g[3]
+            );
+            return udp_v4(
+                src,
+                [224, 2, 127, 254],
+                9875,
+                9875,
+                &sap_packet(src, 1, &sdp),
+            );
+        }
+        let mut payload = vec![0u8; 4]; // RFC 2250: MBZ and fragment offset
+        payload.extend_from_slice(&silent_mp2_frame());
+        let rtp = rtp_packet(
+            14,
+            self.seq,
+            self.ts,
+            0x0DEC_DB00 | self.group[3] as u32,
+            &payload,
+        );
+        self.seq = self.seq.wrapping_add(1);
+        self.ts = self.ts.wrapping_add(2160); // 1152 samples at 48 kHz, 90 kHz clock
+        udp_v4(src, self.group, 4000, 5004, &rtp)
     }
 }
 

@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use decdvb_core::crc::crc32_mpeg2;
 
 use crate::deframe::TS_LEN;
+use crate::section::SectionAssembler;
 
 pub const PID_PAT: u16 = 0x0000;
 pub const PID_CAT: u16 = 0x0001;
@@ -206,15 +207,13 @@ pub struct TsReport {
     pub bad_sections: u64,
 }
 
-/// Sections are capped at this (private sections may reach 4096).
-const MAX_SECTION: usize = 4096 + 3;
-
 /// Watches a transport stream: PID counts, continuity, and the PSI/SI.
 #[derive(Default)]
 pub struct TsAnalyser {
     pub pids: BTreeMap<u16, PidStats>,
     last_cc: BTreeMap<u16, u8>,
-    partial: BTreeMap<u16, Vec<u8>>,
+    sections: SectionAssembler,
+    done: Vec<Vec<u8>>,
     /// Programmes by number, from the PAT (and the SDT).
     pub programmes: BTreeMap<u16, Programme>,
     /// PIDs the PAT names as PMTs, and their programme.
@@ -315,58 +314,15 @@ impl TsAnalyser {
         self.win_secs = 0.0;
     }
 
-    /// Reassemble sections: a packet starting one (PUSI) has a pointer to
-    /// where it starts, the bytes before it finishing the previous one, and
-    /// more may follow back to back.
+    /// Reassemble the SI sections on `pid` and read each one that completes.
     fn si_payload(&mut self, pid: u16, pusi: bool, payload: &[u8]) {
-        if pusi {
-            let ptr = payload[0] as usize;
-            if 1 + ptr > payload.len() {
-                self.partial.remove(&pid);
-                return;
-            }
-            if let Some(mut s) = self.partial.remove(&pid) {
-                s.extend_from_slice(&payload[1..1 + ptr]);
-                self.complete(pid, s);
-                // Whatever it was, a new section starts here.
-                self.partial.remove(&pid);
-            }
-            let mut rest = &payload[1 + ptr..];
-            while !rest.is_empty() && rest[0] != 0xFF {
-                if rest.len() < 3 {
-                    self.partial.insert(pid, rest.to_vec());
-                    return;
-                }
-                let len = 3 + section_length(rest);
-                if rest.len() >= len {
-                    self.section(pid, &rest[..len]);
-                    rest = &rest[len..];
-                } else {
-                    self.partial.insert(pid, rest.to_vec());
-                    return;
-                }
-            }
-        } else if let Some(mut s) = self.partial.remove(&pid) {
-            s.extend_from_slice(payload);
-            self.complete(pid, s);
+        let mut done = std::mem::take(&mut self.done);
+        done.clear();
+        self.sections.feed(pid, pusi, payload, &mut done);
+        for s in &done {
+            self.section(pid, s);
         }
-    }
-
-    /// A partial section grew: process it if whole, keep it if not.
-    fn complete(&mut self, pid: u16, s: Vec<u8>) {
-        if s.len() < 3 {
-            self.partial.insert(pid, s);
-            return;
-        }
-        let len = 3 + section_length(&s);
-        if len > MAX_SECTION {
-            return;
-        }
-        if s.len() >= len {
-            self.section(pid, &s[..len]);
-        } else {
-            self.partial.insert(pid, s);
-        }
+        self.done = done;
     }
 
     /// One complete section.
@@ -672,11 +628,6 @@ impl TsAnalyser {
             bad_sections: self.bad_sections,
         }
     }
-}
-
-/// The 12-bit section length.
-fn section_length(s: &[u8]) -> usize {
-    u16::from_be_bytes([s[1] & 0x0F, s[2]]) as usize
 }
 
 /// Iterate (tag, contents) over a descriptor loop, stopping at a truncation.
