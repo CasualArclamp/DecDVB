@@ -31,6 +31,13 @@ use band_view::{Action, BandInput, BandView, UiVfo};
 use waterfall::{History, RingImage};
 
 fn main() -> eframe::Result {
+    // `--version` alone: print it and stop (the release workflow checks it).
+    // `env!` reads a variable at compile time; Cargo sets this one from
+    // `[workspace.package].version`.
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("decdvb-gui {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     prefs::load();
     let opts = match automation::Options::from_args() {
         Ok(o) => o,

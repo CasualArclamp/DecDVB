@@ -1,0 +1,116 @@
+# Portable Windows release of a tag. Pushing a tag v* (or Actions → Release → Run
+# workflow with an existing tag) builds decdvb-gui.exe and decdvb.exe with the static
+# C runtime and the HackRF front end (pure Rust over USB: no DLLs), checks that their
+# versions match the tag and that they need no C runtime DLL, smoke-tests the command
+# line on a synthetic capture, and uploads them with their SHA-256 to a draft release
+# of the tag. Then write the release notes and publish it:
+#
+#   gh release edit vX.Y.Z --notes-file notes.md --draft=false --latest
+#
+# A release that is already published is never touched: the job fails instead. A trial
+# run without a release: `gh workflow run release.yml -f tag=main -f upload=false`.
+# (Pattern from DecDRM's release workflow.)
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build (vX.Y.Z), or a branch for a trial run without upload
+        required: true
+      upload:
+        description: Upload the executables to a draft release of the tag
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows portable
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build (static C runtime, HackRF front end)
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: >-
+          cargo build --release --target x86_64-pc-windows-msvc -p decdvb-gui -p decdvb-cli
+      - name: Check (versions, no C runtime DLL, command-line smoke test)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=target/x86_64-pc-windows-msvc/release
+          "$bin/decdvb" --version
+          "$bin/decdvb-gui" --version
+          if [[ $TAG == v* ]]; then
+            test "$("$bin/decdvb" --version)" = "decdvb ${TAG#v}"
+            test "$("$bin/decdvb-gui" --version)" = "decdvb-gui ${TAG#v}"
+          fi
+          for exe in decdvb decdvb-gui; do
+            if grep -a -q -i -e vcruntime140 -e api-ms-win-crt "$bin/$exe.exe"; then
+              echo "$exe.exe imports a C runtime DLL: not a static build" >&2
+              exit 1
+            fi
+          done
+          "$bin/decdvb" modcods > /dev/null
+          scene="$RUNNER_TEMP/decdvb-scene_8Msps.cs8"
+          "$bin/decdvb" scene "$scene" --seconds 2
+          "$bin/decdvb" scan "$scene" --timeout 120 | tee "$RUNNER_TEMP/scan.txt"
+          grep -q -i "DVB-S2" "$RUNNER_TEMP/scan.txt"
+      - name: Draft release
+        if: github.event_name == 'push' || inputs.upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bin=target/x86_64-pc-windows-msvc/release
+          cp "$bin/decdvb-gui.exe" "$bin/decdvb.exe" .
+          cat > notes.md <<'EOF'
+          Portable Windows executables for 64-bit Windows 10/11, nothing to install (static C runtime).
+
+          | File | What |
+          |---|---|
+          | `decdvb-gui.exe` | Desktop app: wideband waterfall with VFOs (DVB-S2/S2X → GSE/IP or MPEG-TS, DVB-S, generic PSK/QAM, IQ record), IQ files or a HackRF One |
+          | `decdvb.exe` | Command line: `decdvb scan`, `decdvb analyse`, `decdvb scene`, `decdvb modcods` |
+
+          A HackRF One works receive-only with no DLLs; on Windows it must use the WinUSB driver (Zadig, or the one the official HackRF tools install). IQ files need nothing.
+          Windows SmartScreen may warn on first start because the files are unsigned ("More info" → "Run anyway").
+          EOF
+          {
+            echo
+            echo "Built from $(git rev-parse --short HEAD) by [GitHub Actions]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
+            echo
+            echo "SHA-256:"
+            echo '```'
+            # (Git Bash's sha256sum marks binary mode with a star: "hash *file".)
+            sha256sum decdvb-gui.exe decdvb.exe | sed 's/ \*/  /'
+            echo '```'
+          } >> notes.md
+          if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2> /dev/null); then
+            if [ "$draft" != true ]; then
+              echo "release $TAG is already published: not replacing its files" >&2
+              exit 1
+            fi
+            gh release upload "$TAG" decdvb-gui.exe decdvb.exe --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --draft --verify-tag --title "DecDVB ${TAG#v} (Windows portable)" \
+              --notes-file notes.md decdvb-gui.exe decdvb.exe
+          fi
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
