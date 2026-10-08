@@ -6,7 +6,6 @@
 //! - [`encap`]: the transmit side, for test signals and the modulator.
 
 pub mod auto;
-pub mod crc;
 pub mod decode;
 pub mod encap;
 

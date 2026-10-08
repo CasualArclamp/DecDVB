@@ -9,8 +9,8 @@
 
 use std::collections::VecDeque;
 
-use crate::crc::crc32_mpeg2;
 use crate::decode::{FragMode, Label, Variant};
+use decdvb_core::crc::crc32_mpeg2;
 
 /// Largest GSE body: GSE_LENGTH is 12 bits.
 const MAX_GSE_LENGTH: usize = 4095;

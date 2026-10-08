@@ -633,6 +633,7 @@ name = "decdvb-ts"
 version = "0.0.0"
 dependencies = [
  "decdvb-core",
+ "decdvb-frame",
  "thiserror 2.0.21",
 ]
 

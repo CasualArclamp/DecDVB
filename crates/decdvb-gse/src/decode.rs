@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 
-use crate::crc::crc32_mpeg2;
+use decdvb_core::crc::crc32_mpeg2;
 
 /// What GSE_LENGTH counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

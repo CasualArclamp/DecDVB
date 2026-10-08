@@ -65,6 +65,10 @@ The big readout at the top is the centre frequency, as in SDR++: wheel over a
 digit or click its upper/lower half to step it, right-click to zero that digit
 and every one below it. With the HackRF running it retunes the radio.
 
+**📁 Output folder…** in the toolbar sets where IQ recordings, symbol files,
+PCAP and TS files go (default `Documents\DecDVB`); it is remembered between
+runs and applies to existing VFOs too.
+
 The side bar lists the VFOs with their CPU load (✕ removes one), and shows the
 selected one's settings, its Identify result or demodulator state (lock, MER,
 residual offset), a carrier-locked constellation and a zoomed spectrum.
@@ -129,7 +133,8 @@ cargo build --release
 
 Click **📡 HackRF** in the toolbar, set the frequency, sample rate and gains,
 and **Start**. Frequency and gains apply live. **LNB LO** only labels the axis
-(RF = tuned + LO): 9750 MHz for a QO-100 or Ku low-band LNB, 0 without one.
+(RF = tuned + LO): 10700 MHz by default (a universal Ku LNB's high band),
+9750 MHz for its low band or QO-100, 0 without one.
 
 The driver is pure Rust over USB ([`seify-hackrfone`](https://crates.io/crates/seify-hackrfone)
 on `nusb`): no libhackrf, no libusb, nothing to install beyond the WinUSB driver

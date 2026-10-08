@@ -5,6 +5,7 @@
 //! References: ETSI EN 302 307-1 (DVB-S2) and EN 302 307-2 (DVB-S2X). See
 //! `docs/DESIGN.md` for scope.
 
+pub mod crc;
 pub mod modcod;
 
 pub use modcod::{CodeRate, FecFrame, Modcod, Modulation, s2_modcod, s2_modcod_table};

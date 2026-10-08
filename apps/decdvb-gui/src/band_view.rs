@@ -787,13 +787,8 @@ impl BandView {
     }
 }
 
-/// Where IQ recordings go: the user's Documents\DecDVB, or the temp dir.
+/// Where a new VFO writes its output: the folder chosen with the toolbar's
+/// output-folder button, else Documents\DecDVB.
 pub fn default_record_dir() -> std::path::PathBuf {
-    let base = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(std::path::PathBuf::from);
-    match base {
-        Some(b) => b.join("Documents").join("DecDVB"),
-        None => std::env::temp_dir(),
-    }
+    crate::prefs::output_dir()
 }

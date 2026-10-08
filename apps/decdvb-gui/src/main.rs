@@ -9,6 +9,7 @@ mod band_view;
 mod filename;
 mod format;
 mod freq_display;
+mod prefs;
 mod radio;
 mod side_panel;
 mod waterfall;
@@ -28,6 +29,7 @@ use band_view::{Action, BandInput, BandView, UiVfo};
 use waterfall::{History, RingImage};
 
 fn main() -> eframe::Result {
+    prefs::load();
     let opts = match automation::Options::from_args() {
         Ok(o) => o,
         Err(e) => {
@@ -386,6 +388,34 @@ impl App {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
+            let out = prefs::output_dir();
+            if ui
+                .button("📁 Output folder…")
+                .on_hover_text(format!(
+                    "Where recordings, symbol files, PCAP and TS files go:\n{}",
+                    out.display()
+                ))
+                .clicked()
+                && let Some(dir) = rfd::FileDialog::new().set_directory(&out).pick_folder()
+            {
+                match prefs::set_output_dir(dir.clone()) {
+                    Ok(()) => self.note = format!("Output folder: {}", dir.display()),
+                    Err(e) => self.note = format!("Output folder not saved: {e}"),
+                }
+                // Existing VFOs follow; a recording already open keeps its file.
+                let updates: Vec<_> = self
+                    .vfos
+                    .iter()
+                    .map(|v| {
+                        let mut s = v.settings.clone();
+                        s.record_dir = dir.clone();
+                        Action::Update(v.id, s)
+                    })
+                    .collect();
+                for a in updates {
+                    self.apply(a);
+                }
+            }
             if ui.button("📂 Open IQ…").clicked()
                 && let Some(p) = rfd::FileDialog::new()
                     .add_filter(
