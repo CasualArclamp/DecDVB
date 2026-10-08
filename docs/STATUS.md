@@ -545,3 +545,18 @@ list, needs nothing new and came first.
   the scene and test start mid-stream, as a real carrier is.
 - Tests: RS to t errors for five sizes, every rate round trip, every
   rotation/inversion/start, rate 1/2 at 3.5 dB, and a DVB-S VFO end to end.
+
+## RCV-20x modes, part 2 — turbo product code machinery (2026-10-09)
+
+`decdvb-modem::tpc`: extended Hamming codes (any m, shortened), their
+two-dimensional products, and the iterative Chase–Pyndiah soft-in/soft-out
+decoder (16 test patterns, Pyndiah's α/β schedule). On the shape of IESS-315's
+`tpc_2964` — (64,57) × (46,39), 2223 data bits in 2944, rate 0.755 — a
+frame with ~100 raw errors (Eb/N0 3.5 dB) decodes in 9 or more of 10.
+
+**Not done, and why:** what makes it *tpc_2964* rather than a product code
+of that shape — where the 20-bit unique word F50B8h sits, the bit order of
+the 46 × 64 block, the Hamming polynomial (x⁶ + x + 1 is assumed only for
+the tests), the (2,3,9,12) descrambler with preset 475h and where it runs
+— is in IESS-315 (or could be found from a real carrier with the parity
+checks as the judge). Waiting on Rory for the spec or a capture.

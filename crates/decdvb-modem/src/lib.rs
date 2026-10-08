@@ -5,8 +5,10 @@
 //! - [`rs`]: shortened Reed–Solomon codes over GF(256).
 //! - [`interleave`]: Forney convolutional interleaving.
 //! - [`dvbs`]: the DVB-S transmitter and blind receiver.
+//! - [`tpc`]: turbo product codes (extended Hamming products, Chase–Pyndiah).
 
 pub mod conv;
 pub mod dvbs;
 pub mod interleave;
 pub mod rs;
+pub mod tpc;
