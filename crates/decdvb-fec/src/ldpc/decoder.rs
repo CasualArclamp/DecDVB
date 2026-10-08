@@ -360,6 +360,33 @@ mod tests {
         }
     }
 
+    /// Each code's waterfall on BPSK: the lowest Eb/N0 (0.25 dB steps) at
+    /// which 8 frames all decode. Codes of similar rate should sit close
+    /// together (run by hand, release:
+    /// `cargo test -p decdvb-fec --release ldpc_waterfalls -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn ldpc_waterfalls() {
+        for p in all_s2().chain(all_s2x()) {
+            if p.frame != decdvb_core::FecFrame::Normal {
+                continue;
+            }
+            let r = p.rate.num as f64 / p.rate.den as f64;
+            let mut at = None;
+            for step in 0..24 {
+                let eb = 0.0 + 0.25 * step as f64;
+                if (0..8).all(|s| run(p, eb, 4.0, 100 + s).1 == 0) {
+                    at = Some(eb);
+                    break;
+                }
+            }
+            println!(
+                "{:>4}/{:<4} r={r:.3}  waterfall {:?} dB",
+                p.rate.num, p.rate.den, at
+            );
+        }
+    }
+
     /// Decoding speed, release build:
     /// `cargo test -p decdvb-fec --release ldpc_throughput -- --ignored --nocapture`.
     #[test]

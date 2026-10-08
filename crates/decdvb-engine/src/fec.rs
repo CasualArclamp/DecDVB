@@ -1073,7 +1073,18 @@ mod tests {
         esn0_db: f64,
         seed: u64,
     ) -> Vec<Iq> {
-        let mut framer = PlFramer::new(0, seed);
+        signal_gold(schedule, n_sym, cycles, esn0_db, seed, 0)
+    }
+
+    fn signal_gold(
+        schedule: &[FrameSpec],
+        n_sym: usize,
+        cycles: f64,
+        esn0_db: f64,
+        seed: u64,
+        gold: u32,
+    ) -> Vec<Iq> {
+        let mut framer = PlFramer::new(gold, seed);
         let syms = framer.build_schedule(schedule, n_sym);
         let mut sh = Shaper::new(4, 0.25, 16);
         let mut x = Vec::new();
@@ -1271,6 +1282,63 @@ mod tests {
             let got = decode_all(&x);
             let ok = got.iter().filter(|b| b.ok()).count();
             println!("{snr:+.0} dB: {ok} of {} frames good", got.len());
+        }
+    }
+
+    /// Frames good against Table 20a's ideal Es/N0 for a few S2X MODCODs —
+    /// the implementation loss (run by hand: `cargo test -p decdvb-engine
+    /// --release s2x_threshold_sweep -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn s2x_threshold_sweep() {
+        for (spec, ideal) in [
+            (FrameSpec::s2x(132, true), -2.03),
+            (FrameSpec::s2x(144, true), 7.02),
+            (FrameSpec::s2x(154, true), 7.51),
+            (FrameSpec::s2x(178, true), 11.75),
+            (FrameSpec::s2x(186, true), 14.81),
+            (FrameSpec::s2x(214, true), 19.57),
+        ] {
+            let name = spec.info().modcod().unwrap().to_string();
+            for over in [1.0, 2.0, 3.0] {
+                let x = signal(&[spec], 300_000, 0.001, ideal + over, 29);
+                let got = decode_all(&x);
+                let ok = got.iter().filter(|b| b.ok()).count();
+                println!(
+                    "{name:16} ideal {ideal:+.2} dB, +{over}: {ok}/{} good",
+                    got.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finds_a_preferred_scrambling_sequence() {
+        // Scrambled with Table 19e's sequence 3 (gold code 3·10 949); the
+        // demodulator is told 0 and must find it from the pilots.
+        let schedule = [FrameSpec::s2x(154, true), FrameSpec::new(4, false, true)];
+        let x = signal_gold(&schedule, 300_000, 0.001, 12.0, 27, 32_847);
+        let mut d = Demod::new(4.0, 1.0, 0.25, 0);
+        let mut fec = FecDecoder::new();
+        let mut frames = Vec::new();
+        let mut got = Vec::new();
+        for chunk in x.chunks(50_000) {
+            frames.clear();
+            d.process(chunk, &mut frames);
+            got.extend(frames.iter().filter_map(|f| fec.decode(f)));
+        }
+        assert_eq!(d.gold_code(), 32_847);
+        assert!(got.len() >= 5, "only {} frames", got.len());
+        for (k, b) in got.iter().enumerate() {
+            assert!(
+                b.ok(),
+                "frame {k} of {} (PLS {}): {:?} {:?} {:?}",
+                got.len(),
+                b.pls.plsc,
+                b.ldpc,
+                b.bch,
+                b.header
+            );
         }
     }
 

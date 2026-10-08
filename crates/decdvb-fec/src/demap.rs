@@ -300,6 +300,68 @@ mod tests {
         check(&x(240), 2025, 0b0001, "16APSK 26/45 short");
     }
 
+    /// Mapping + LDPC on AWGN, no demodulator: frames converged at
+    /// Table 20a's ideal Es/N0 plus a margin (run by hand, release:
+    /// `cargo test -p decdvb-fec --release awgn_modcod_sweep -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn awgn_modcod_sweep() {
+        use crate::ldpc::{LdpcCode, LdpcDecoder};
+        use crate::params::FecParams;
+        for (pls, ideal) in [
+            (154u8, 7.51),
+            (156, 7.80),
+            (178, 11.75),
+            (186, 14.81),
+            (214, 19.57),
+        ] {
+            let mc = modcod(pls, FecFrame::Normal).unwrap();
+            let mp = Mapper::for_modcod(&mc).unwrap();
+            let p = FecParams::new(mc.frame, mc.rate).unwrap();
+            let code = LdpcCode::new(p.ldpc_table());
+            let (n, k) = (code.n, code.k);
+            for over in [0.5, 1.0, 2.0] {
+                let es_n0 = 10f64.powf((ideal + over) / 10.0);
+                let sigma = (1.0 / (2.0 * es_n0)).sqrt() as f32; // per dimension
+                let mut ok = 0;
+                for f in 0..8u64 {
+                    let info = rand_bytes(k / 8, 1000 + f);
+                    let mut cw = info.clone();
+                    cw.resize(n / 8, 0);
+                    code.encode(&info, &mut cw[k / 8..]);
+                    let mut sym = Vec::new();
+                    mp.map(&cw, &mut sym);
+                    let noise = rand_bytes(sym.len() * 16, 77 + f);
+                    let g = |i: usize| {
+                        // Box–Muller from two bytes' worth of uniform.
+                        let u1 = (u32::from_le_bytes(noise[8 * i..8 * i + 4].try_into().unwrap())
+                            as f32
+                            + 1.0)
+                            / 4_294_967_297.0;
+                        let u2 = u32::from_le_bytes(noise[8 * i + 4..8 * i + 8].try_into().unwrap())
+                            as f32
+                            / 4_294_967_296.0;
+                        (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+                    };
+                    for (j, y) in sym.iter_mut().enumerate() {
+                        *y += Iq::new(sigma * g(2 * j), sigma * g(2 * j + 1));
+                    }
+                    let mut llr = vec![0f32; n];
+                    mp.demap_llr(&sym, 2.0 * sigma * sigma, &mut llr);
+                    let mut q = vec![0i8; n];
+                    quantize(&llr, 4.0, &mut q);
+                    let mut out = vec![0u8; k / 8];
+                    let o =
+                        LdpcDecoder::new(LdpcCode::new(p.ldpc_table())).decode(&q, &mut out, 50);
+                    if o.converged && out == info {
+                        ok += 1;
+                    }
+                }
+                println!("{mc:18} ideal {ideal:+.2} +{over}: {ok}/8");
+            }
+        }
+    }
+
     #[test]
     fn llrs_scale_with_the_noise() {
         let mp = Mapper::s2(Constellation::qpsk(), CodeRate::new(1, 2), 2);

@@ -87,21 +87,30 @@ impl CarrierPll {
     /// through: whatever phase error the loop would carry into the block —
     /// including a whole cycle slip of 90° or more — is removed at once, from
     /// the block's average, instead of being pulled in over ~1/Bn symbols.
-    /// `sent(n)` is the reference for `block[n]`.
-    pub fn anchor(&mut self, block: &[Iq], sent: impl Fn(usize) -> Iq) {
+    /// `sent(n)` is the reference for `block[n]`. Returns the correction
+    /// made, radians: how far the loop had drifted.
+    pub fn anchor(&mut self, block: &[Iq], sent: impl Fn(usize) -> Iq) -> f64 {
         let mut acc = Iq::new(0.0, 0.0);
         for (n, &y) in block.iter().enumerate() {
             let ph = -(self.phase + self.freq * n as f64);
             acc += y * Iq::new(ph.cos() as f32, ph.sin() as f32) * sent(n).conj();
         }
-        if acc.norm() > 0.0 {
-            self.phase += acc.arg() as f64;
-            if self.phase > PI {
-                self.phase -= TAU;
-            } else if self.phase < -PI {
-                self.phase += TAU;
-            }
+        if acc.norm() == 0.0 {
+            return 0.0;
         }
+        let corr = acc.arg() as f64;
+        self.phase += corr;
+        if self.phase > PI {
+            self.phase -= TAU;
+        } else if self.phase < -PI {
+            self.phase += TAU;
+        }
+        corr
+    }
+
+    /// Frequency estimate, radians per symbol.
+    pub fn freq_rad(&self) -> f64 {
+        self.freq
     }
 
     pub fn phase(&self) -> f64 {
@@ -128,10 +137,16 @@ impl CarrierPll {
 
     /// De-rotate `x`, steer on the nearest of `points`, return the
     /// de-rotated symbol.
+    ///
+    /// The error is `Im(y·d*)` — the angle weighted by the amplitudes —
+    /// rather than the angle itself: on APSK an inner-ring symbol's angle is
+    /// several times noisier than an outer one's, and weighting them equally
+    /// let it jitter the loop into cycle slips (16APSK at 12 dB lost one
+    /// frame in five). On unit-power constellations the gain averages 1.
     pub fn step(&mut self, x: Iq, points: &[Iq]) -> Iq {
         let y = self.rotate(x);
         let d = nearest(y, points);
-        let err = (y * d.conj()).arg() as f64;
+        let err = (y * d.conj()).im as f64;
         self.update(err);
         y
     }
@@ -159,6 +174,12 @@ pub fn mer_db(sym: &[Iq], points: &[Iq]) -> f32 {
         err += (s - d).norm_sqr() as f64;
     }
     (10.0 * (sig / err.max(1e-30)).log10()) as f32
+}
+
+/// The largest number of points on any one ring: the finest rotational
+/// step a decision-directed loop can slip by is 2π over it.
+pub fn densest_ring(points: &[Iq]) -> usize {
+    ring_orders(points).into_iter().fold(1.0f32, f32::max) as usize
 }
 
 /// How many points share each point's ring: the rotational symmetry the

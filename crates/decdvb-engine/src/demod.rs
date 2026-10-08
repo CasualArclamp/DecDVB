@@ -22,7 +22,7 @@
 //! tone at the carrier offset.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::f64::consts::TAU;
+use std::f64::consts::{PI, TAU};
 
 use decdvb_core::{Iq, Modulation};
 use decdvb_dsp::{Agc, CarrierPll, Fir, LOCK_COHERENCE, SymbolSync, rrc_taps};
@@ -58,6 +58,10 @@ const TIMING_BN_SEARCH: f64 = 0.005;
 const TIMING_BN_LOCKED: f64 = 0.001;
 /// Carrier-locked data symbols kept for display.
 const RECENT: usize = 3000;
+/// A pilot block's correction, as a fraction of the constellation's finest
+/// rotational step (2π over its densest ring), beyond which the data before
+/// it are taken to have slipped and are re-derotated by interpolation.
+const SLIP_FRACTION: f64 = 0.25;
 /// Pilots and dummy-frame payload: `(1 + j)/sqrt(2)` before scrambling
 /// (§5.5.3).
 const PILOT: Iq = Iq::new(
@@ -67,6 +71,22 @@ const PILOT: Iq = Iq::new(
 /// Data symbols before each pilot block, and the block-to-block period.
 pub(crate) const PILOT_AFTER: usize = SLOTS_PER_PILOT_BLK * SLOT_LEN;
 pub(crate) const PILOT_PERIOD: usize = PILOT_AFTER + PILOT_BLK_LEN;
+/// The preferred PL scrambling sequences of EN 302 307-2 Table 19e: gold
+/// sequence indexes 0 and k·10 949, k = 1..6. The demodulator tries them
+/// when the one it was given does not fit the pilots.
+pub const PREFERRED_GOLD_CODES: [u32; 7] = [
+    0,
+    10_949,
+    2 * 10_949,
+    3 * 10_949,
+    4 * 10_949,
+    5 * 10_949,
+    6 * 10_949,
+];
+/// Pilot coherence (see `pilot_coherence`) that says a scrambling sequence
+/// fits: ~1 when it does, ~0.05 when not.
+const GOLD_FITS: f32 = 0.5;
+
 /// How far an outside frequency hint may be from the headers' own estimate
 /// and still be used, cycles per symbol: far past that estimate's noise, so a
 /// stale hint is caught but a good one is kept at low SNR.
@@ -192,6 +212,12 @@ pub struct Demod {
     coherence: f32,
     fresh: bool,
     modulation: Option<Modulation>,
+    /// The scrambling sequence has been seen to fit a frame's pilots.
+    gold_verified: bool,
+    /// The frame's payload before carrier recovery (slip repair needs it).
+    raw: Vec<Iq>,
+    /// Stretches of data re-derotated after a slip.
+    slips: u64,
     /// Smoothed signal amplitude and noise variance (see `PlFrame`).
     amp: f32,
     noise: f32,
@@ -238,6 +264,9 @@ impl Demod {
             coherence: 0.0,
             fresh: true,
             modulation: None,
+            gold_verified: false,
+            raw: Vec::new(),
+            slips: 0,
             amp: 1.0,
             noise: 1.0,
             level_fresh: true,
@@ -271,6 +300,12 @@ impl Demod {
         self.pll.freq_cycles() * self.symbol_rate()
     }
 
+    /// The PL scrambling sequence (gold code) in use: the one given, or a
+    /// preferred one found to fit the pilots.
+    pub fn gold_code(&self) -> u32 {
+        self.scrambler.gold_code()
+    }
+
     /// Modulation of the last frame that carried data.
     pub fn modulation(&self) -> Option<Modulation> {
         self.modulation
@@ -292,6 +327,11 @@ impl Demod {
     /// Frames emitted so far.
     pub fn frames(&self) -> u64 {
         self.frames
+    }
+
+    /// Stretches of data repaired after a carrier slip.
+    pub fn slips_repaired(&self) -> u64 {
+        self.slips
     }
 
     /// Times lock has been lost.
@@ -406,6 +446,9 @@ impl Demod {
                     // Carrier first: the loop then stands where the next
                     // header begins, and can read it coherently.
                     let p0 = hdr_end + 1;
+                    if pls.has_pilots && !self.gold_verified {
+                        self.check_gold(p0, pls);
+                    }
                     let mut payload = self.sym[p0..p0 + pls.payload_len as usize].to_vec();
                     self.scrambler.descramble(&mut payload);
                     let (gain, noise_var) = self.recover_carrier(hdr_end, pls, &mut payload);
@@ -613,6 +656,32 @@ impl Demod {
         self.data.clear();
         // A VL-SNR frame's extra pilot blocks are known symbols too.
         let layout = pls.vlsnr.map(vlsnr::layout);
+        // Slip repair: the data between two known blocks are re-derotated
+        // by interpolating between the phases the blocks measure when the
+        // later block finds the loop drifted by more than this. A decision-
+        // directed loop on APSK can settle a whole step off — 30° on 4+12's
+        // outer ring, with only the faint inner ring disagreeing — and stay
+        // there until the next pilots, which cost 16APSK 2–3 dB.
+        let dense = cst.map_or(4, |c| decdvb_dsp::carrier::densest_ring(&c.points));
+        let slip = if cst.is_some() {
+            SLIP_FRACTION * TAU / dense as f64
+        } else {
+            f64::INFINITY
+        };
+        // Through the data, a bandwidth for the decisions' own SNR: a dense
+        // ring's points are closer together than QPSK's, by its point count
+        // over 4, and the loop must be as much quieter.
+        if let Some(c) = cst {
+            let dense = decdvb_dsp::carrier::densest_ring(&c.points).max(4) as f64;
+            let snr = 10.0 * (self.amp * self.amp / self.noise).log10() as f64;
+            self.pll
+                .set_bandwidth(carrier_bandwidth(snr - 20.0 * (dense / 4.0).log10()));
+        }
+        self.raw.clear();
+        self.raw.extend_from_slice(payload);
+        // Where the current stretch of data began, and the phase there.
+        let mut seg = (0usize, self.pll.phase());
+        let mut in_block = false;
         for i in 0..payload.len() {
             let pilot = match layout {
                 Some(l) => l[i] == Slot::Pilot,
@@ -629,7 +698,36 @@ impl Demod {
                         .unwrap_or(l.len()),
                     None => (i + PILOT_BLK_LEN).min(payload.len()),
                 };
-                self.pll.anchor(&payload[i..end], |_| PILOT);
+                let corr = self.pll.anchor(&payload[i..end], |_| PILOT);
+                if corr.abs() > slip && i > seg.0 {
+                    let (i0, ph0) = seg;
+                    let span = (i - i0) as f64;
+                    // Unwrap the block's phase against where the frequency
+                    // says it should be, then interpolate linearly.
+                    let want = ph0 + self.pll.freq_rad() * span;
+                    let d = self.pll.phase() - want;
+                    let ph1 = want + (d + PI).rem_euclid(TAU) - PI;
+                    for (t, (y, &x)) in payload[i0..i].iter_mut().zip(&self.raw[i0..i]).enumerate()
+                    {
+                        let ph = -(ph0 + (ph1 - ph0) * t as f64 / span);
+                        *y = x * Iq::new(ph.cos() as f32, ph.sin() as f32);
+                    }
+                    // A slip also kicked the loop's frequency: take the one
+                    // the two blocks measure instead — on constellations
+                    // denser than QPSK, which are the ones that slip and
+                    // run where the blocks' phases are precise. (At QPSK's
+                    // −1 dB the measured frequency is noisier than the
+                    // loop's own: resetting it lost every 13/45 frame.)
+                    if dense > 4 {
+                        self.pll.set_freq_cycles((ph1 - ph0) / span / TAU);
+                    }
+                    self.slips += 1;
+                }
+                in_block = true;
+            } else if in_block && !pilot {
+                // The first symbol after a known block starts a stretch.
+                seg = (i, self.pll.phase());
+                in_block = false;
             }
             let x = payload[i];
             payload[i] = match cst {
@@ -682,6 +780,49 @@ impl Demod {
             self.recent.push_back(y);
         }
         level
+    }
+
+    /// How well `scr` descrambles the pilot blocks of the frame whose
+    /// payload starts at `p0`: the differentials across each block of what
+    /// should be one repeated symbol, coherently summed — near 1 when the
+    /// sequence is right, near 0 when not, and blind to the carrier.
+    fn pilot_coherence(&self, scr: &PlScrambler, p0: usize, pls: PlsInfo) -> f32 {
+        let (mut acc, mut mag) = (Iq::new(0.0, 0.0), 0f32);
+        for b in 0..pls.n_pilots as usize {
+            let start = b * PILOT_PERIOD + PILOT_AFTER;
+            for i in start..start + PILOT_BLK_LEN - 1 {
+                let z0 = self.sym[p0 + i] * scr.factor(i);
+                let z1 = self.sym[p0 + i + 1] * scr.factor(i + 1);
+                acc += z1 * z0.conj();
+                mag += z0.norm() * z1.norm();
+            }
+        }
+        acc.norm() / mag.max(1e-12)
+    }
+
+    /// Check the scrambling sequence against a frame's pilots, and if it
+    /// does not fit, look for one of Table 19e's that does.
+    fn check_gold(&mut self, p0: usize, pls: PlsInfo) {
+        if self.pilot_coherence(&self.scrambler, p0, pls) > GOLD_FITS {
+            self.gold_verified = true;
+            return;
+        }
+        let current = self.scrambler.gold_code();
+        let best = PREFERRED_GOLD_CODES
+            .iter()
+            .filter(|&&n| n != current)
+            .map(|&n| {
+                let scr = PlScrambler::new(n);
+                let c = self.pilot_coherence(&scr, p0, pls);
+                (scr, c)
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        if let Some((scr, c)) = best
+            && c > GOLD_FITS
+        {
+            self.scrambler = scr;
+            self.gold_verified = true;
+        }
     }
 
     /// A VL-SNR frame's payload, carrier-corrected and descrambled as if

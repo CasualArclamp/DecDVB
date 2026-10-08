@@ -37,7 +37,8 @@ identified blind.*
 | **LDPC + BCH → BBFRAMEs**: all 21 S2 and 31 S2X codes, BBHEADER, stream info, payload rate | ✅ |
 | **S2X**: 8-bit PLS code, all 55 normal/short MODCODs — 2+4+2 8APSK to 256APSK, the new interleavers | ✅ |
 | **S2X VL-SNR**: the VL-SNR header, pi/2-BPSK (and spread), medium FECFRAMEs, all 9 MODCODs — down to about 0 dB Es/N0 so far | ✅ |
-| S2X superframing (Annex E), PL scrambling search (Table 19e) | to do |
+| PL scrambling: the preferred sequences of S2X Table 19e found from the pilots | ✅ |
+| S2X superframing (Annex E) | to do |
 | **GSE → IP → PCAP** + live IP stats; GSE variant detected from the data | ✅ |
 | **MPEG-TS**: services, PIDs, errors; `.ts` file, UDP, TCP/HTTP to VLC or PotPlayer | ✅ |
 | **TS analyser** (EBSPro-style): PIDs, services, now/next, network, tables | ✅ |

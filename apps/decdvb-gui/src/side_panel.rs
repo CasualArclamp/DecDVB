@@ -285,7 +285,18 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
             }
             if matches!(s.decoder, DecoderKind::Dvbs2Ip | DecoderKind::Dvbs2Ts) {
                 ui.label("Gold code");
-                ui.add(egui::DragValue::new(&mut s.gold_code).range(0..=262_141));
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut s.gold_code).range(0..=262_141));
+                    // The demodulator tries Table 19e's sequences itself.
+                    if let Some(g) = st.gold_code
+                        && g != s.gold_code
+                    {
+                        ui.label(RichText::new(format!("using {g} (found)")).small())
+                            .on_hover_text(
+                                "This sequence fitted the pilots; the one set here did not.",
+                            );
+                    }
+                });
                 ui.end_row();
             }
 

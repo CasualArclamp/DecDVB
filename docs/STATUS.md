@@ -484,3 +484,35 @@ in acquisition, and superframing (Annex E; DESIGN puts it in M5).
 **S2X left**: superframing (Annex E, M5 in DESIGN), and searching the
 preferred PL scrambling sequences of Table 19e when the default does not
 lock.
+
+## Demodulator: APSK within 1 dB of the ideal, scrambling found (2026-10-08)
+
+Measuring S2X against EN 302 307-2 Table 20a's ideal Es/N0 showed the FEC
+chain itself within 0.5–1 dB on plain AWGN (`awgn_modcod_sweep`, and every
+LDPC code's waterfall sits in rate order — `ldpc_waterfalls`), but the full
+receiver losing 3 dB and more on 4+12 16APSK and 4+12+20+28 64APSK — and S2's
+own 16APSK 2/3 losing two frames in eleven at 12 dB. Whole frames failed, in
+runs: carrier slips. Three changes to the carrier loop:
+
+- **Decision error weighted by amplitude** (`Im(y·d*)`, not `arg`): an inner
+  ring's angle is several times noisier than the outer's.
+- **Slip repair**: each pilot block's anchor reports how far the loop had
+  drifted; beyond a quarter of the constellation's finest rotational step,
+  the data since the previous known block are re-derotated by interpolating
+  between the two blocks' phases, from the raw symbols. On constellations
+  denser than QPSK the loop's frequency is reset to the blocks' too (not on
+  QPSK: at −1 dB that lost every 13/45 frame).
+- **Bandwidth by density**: the decision-directed loop's bandwidth is set for
+  the SNR less 20·log10(densest ring / 4) — a 12-point ring decides angles
+  three times closer than QPSK.
+
+Now (`s2x_threshold_sweep`, ignored): 8PSK 25/36, 16APSK 26/45, 32APSK 32/45,
+64APSK 11/15 and 256APSK 3/4 decode every frame at their ideal + 1 dB; QPSK
+13/45 at + 2 dB (below that, PL sync). The GUI scene is unchanged (100 %).
+
+**PL scrambling (Table 19e)**: a frame's pilots descrambled with the right
+sequence are one repeated symbol, so differentials across each pilot block
+add up coherently (~1) and with a wrong one do not (~0.05) — no carrier lock
+needed. When the given gold code does not fit, the demodulator tries the
+seven preferred ones (0 and k·10 949) and switches; the side panel shows
+"using … (found)".

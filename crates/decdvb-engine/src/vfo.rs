@@ -181,6 +181,9 @@ pub struct VfoStatus {
     pub recording_active: bool,
     /// Carrier loop of a running demodulator (for Identify: its live view).
     pub carrier: Option<CarrierState>,
+    /// DVB-S2: the PL scrambling sequence in use (it may have been found,
+    /// not set).
+    pub gold_code: Option<u32>,
     /// DVB-S2 decoders: what FEC has made of the frames.
     pub fec: Option<FecStats>,
 }
@@ -822,6 +825,7 @@ impl Worker {
                             modulation: m,
                         });
                     }
+                    st.gold_code = Some(d.gold_code());
                     let fec = fec.as_ref().map(|w| w.stats());
                     st.message = match (d.lock_state(), &fec) {
                         (LockState::Searching, _) => "searching for PLHEADERs".into(),
