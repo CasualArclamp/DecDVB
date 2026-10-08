@@ -353,3 +353,21 @@ audio and top-flow lists after a burst; and the demodulator ran its timing
 loop across a whole input block before frame logic could re-widen it after a
 lost lock — one call with everything after a dropout never re-acquired (it
 now works in 16 k-sample chunks).
+
+## M3, part 1 — S2X FEC layer (done, 2026-10-08)
+
+- The 31 S2X LDPC codes for normal and short FECFRAMEs (EN 302 307-2
+  Annex B/C, generated from gr-dvbs2rx's tables: rates 2/9 … 154/180, the
+  "-L" rates 90/180 … 22/30 kept unreduced), plus the three medium-frame
+  tables for VL-SNR. K_bch/N_bch/t for each (all t = 12).
+- Encoder, layered decoder and BCH tested over every S2X code exactly as
+  over the S2 ones (codewords check, decoding near threshold, t errors
+  corrected).
+
+**What S2X still needs — and why it is not done yet.** The reference code
+on hand stops at the FEC layer: none of it has the S2X physical layer — the
+8-bit PLS code and the MODCOD 128–255 table, the 8/16/32/64/128/256APSK
+constellations (radii and bit labels), the S2X bit-interleaver permutations,
+VL-SNR headers and pi/2-BPSK spreading, or superframing. Those come from
+EN 302 307-2 itself (or gr-dtv's S2X modulator); they are tables where a
+guess would silently decode nothing, so they wait for the source.

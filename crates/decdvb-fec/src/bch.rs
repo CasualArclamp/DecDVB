@@ -359,7 +359,7 @@ fn generator(gf: &Gf, t: usize) -> Vec<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::all_s2;
+    use crate::params::{all_s2, all_s2x};
 
     fn rng(seed: u64) -> impl FnMut() -> u64 {
         let mut s = seed | 1;
@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn corrects_up_to_t_errors_in_every_code() {
         let mut next = rng(5);
-        for p in all_s2() {
+        for p in all_s2().chain(all_s2x()) {
             let bch = Bch::new(p.frame, p.t, p.n_bch);
             let mut cw: Vec<u8> = (0..p.n_bch / 8).map(|_| next() as u8).collect();
             bch.encode(&mut cw);

@@ -16,6 +16,7 @@
 //! Rust loops over 360-lane arrays vectorise.
 
 pub mod tables;
+pub mod tables_s2x;
 
 mod decoder;
 
@@ -171,7 +172,7 @@ fn rows(t: &'static Table) -> impl Iterator<Item = &'static [u16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::all_s2;
+    use crate::params::{all_s2, all_s2x};
 
     pub(crate) fn rng(seed: u64) -> impl FnMut() -> u64 {
         let mut s = seed | 1;
@@ -186,7 +187,7 @@ mod tests {
     #[test]
     fn encoded_words_satisfy_every_check() {
         let mut next = rng(3);
-        for p in all_s2() {
+        for p in all_s2().chain(all_s2x()) {
             let code = LdpcCode::new(p.ldpc_table());
             let info: Vec<u8> = (0..code.k / 8).map(|_| next() as u8).collect();
             let mut cw = info.clone();
@@ -202,7 +203,7 @@ mod tests {
 
     #[test]
     fn every_table_address_becomes_one_edge_block() {
-        for p in all_s2() {
+        for p in all_s2().chain(all_s2x()) {
             let code = LdpcCode::new(p.ldpc_table());
             let t = p.ldpc_table();
             // Info edges: every address of every row is one 360-edge block;

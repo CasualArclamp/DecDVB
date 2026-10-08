@@ -264,7 +264,7 @@ fn add_rotated(delta: &[i16; LANES], s: usize, dst: &mut [i16]) {
 mod tests {
     use super::super::tests::rng;
     use super::*;
-    use crate::params::{FecParams, all_s2};
+    use crate::params::{FecParams, all_s2, all_s2x};
 
     /// Encode random info, send as BPSK (+1 for 0) through AWGN at `ebn0_db`,
     /// quantize at `scale` steps per LLR unit, decode. Returns the outcome,
@@ -345,7 +345,7 @@ mod tests {
     fn decodes_every_code_near_its_threshold() {
         // At several quantization scales: the decoder must not depend on
         // where the caller puts the LLRs within the 8-bit range.
-        for p in all_s2() {
+        for p in all_s2().chain(all_s2x()) {
             for scale in [2.0, 4.0, 8.0] {
                 let (o, errors, parity_ok) = run(p, test_ebn0(p), scale, 7);
                 assert_eq!(errors, 0, "{p:?} ×{scale}: {o:?}");

@@ -4,6 +4,7 @@
 use decdvb_core::{CodeRate, FecFrame};
 
 use crate::ldpc::tables::{self, Table};
+use crate::ldpc::tables_s2x;
 
 /// Sizes of one FECFRAME's codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +39,32 @@ impl FecParams {
                 (5, 6) => (53_840, 54_000, 10),
                 (8, 9) => (57_472, 57_600, 8),
                 (9, 10) => (58_192, 58_320, 8),
+                // S2X (EN 302 307-2 Table 5a; every one t = 12). Rates are
+                // kept unreduced: 90/180 is not the S2 1/2 code.
+                (2, 9) => (14_208, 14_400, 12),
+                (13, 45) => (18_528, 18_720, 12),
+                (9, 20) => (28_968, 29_160, 12),
+                (90, 180) => (32_208, 32_400, 12),
+                (96, 180) => (34_368, 34_560, 12),
+                (11, 20) => (35_448, 35_640, 12),
+                (100, 180) => (35_808, 36_000, 12),
+                (104, 180) => (37_248, 37_440, 12),
+                (26, 45) => (37_248, 37_440, 12),
+                (18, 30) => (38_688, 38_880, 12),
+                (28, 45) => (40_128, 40_320, 12),
+                (23, 36) => (41_208, 41_400, 12),
+                (116, 180) => (41_568, 41_760, 12),
+                (20, 30) => (43_008, 43_200, 12),
+                (124, 180) => (44_448, 44_640, 12),
+                (25, 36) => (44_808, 45_000, 12),
+                (128, 180) => (45_888, 46_080, 12),
+                (13, 18) => (46_608, 46_800, 12),
+                (132, 180) => (47_328, 47_520, 12),
+                (22, 30) => (47_328, 47_520, 12),
+                (135, 180) => (48_408, 48_600, 12),
+                (140, 180) => (50_208, 50_400, 12),
+                (7, 9) => (50_208, 50_400, 12),
+                (154, 180) => (55_248, 55_440, 12),
                 _ => return None,
             },
             // Table 5b. The short codes' nominal rates are not their real ones
@@ -54,6 +81,14 @@ impl FecParams {
                 (4, 5) => (12_432, 12_600, 12),
                 (5, 6) => (13_152, 13_320, 12),
                 (8, 9) => (14_232, 14_400, 12),
+                // S2X (EN 302 307-2 Table 5b).
+                (11, 45) => (3_792, 3_960, 12),
+                (4, 15) => (4_152, 4_320, 12),
+                (14, 45) => (4_872, 5_040, 12),
+                (7, 15) => (7_392, 7_560, 12),
+                (8, 15) => (8_472, 8_640, 12),
+                (26, 45) => (9_192, 9_360, 12),
+                (32, 45) => (11_352, 11_520, 12),
                 _ => return None,
             },
             FecFrame::Medium => return None,
@@ -93,6 +128,37 @@ impl FecParams {
             ((4, 5), false) => &tables::SHORT_4_5,
             ((5, 6), false) => &tables::SHORT_5_6,
             ((8, 9), false) => &tables::SHORT_8_9,
+            ((2, 9), true) => &tables_s2x::NORMAL_2_9,
+            ((13, 45), true) => &tables_s2x::NORMAL_13_45,
+            ((9, 20), true) => &tables_s2x::NORMAL_9_20,
+            ((90, 180), true) => &tables_s2x::NORMAL_90_180,
+            ((96, 180), true) => &tables_s2x::NORMAL_96_180,
+            ((11, 20), true) => &tables_s2x::NORMAL_11_20,
+            ((100, 180), true) => &tables_s2x::NORMAL_100_180,
+            ((104, 180), true) => &tables_s2x::NORMAL_104_180,
+            ((26, 45), true) => &tables_s2x::NORMAL_26_45,
+            ((18, 30), true) => &tables_s2x::NORMAL_18_30,
+            ((28, 45), true) => &tables_s2x::NORMAL_28_45,
+            ((23, 36), true) => &tables_s2x::NORMAL_23_36,
+            ((116, 180), true) => &tables_s2x::NORMAL_116_180,
+            ((20, 30), true) => &tables_s2x::NORMAL_20_30,
+            ((124, 180), true) => &tables_s2x::NORMAL_124_180,
+            ((25, 36), true) => &tables_s2x::NORMAL_25_36,
+            ((128, 180), true) => &tables_s2x::NORMAL_128_180,
+            ((13, 18), true) => &tables_s2x::NORMAL_13_18,
+            ((132, 180), true) => &tables_s2x::NORMAL_132_180,
+            ((22, 30), true) => &tables_s2x::NORMAL_22_30,
+            ((135, 180), true) => &tables_s2x::NORMAL_135_180,
+            ((140, 180), true) => &tables_s2x::NORMAL_140_180,
+            ((7, 9), true) => &tables_s2x::NORMAL_7_9,
+            ((154, 180), true) => &tables_s2x::NORMAL_154_180,
+            ((11, 45), false) => &tables_s2x::SHORT_11_45,
+            ((4, 15), false) => &tables_s2x::SHORT_4_15,
+            ((14, 45), false) => &tables_s2x::SHORT_14_45,
+            ((7, 15), false) => &tables_s2x::SHORT_7_15,
+            ((8, 15), false) => &tables_s2x::SHORT_8_15,
+            ((26, 45), false) => &tables_s2x::SHORT_26_45,
+            ((32, 45), false) => &tables_s2x::SHORT_32_45,
             // `new` only builds the combinations above.
             _ => unreachable!("no LDPC table for {:?} {}", self.frame, self.rate),
         }
@@ -102,6 +168,17 @@ impl FecParams {
     pub fn bbframe_bytes(&self) -> usize {
         self.k_bch / 8
     }
+}
+
+/// Every S2X code (normal and short FECFRAMEs; medium ones come with VL-SNR).
+pub fn all_s2x() -> impl Iterator<Item = FecParams> {
+    const NORMAL: [(u16, u16); 24] = [(2, 9), (13, 45), (9, 20), (90, 180), (96, 180), (11, 20), (100, 180), (104, 180), (26, 45), (18, 30), (28, 45), (23, 36), (116, 180), (20, 30), (124, 180), (25, 36), (128, 180), (13, 18), (132, 180), (22, 30), (135, 180), (140, 180), (7, 9), (154, 180)];
+    const SHORT: [(u16, u16); 7] = [(11, 45), (4, 15), (14, 45), (7, 15), (8, 15), (26, 45), (32, 45)];
+    NORMAL
+        .iter()
+        .map(|&(n, d)| (FecFrame::Normal, n, d))
+        .chain(SHORT.iter().map(|&(n, d)| (FecFrame::Short, n, d)))
+        .filter_map(|(f, n, d)| FecParams::new(f, CodeRate::new(n, d)))
 }
 
 /// Every code DVB-S2 defines, normal frames first.
@@ -146,5 +223,14 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 21);
+        let mut n = 0;
+        for p in all_s2x() {
+            let t = p.ldpc_table();
+            assert_eq!((t.n, t.k), (p.n_ldpc, p.n_bch), "{p:?}");
+            assert_eq!(p.n_bch - p.k_bch, if p.frame == FecFrame::Normal { 16 } else { 14 } * p.t);
+            assert_eq!(p.k_bch % 8, 0);
+            n += 1;
+        }
+        assert_eq!(n, 31);
     }
 }
