@@ -1,0 +1,12 @@
+﻿[package]
+name = "decdvb-frame"
+description = "PL framing: PLHEADER/PLS, pilots, scrambler, BBFRAME/BBHEADER, superframe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decdvb-core = { path = "../decdvb-core" }
+thiserror.workspace = true

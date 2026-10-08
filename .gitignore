@@ -1,0 +1,15 @@
+/target
+/target-portable
+# Reference clones (gr-dvbs2rx, leansdr, gr-dtv, dontlookup) — never committed.
+/reference
+# User captures and recordings.
+/samples
+/captures
+/out
+# Portable builds; the exes are published on GitHub releases instead.
+/exe/*.exe
+*.pcap
+*.ts
+*.cs8
+*.cs16
+*.cf32

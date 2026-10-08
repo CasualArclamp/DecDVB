@@ -1,0 +1,39 @@
+//! IQ input and output for DecDVB.
+//!
+//! Everything upstream of the demodulator talks to an [`IqSource`]: an IQ file
+//! (replay, and the only way to handle transponders wider than the HackRF) or
+//! the live HackRF One. Recording goes out through [`IqFileWriter`].
+
+pub mod file;
+
+#[cfg(feature = "hackrf")]
+pub mod hackrf;
+
+pub use file::{IqFileReader, IqFileWriter, format_from_path};
+
+use decdvb_core::{Iq, Result};
+
+/// A source of baseband complex samples.
+///
+/// Rust note: this is a plain trait object interface rather than an iterator so
+/// that implementations can fill a caller-owned buffer and avoid allocating per
+/// block — at 15 MS/s the allocator would otherwise dominate.
+pub trait IqSource: Send {
+    /// Fill `out` with up to its capacity worth of samples. Returns the number
+    /// of samples written; `Ok(0)` means end of stream.
+    ///
+    /// Implementations clear `out` first and push into it, so the caller can
+    /// reuse one `Vec` for the whole run.
+    fn read(&mut self, out: &mut Vec<Iq>) -> Result<usize>;
+
+    /// Sample rate in Hz.
+    fn sample_rate(&self) -> f64;
+
+    /// RF centre frequency in Hz, if known (0.0 for a plain baseband file).
+    fn center_freq(&self) -> f64 {
+        0.0
+    }
+
+    /// Human-readable description for the GUI/CLI status line.
+    fn describe(&self) -> String;
+}

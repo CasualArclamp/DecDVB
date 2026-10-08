@@ -1,0 +1,21 @@
+[package]
+name = "decdvb-io"
+description = "DecDVB I/O: IQ file replay/record and the HackRF front end"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Live HackRF One front end. Implemented in M1 by loading libhackrf at run time
+# (libloading), so building DecDVB never needs the HackRF SDK installed.
+hackrf = ["dep:libloading"]
+
+[dependencies]
+decdvb-core = { path = "../decdvb-core" }
+num-complex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+libloading = { version = "0.8", optional = true }

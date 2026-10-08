@@ -1,0 +1,12 @@
+﻿[package]
+name = "decdvb-ts"
+description = "TS-mode BBFRAME to MPEG-TS extraction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decdvb-core = { path = "../decdvb-core" }
+thiserror.workspace = true

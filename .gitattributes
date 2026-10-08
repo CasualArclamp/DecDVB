@@ -1,0 +1,17 @@
+# Normalise text in the repository to LF; Git checks it out native on Windows.
+* text=auto
+
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=crlf
+
+# Captures and binaries are never diffed or line-ending converted.
+*.cs8 binary
+*.cs16 binary
+*.cf32 binary
+*.pcap binary
+*.ts binary
+*.exe binary

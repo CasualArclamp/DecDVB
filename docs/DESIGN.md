@@ -1,0 +1,228 @@
+# DecDVB — Design
+
+A Rust **DVB-S2 / DVB-S2X** receiver with **ACM** (Adaptive Coding & Modulation), **GSE** de-encapsulation to **IP (PCAP)**, **TS** extraction, and a matching **modulator** for loopback and ACM test-signal generation. HackRF One based, with IQ-file replay.
+
+Status date: 2026-10-08 (kickoff). This document is the source of truth for scope and milestones — read it before continuing work. Decisions here come from the kickoff Q&A with Rory.
+
+---
+
+## 1. Goals & non-goals
+
+**Goals**
+- Receive and decode DVB-S2 and DVB-S2X signals that fit a HackRF One (symbol rate up to ~15 MS/s; practically 125 kS–10 MS/s is the sweet spot).
+- Full **ACM/VCM**: demodulate each PLFRAME at whatever MODCOD its PLHEADER declares, frame by frame, with no prior knowledge.
+- De-encapsulate **GSE** → reassemble **IPv4/IPv6** → write **PCAP** + show live stream stats. Handle the proprietary GSE variants real operators use (see §6).
+- Extract **TS-mode** BBFRAMEs → `.ts` (most amateur DATV is still TS).
+- A **modulator** (TX) that produces spec-correct S2/S2X signals (HackRF TX or IQ file) so we can generate ACM/GSE test signals and run end-to-end loopback — real ACM/GSE captures are scarce.
+- egui/glow GUI + CLI, same look/feel as DecDRM. Portable exes + GitHub releases + CI.
+
+**Non-goals (for now)**
+- Channel bonding (S2X Annex D) and wideband / time-slicing (Annex M) — need multiple tuners or >20 MHz; file-only if ever.
+- Full two-way ACM link with a return channel (we build the pieces — RX SNR estimate + TX per-frame MODCOD — but not the closed loop over a radio return path now).
+- Conditional access / descrambling of encrypted payloads. We decode the transport, not break crypto.
+- Formal DVB certification. "Compliant" here = matches the normative bit/symbol processing and verifies against reference vectors for everything a HackRF can receive.
+
+**Targets:** QO-100 & amateur DATV; narrow Ku/C SCPC/VSAT IP carriers; wide broadcast muxes (file replay only — too wide for HackRF live); own HackRF TX later.
+
+---
+
+## 2. Signal chain (RX)
+
+```
+HackRF / IQ file
+  → AGC + DC/IQ-balance
+  → resample to N samples/symbol
+  → matched filter (RRC, roll-off from PLHEADER search / config)
+  → timing recovery (Gardner)
+  → coarse+fine carrier frequency & phase recovery
+  → PL sync: SOF correlation (25 symbols) + PLS code decode (64→7 bits)  → MODCOD, FECFRAME type, pilots?
+  → pilot-aided phase tracking
+  → PL descramble (gold code, index from config/search)
+  → de-map to soft bits (LLRs) for the declared MODCOD
+  → LDPC decode (DVB-S2/S2X H-matrices; normal 64800 / short 16200 / medium 32400)
+  → BCH decode (outer)
+  → BBFRAME  → BBHEADER parse (CRC-8) → MATYPE (TS/GS, SIS/MIS, CCM/ACM, ISSYI, NPD, RO), DFL, SYNC, UPL …
+      ├─ GS (generic stream) → GSE de-encapsulation → reassembly → IP → PCAP + stats
+      └─ TS (transport)      → TS reassembly (incl. CRC variants) → .ts
+```
+
+ACM/VCM is inherent: every PLFRAME carries its own MODCOD in the PLHEADER, so the demod re-selects constellation + LDPC rate per frame. VCM = fixed set over streams; ACM = time-varying; same code path.
+
+## 3. Signal chain (TX / modulator)
+
+Mirror of RX: input bytes (TS, or GSE-encapsulated IP, or BBFRAME) → BBHEADER + CRC-8 → BB scrambling → BCH encode → LDPC encode → bit interleave → map to constellation → PL framing (SOF + PLS + pilots) → PL scramble → RRC pulse shape → resample → HackRF TX / IQ file. Used for loopback tests and ACM test-signal sequences (script a MODCOD schedule).
+
+---
+
+## 4. Workspace layout
+
+Cargo workspace `decdvb`, modelled on DecDRM.
+
+```
+crates/
+  decdvb-core     shared types: MODCOD tables, FECFRAME params, roll-offs,
+                  BBHEADER/MATYPE, config, error types, SNR/metrics structs
+  decdvb-dsp      AGC, DC/IQ correction, resampler, RRC filter, Gardner TED,
+                  carrier recovery (coarse FFT + fine PLL), interpolators
+  decdvb-fec      LDPC decoder+encoder (all rates, 3 frame lengths), BCH,
+                  bit (de)interleaver, (de)mapper + LLR for QPSK..256APSK, pi/2-BPSK
+  decdvb-frame    PLHEADER (SOF + PLS 64-bit), MODCOD/type decode, dummy frames,
+                  pilot insertion/removal, PL (de)scrambler, VL-SNR header,
+                  superframe (Annex E), BBFRAME assembly, BBHEADER + CRC-8
+  decdvb-gse      GSE de-encapsulation + reassembly; standard + proprietary
+                  variants (header-len, split frag-id); label/protocol handling
+  decdvb-ts       TS-mode BBFRAME → MPEG-TS; null-packet reinsertion, sync,
+                  Generic/Newtec CRC variants
+  decdvb-ip       IPv4/IPv6 parse, PCAP writer, stream classification + stats,
+                  blind IP-header-checksum fallback search
+  decdvb-io       HackRF source (libhackrf FFI / soapy), IQ file reader/writer
+                  (cs8/cs16/cf32), HackRF TX sink, ring buffers
+  decdvb-engine   orchestrates RX (and TX) chain; ACM state; multistream/ISI
+                  filter; gold-code handling; metrics aggregation
+apps/
+  decdvb-cli      headless decode / modulate
+  decdvb-gui      egui/glow: constellation, spectrum, ACM timeline, stream table
+docs/ DESIGN.md, reference/ (git-ignored), samples/ (git-ignored), exe/, scripts/, .github/
+```
+
+## 5. FEC — the heavy part
+
+- **LDPC**: DVB-S2 (EN 302 307-1) + S2X (EN 302 307-2) parity-check matrices. Frame lengths 64800 (normal), 16200 (short), 32400 (S2X medium). Rates from 1/4 … 9/10 (S2) plus the many S2X rates (e.g. 13/45, 9/20, 11/20, 26/45, 28/45, 23/36, 25/36, 13/18, 90/180 …). Layered/min-sum decoder with normalized min-sum, a few iterations, early-stop on BCH/parity. Port structure + the rate tables from **gr-dvbs2rx** / **leansdr** (GPL-3), re-expressed in Rust.
+- **BCH**: outer code, t = 8/10/12 correctable, GF(2^16)/(2^14)/(2^15) per frame length.
+- **Interleaver**: column-twist bit interleaver for 8PSK+ (S2) and the S2X variants.
+- **Demapper**: Gray-mapped QPSK/8PSK, and the APSK ring constellations (16/32/64/128/256APSK) with the ring ratios γ per MODCOD from the spec tables; soft LLRs (approx-LLR with per-ring scaling). pi/2-BPSK for VL-SNR.
+
+Verification: compare our encode→decode and demap/LLR against vectors generated by gr-dtv (TX) and gr-dvbs2rx (RX) for each MODCOD. Reference clones are git-ignored; vectors are generated locally (CI can regenerate small ones or carry committed golden vectors that contain no third-party code).
+
+## 6. GSE / IP (the headline feature, per dontlookup)
+
+After BBFRAMEs exist, GS-mode payload is GSE. Implement:
+- Standard GSE (EN 301 545 / TS 102 606): Start/End fragment flags, 1-byte vs no fragment-id, length field, LT (label type) 6B/3B/broadcast/reuse, PROTOCOL-TYPE / extension headers, total-length + CRC-32 on reassembly.
+- **Proprietary variants** (from dontlookup, MIT): (a) non-standard **2-byte header-length** field (`hdrlen-2`); (b) **split fragment-id** = 6-bit frag-id + 2-bit counter instead of 8-bit. → run the 4 combinations and let the user/validator pick the one that yields valid IP (IP-header checksum + sane lengths).
+- **Blind IP search** fallback: scan BBFRAME payload byte offsets for an IPv4 header whose checksum validates (dontlookup's approach) when framing is unknown; also a byte-pair-swap pass.
+- Reassemble fragments per frag-id → IP datagram → **PCAP** (DLT_RAW or DLT_EN10MB with a synthetic MAC) + live stats (per src/dst, protocol, pps, bps). TS-mode handled in `decdvb-ts`.
+
+## 7. Input / output
+
+- **Input:** HackRF live via `libhackrf` FFI (preferred; a `libhackrf.dll` is already present on this PC) — optionally SoapySDR later. IQ files: HackRF `cs8` (int8 I/Q), `cs16`, `cf32`. Center-freq / sample-rate / gain in config; LNB LO offset handling for Ku.
+- **Output:** `.pcap` for IP; `.ts` for transport; GUI panels; CSV/JSON metrics.
+
+## 8. Platform, build, release
+
+- Windows 11 primary, Linux x86_64 too. egui/eframe with the **glow** (OpenGL) renderer (as DecDRM — keeps the Rust-version floor sane). `rustfft` for DSP.
+- Portable static-CRT exes in `exe/` + attached to GitHub releases; CI on GitHub Actions (Linux+Windows tests, clippy, smoke); release.yml drafts portable exes from a pushed tag. See memory [[feedback-release-and-ci]].
+- Repo: planned public `CasualArclamp/DecDVB`, **GPL-3.0-or-later**. Commit identity `Arclamp <45412977+CasualArclamp@users.noreply.github.com>`.
+
+## 9. Milestones
+
+- **M0 — skeleton**: workspace builds; core types + MODCOD/FECFRAME tables; config; IQ-file + HackRF source; CLI prints samples; GUI shows raw IQ constellation + spectrum. CI green. *(local git; create public repo at end of M0/M1.)*
+- **M1 — acquisition & PL**: RRC + timing (Gardner) + carrier recovery; SOF/PLS correlation; PLHEADER decode (MODCOD, FECFRAME, pilots); PL descramble; pilot phase tracking. Output: locks on a signal, prints MODCOD per frame, clean constellation.
+- **M2 — FEC core**: demap→LLR + LDPC + BCH for the common MODCODs (QPSK/8PSK, normal+short); BBHEADER + CRC-8; emit valid BBFRAMEs. Verified vs reference vectors.
+- **M3 — full MODCOD coverage**: 16/32/64/128/256APSK, all S2 + S2X rates, medium frame, VL-SNR + pi/2-BPSK.
+- **M4 — GSE → IP → PCAP + TS**: standard + proprietary GSE variants, reassembly, PCAP + live stats; TS-mode extraction. (Headline.)
+- **M5 — S2X framing & ACM polish**: superframe (Annex E), multistream/ISI filtering, gold-code index, ACM/VCM across changing MODCODs, SNR estimate per frame.
+- **M6 — modulator (TX)**: full encode chain → HackRF TX / IQ file; scripted ACM MODCOD schedules; end-to-end loopback test.
+- **M7 — GUI polish + release**: stream table, ACM timeline, per-MODCOD constellation, throughput; portable exe + first public release.
+
+## 10. Testing
+
+- Unit tests per crate (FEC encode↔decode round trips, GSE reassembly, CRC, mapper/demapper symmetry).
+- Golden vectors (committed, self-generated — no third-party source in the repo) for LDPC/BCH/mapping.
+- Loopback: modulator → demodulator in-process and over a HackRF TX→RX cable, across MODCODs and roll-offs.
+- Live: Rory tests against QO-100 / real carriers himself. Keep heavy sweeps on CI.
+
+## Appendix A — where to look in the reference code
+
+Clones live in `reference/` (git-ignored). `gr-dvbs2rx`'s `lib/` maps almost
+one-to-one onto our crates, so each milestone knows where to read first:
+
+| Our crate / milestone | gr-dvbs2rx files |
+|---|---|
+| `decdvb-dsp` timing (M1) | `symbol_sync_cc_impl.cc`, `delay_line.h` |
+| `decdvb-dsp` carrier (M1) | `pl_freq_sync.cc/.h`, `rotator_cc_impl.cc` |
+| `decdvb-frame` PL sync (M1) | `pl_frame_sync.cc/.h`, `plsync_cc_impl.cc` |
+| `decdvb-frame` PLS decode (M1) | `pl_signaling.cc`, `reed_muller.cc` — the 64-bit PLS code is a **Reed–Muller** code |
+| `decdvb-frame` descramble (M1) | `pl_descrambler.cc`, `pl_defs.h` |
+| `decdvb-fec` demap/LLR (M2–M3) | `xfecframe_demapper_cb_impl.cc`, `qpsk.h`, `psk.hh`, `qam.hh`, `pi2_bpsk.cc` |
+| `decdvb-fec` LDPC (M2–M3) | `ldpc_decoder_bb_impl.cc`, `dvb_s2_tables.hh` (55 KB), `dvb_s2x_tables.hh` (131 KB) |
+| `decdvb-fec` BCH (M2) | `bch.cc`, `gf.cc`, `gf_util.h`, `reed_solomon_error_correction.hh` |
+| `decdvb-fec` params (M2) | `fec_params.cc` — K/N per MODCOD |
+| `decdvb-frame` BBHEADER (M2) | `bbdeheader_bb_impl.cc`, `bbdescrambler_bb_impl.cc`, `crc.h` |
+
+`leansdr`'s `dvbs2.h` is the compact alternative worth comparing for
+acquisition behaviour at low SNR. `gr-dtv` is the modulator reference for M6.
+
+Those directories are untrusted downloaded code: read them, never build or run
+them as part of DecDVB's own test loop.
+
+## Appendix B — GSE wire format
+
+Recorded here so M4 does not have to re-derive it. Cross-checked against the
+Kaitai definitions in `dontlookup/parser/parsers/gse/*.ksy` (MIT) and ETSI
+TS 102 606.
+
+Every GSE packet starts with a 2-byte header, big-endian bit order:
+
+```
+ bit  15 14 | 13 12 | 11 ........ 0
+      S  E  |  LT   |  GSE_LENGTH (12 bits)
+```
+
+`S`/`E` taken together as a 2-bit value:
+
+| value | name   | S | E | meaning                   |
+|-------|--------|---|---|---------------------------|
+| 0     | middle | 0 | 0 | a middle fragment         |
+| 1     | end    | 0 | 1 | the last fragment         |
+| 2     | start  | 1 | 0 | the first fragment        |
+| 3     | whole  | 1 | 1 | an unfragmented PDU       |
+
+`LT` (label type): `0` = 6-byte label, `1` = 3-byte label, `2` = broadcast (no
+label), `3` = re-use the previous label.
+
+**Padding:** `S/E == middle (0b00)` *and* `LT == 0b00` *and* `GSE_LENGTH == 0`
+means the rest of the BBFRAME data field is padding — stop parsing the frame.
+
+Body by type (all after the 2-byte header):
+
+| type   | fields                                                                   |
+|--------|--------------------------------------------------------------------------|
+| start  | `frag_id` u8, `total_length` u16, `protocol_type` u16, label (6/3/0 B), data |
+| middle | `frag_id` u8, data                                                       |
+| end    | `frag_id` u8, data, `crc32` u32 (last 4 bytes)                           |
+| whole  | `protocol_type` u16, label (6/3/0 B), data                                |
+
+Note that **whole** carries no `frag_id` and no CRC, and **middle**/**end**
+carry no protocol type or label — those come from the matching *start*
+fragment, keyed by `frag_id`.
+
+### The four variants to try
+
+Two independent deviations, so four parsers, exactly as dontlookup does. Run
+them all and accept whichever yields a valid IP header (checksum + sane
+lengths):
+
+1. **Length meaning.** *Standard*: `GSE_LENGTH` counts every byte after the
+   2-byte header. *`hdrlen`*: `GSE_LENGTH` counts the **PDU only**, excluding
+   the frag-id / total-length / protocol-type / label fields that follow it.
+2. **Fragment id.** *Standard*: `frag_id` is a plain u8. *`split`*: that byte is
+   a 6-bit `frag_id` plus a 2-bit continuity counter.
+
+A fifth, `hdrlen_unsafe`, is `hdrlen` that also ignores `LT` — more permissive,
+accepting packets a label-type check would discard. Worth having as a last
+resort.
+
+### Fallbacks when framing is unknown
+
+- **Blind IPv4 search**: scan every byte offset of the BBFRAME data field for a
+  header whose IHL, total length and checksum all agree.
+- **Byte-pair swap**: some captures arrive 16-bit byte-swapped; re-run the
+  parsers over a pair-swapped copy.
+
+## Appendix C — TS mode
+
+TS-mode BBFRAMEs carry 188-byte MPEG-TS packets with the sync byte replaced per
+the BBHEADER's `SYNC`/`SYNCD` fields, and optional null-packet deletion (NPD).
+dontlookup also implements two CRC variants seen in the wild — "Generic" and
+"Newtec" — which `decdvb-ts` should offer alongside the standard handling.
+
