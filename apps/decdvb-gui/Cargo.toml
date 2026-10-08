@@ -28,6 +28,8 @@ eframe = { version = "0.36.2", default-features = false, features = ["default_fo
 egui_plot = "0.37.0"
 # Native file dialogs (Win32 on Windows, XDG desktop portal on Linux).
 rfd = "0.17.2"
+# PNG output for --screenshot (documentation and smoke tests).
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 # eframe's defaults turn on winit's defaults; with eframe's defaults off we
 # re-enable them here (Linux only), so building needs no X11/Wayland dev packages.

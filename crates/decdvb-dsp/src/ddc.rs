@@ -7,12 +7,22 @@
 //! symbol is then fractional, which the symbol synchroniser's interpolator
 //! handles, so no fractional resampler is needed here.
 //!
-//! The filter is a Blackman-windowed sinc. Its stopband starts at
-//! `out_rate − bw/2`, the lowest frequency that would alias back into the
-//! passband after decimation, so the whole transition band can be spent between
-//! the passband edge and that point.
+//! The filters are Blackman-windowed sincs. The stopband starts just past the
+//! VFO's edge (half as far again as its half-width) — so a VFO delivers what
+//! its edges show on the waterfall, as in SDR++ — and never later than
+//! `out_rate − bw/2`, where aliasing would begin. An earlier version used that
+//! aliasing limit alone, which let a strong neighbour up to ~out_rate/2 through
+//! and wrecked a symbol-rate estimate; see the regression test.
+//!
+//! One stage when the decimation is small. Otherwise two: a short filter with a
+//! generous transition band does most of the decimation, and the sharp filter
+//! that defines the VFO's edges runs at the lower rate. The split is chosen to
+//! minimise multiply-adds per input sample; for a narrow VFO on a wide span it
+//! costs a third to a quarter of a single sharp stage.
 
 use decdvb_core::Iq;
+
+use crate::dot::dot_cr;
 
 /// Output rate as a multiple of the VFO bandwidth (before rounding the
 /// decimation factor down, which only raises it).
@@ -52,23 +62,81 @@ pub fn lowpass(cutoff: f64, ntaps: usize) -> Vec<f32> {
     taps.into_iter().map(|t| t as f32).collect()
 }
 
-/// Numerically controlled oscillator mixing + decimating FIR.
+/// Filter length for a transition from `pass` to `stop` Hz at `rate`.
+fn ntaps(rate: f64, pass: f64, stop: f64) -> usize {
+    ((BLACKMAN_K * rate / (stop - pass)).ceil() as usize).clamp(15, MAX_TAPS)
+}
+
+/// A low-pass for a transition from `pass` to `stop` Hz at `rate`, cut off
+/// midway between them.
+fn design(rate: f64, pass: f64, stop: f64) -> Vec<f32> {
+    lowpass(
+        ((pass + stop) / 2.0 / rate).min(0.49),
+        ntaps(rate, pass, stop),
+    )
+}
+
+/// One decimating FIR stage.
+struct Stage {
+    /// Taps reversed, so the dot product runs over the buffer forwards.
+    taps_rev: Vec<f32>,
+    decim: usize,
+    /// The last `taps - 1` inputs from previous calls, then the new ones.
+    buf: Vec<Iq>,
+    /// Index in `buf` of the input at which the next output is due.
+    next_out: usize,
+}
+
+impl Stage {
+    fn new(mut taps: Vec<f32>, decim: usize) -> Self {
+        taps.reverse();
+        let l = taps.len();
+        Stage {
+            taps_rev: taps,
+            decim,
+            buf: vec![Iq::new(0.0, 0.0); l - 1],
+            next_out: l - 1,
+        }
+    }
+
+    fn process(&mut self, input: &[Iq], out: &mut Vec<Iq>) {
+        let l = self.taps_rev.len();
+        self.buf.extend_from_slice(input);
+        out.reserve(self.buf.len().saturating_sub(self.next_out) / self.decim + 1);
+        while self.next_out < self.buf.len() {
+            let window = &self.buf[self.next_out + 1 - l..=self.next_out];
+            out.push(dot_cr(window, &self.taps_rev));
+            self.next_out += self.decim;
+        }
+        // Keep only the history the next call needs.
+        let drop = self.buf.len() - (l - 1);
+        self.buf.drain(..drop);
+        self.next_out -= drop;
+    }
+
+    fn reset(&mut self) {
+        let l = self.taps_rev.len();
+        self.buf.clear();
+        self.buf.resize(l - 1, Iq::new(0.0, 0.0));
+        self.next_out = l - 1;
+    }
+}
+
+/// Numerically controlled oscillator mixing + one or two decimating FIRs.
 pub struct Ddc {
     in_rate: f64,
     decim: usize,
     bandwidth: f64,
     offset_hz: f64,
     /// Current oscillator phasor and its per-sample step (unit magnitude).
-    /// f64 so that hours of running do not accumulate audible phase error.
+    /// f64 so that hours of running do not accumulate phase error.
     phasor: (f64, f64),
     step: (f64, f64),
     since_renorm: u32,
-    /// Filter taps, reversed so the dot product runs over the buffer forwards.
-    taps_rev: Vec<f32>,
-    /// Mixed samples: the last `taps - 1` from previous calls, then new ones.
-    buf: Vec<Iq>,
-    /// Index in `buf` of the input sample at which the next output is due.
-    next_out: usize,
+    stages: Vec<Stage>,
+    /// Scratch: mixed input, and the output of the first of two stages.
+    mixed: Vec<Iq>,
+    mid: Vec<Iq>,
 }
 
 impl Ddc {
@@ -82,37 +150,70 @@ impl Ddc {
             bandwidth > 0.0 && bandwidth <= in_rate,
             "VFO bandwidth must be positive and within the sample rate"
         );
-        let decim = ((in_rate / (OVERSAMPLE * bandwidth)).floor() as usize).max(1);
-        let out_rate = in_rate / decim as f64;
+        let max_decim = ((in_rate / (OVERSAMPLE * bandwidth)).floor() as usize).max(1);
+        let pass = bandwidth / 2.0;
 
-        // Transition band: from the passband edge to where aliasing would start.
-        // With decim == 1 there is no aliasing, so just roll off past the edge.
-        let transition = if decim > 1 {
-            (out_rate - bandwidth).max(0.05 * bandwidth)
-        } else {
-            (in_rate - bandwidth)
-                .max(0.05 * bandwidth)
-                .min(in_rate / 2.0)
+        // Passband to the VFO edge; stopband half as far again, and never past
+        // the point where aliasing would begin at the final output rate.
+        let final_stop = |out_rate: f64, decim: usize| {
+            let alias = if decim > 1 {
+                out_rate - pass
+            } else {
+                in_rate / 2.0
+            };
+            (pass * 1.5).min(alias).max(pass * 1.02)
         };
-        let ntaps = ((BLACKMAN_K * in_rate / transition).ceil() as usize).clamp(15, MAX_TAPS);
-        // Cut off midway through the transition band.
-        let cutoff = ((bandwidth / 2.0 + transition / 2.0) / in_rate).min(0.49);
 
-        let mut taps_rev = lowpass(cutoff, ntaps);
-        taps_rev.reverse();
-        let l = taps_rev.len();
+        // Single stage, as the baseline.
+        let stop = final_stop(in_rate / max_decim as f64, max_decim);
+        let mut best_cost = ntaps(in_rate, pass, stop) as f64 / max_decim as f64;
+        let mut best: Option<(usize, usize)> = None;
+
+        // Two stages, over the exact factorisations of the decimation.
+        for d1 in 2..=max_decim / 2 {
+            if !max_decim.is_multiple_of(d1) {
+                continue;
+            }
+            let d2 = max_decim / d1;
+            let r1 = in_rate / d1 as f64;
+            let stop2 = final_stop(r1 / d2 as f64, d2);
+            // Stage 1 need only be flat to the VFO edge, and must keep its
+            // aliases out of everything stage 2 does not itself remove.
+            let stop1 = r1 - stop2;
+            if stop1 - pass < 0.1 * bandwidth {
+                continue;
+            }
+            let cost = ntaps(in_rate, pass, stop1) as f64 / d1 as f64
+                + ntaps(r1, pass, stop2) as f64 / max_decim as f64;
+            if cost < best_cost {
+                best_cost = cost;
+                best = Some((d1, d2));
+            }
+        }
+
+        let stages = match best {
+            None => vec![Stage::new(design(in_rate, pass, stop), max_decim)],
+            Some((d1, d2)) => {
+                let r1 = in_rate / d1 as f64;
+                let stop2 = final_stop(r1 / d2 as f64, d2);
+                vec![
+                    Stage::new(design(in_rate, pass, r1 - stop2), d1),
+                    Stage::new(design(r1, pass, stop2), d2),
+                ]
+            }
+        };
 
         let mut ddc = Ddc {
             in_rate,
-            decim,
+            decim: max_decim,
             bandwidth,
             offset_hz: 0.0,
             phasor: (1.0, 0.0),
             step: (1.0, 0.0),
             since_renorm: 0,
-            taps_rev,
-            buf: vec![Iq::new(0.0, 0.0); l - 1],
-            next_out: l - 1,
+            stages,
+            mixed: Vec::new(),
+            mid: Vec::new(),
         };
         ddc.set_offset(offset_hz);
         ddc
@@ -143,24 +244,49 @@ impl Ddc {
         self.in_rate / self.decim as f64
     }
 
+    /// Filter stages as (taps, decimation), for diagnostics.
+    pub fn stage_layout(&self) -> Vec<(usize, usize)> {
+        self.stages
+            .iter()
+            .map(|s| (s.taps_rev.len(), s.decim))
+            .collect()
+    }
+
+    /// Multiply-adds per input sample.
+    pub fn cost(&self) -> f64 {
+        let mut d = 1usize;
+        let mut c = 0.0;
+        for s in &self.stages {
+            d *= s.decim;
+            c += s.taps_rev.len() as f64 / d as f64;
+        }
+        c
+    }
+
+    /// The filters' combined span in input samples: skipping
+    /// `taps() / decimation()` outputs clears the start-up transient.
     pub fn taps(&self) -> usize {
-        self.taps_rev.len()
+        let mut d = 1usize;
+        let mut span = 0usize;
+        for s in &self.stages {
+            span += s.taps_rev.len() * d;
+            d *= s.decim;
+        }
+        span
     }
 
     /// Mix, filter and decimate `input`, appending to `out`.
     pub fn process(&mut self, input: &[Iq], out: &mut Vec<Iq>) {
-        let l = self.taps_rev.len();
-
-        // Mix every input sample down and append it to the filter buffer.
-        self.buf.reserve(input.len());
+        // Mix every input sample down.
+        self.mixed.clear();
+        self.mixed.reserve(input.len());
         let (sr, si) = self.step;
         for &x in input {
             let (pr, pi) = self.phasor;
-            let m = Iq::new(
+            self.mixed.push(Iq::new(
                 (x.re as f64 * pr - x.im as f64 * pi) as f32,
                 (x.re as f64 * pi + x.im as f64 * pr) as f32,
-            );
-            self.buf.push(m);
+            ));
             self.phasor = (pr * sr - pi * si, pr * si + pi * sr);
             self.since_renorm += 1;
             if self.since_renorm == RENORM_EVERY {
@@ -170,31 +296,22 @@ impl Ddc {
             }
         }
 
-        // One filter output per `decim` inputs, each over the `l` samples
-        // ending at `next_out`.
-        out.reserve((self.buf.len() - self.next_out) / self.decim + 1);
-        while self.next_out < self.buf.len() {
-            let window = &self.buf[self.next_out + 1 - l..=self.next_out];
-            let mut acc = Iq::new(0.0, 0.0);
-            for (s, &t) in window.iter().zip(&self.taps_rev) {
-                acc += s * t;
+        match self.stages.as_mut_slice() {
+            [only] => only.process(&self.mixed, out),
+            [first, second] => {
+                self.mid.clear();
+                first.process(&self.mixed, &mut self.mid);
+                second.process(&self.mid, out);
             }
-            out.push(acc);
-            self.next_out += self.decim;
+            _ => unreachable!("a DDC has one or two stages"),
         }
-
-        // Keep only the history the next call needs.
-        let drop = self.buf.len() - (l - 1);
-        self.buf.drain(..drop);
-        self.next_out -= drop;
     }
 
     /// Clear filter history (e.g. after the source restarts).
     pub fn reset(&mut self) {
-        let l = self.taps_rev.len();
-        self.buf.clear();
-        self.buf.resize(l - 1, Iq::new(0.0, 0.0));
-        self.next_out = l - 1;
+        for s in &mut self.stages {
+            s.reset();
+        }
     }
 }
 
@@ -215,6 +332,13 @@ mod tests {
     fn power_db(x: &[Iq]) -> f64 {
         let p: f64 = x.iter().map(|s| s.norm_sqr() as f64).sum::<f64>() / x.len() as f64;
         10.0 * p.max(1e-30).log10()
+    }
+
+    /// Output of a DDC fed `x`, with the start-up transient skipped.
+    fn settled(d: &mut Ddc, x: &[Iq]) -> Vec<Iq> {
+        let mut out = Vec::new();
+        d.process(x, &mut out);
+        out[d.taps() / d.decimation() + 10..].to_vec()
     }
 
     #[test]
@@ -238,57 +362,107 @@ mod tests {
         let rate = 8e6;
         let off = 1.234e6;
         let mut d = Ddc::new(rate, off, 400e3);
-        let mut out = Vec::new();
-        d.process(&tone(rate, off, 200_000), &mut out);
-
-        // Skip the filter's start-up transient, then the output should be a
-        // constant phasor: tiny sample-to-sample phase change.
-        let settled = &out[d.taps() / d.decimation() + 10..];
-        let max_step = settled
+        let s = settled(&mut d, &tone(rate, off, 200_000));
+        // A constant phasor: tiny sample-to-sample phase change, unity gain.
+        let max_step = s
             .windows(2)
             .map(|w| (w[1] * w[0].conj()).arg().abs())
             .fold(0.0f32, f32::max);
         assert!(max_step < 1e-3, "residual rotation {max_step} rad/sample");
-        // And at unity gain.
-        assert!(
-            power_db(settled).abs() < 0.1,
-            "gain {} dB",
-            power_db(settled)
-        );
+        assert!(power_db(&s).abs() < 0.1, "gain {} dB", power_db(&s));
     }
 
     #[test]
     fn out_of_band_tone_is_rejected() {
-        let rate = 8e6;
-        let mut d = Ddc::new(rate, 0.0, 400e3);
-        let mut out = Vec::new();
         // 1.5 MHz away: far outside the 200 kHz half-bandwidth, and it would
         // alias into the passband if the filter let it through.
-        d.process(&tone(rate, 1.5e6, 400_000), &mut out);
-        let settled = &out[d.taps() / d.decimation() + 10..];
-        assert!(power_db(settled) < -60.0, "leak {} dB", power_db(settled));
+        let rate = 8e6;
+        let mut d = Ddc::new(rate, 0.0, 400e3);
+        let s = settled(&mut d, &tone(rate, 1.5e6, 400_000));
+        assert!(power_db(&s) < -60.0, "leak {} dB", power_db(&s));
+    }
+
+    #[test]
+    fn neighbour_just_outside_the_vfo_is_rejected() {
+        // Regression: a 1.5 MHz VFO at 8 MS/s decimates by 2 to 4 MS/s, so a
+        // neighbour 1.7 MHz from the VFO centre is inside the output's Nyquist
+        // band. The first filter design only stopped at the aliasing limit
+        // (~2 MHz) and let it through at full strength.
+        let rate = 8e6;
+        let mut d = Ddc::new(rate, -2.5e6, 1.516e6);
+        assert_eq!(d.decimation(), 2);
+        let s = settled(&mut d, &tone(rate, -0.8e6, 400_000));
+        assert!(
+            power_db(&s) < -60.0,
+            "neighbour leaks at {} dB",
+            power_db(&s)
+        );
+    }
+
+    #[test]
+    fn vfo_passband_is_flat_to_its_edge() {
+        let rate = 8e6;
+        let mut d = Ddc::new(rate, 0.0, 1.0e6);
+        let s = settled(&mut d, &tone(rate, 0.48e6, 400_000));
+        assert!(power_db(&s).abs() < 0.5, "edge gain {} dB", power_db(&s));
+    }
+
+    #[test]
+    fn narrow_vfo_on_a_wide_span_uses_two_cheap_stages() {
+        // The case that loaded the CPU: 380 kHz at 20 MS/s.
+        let decim = (20e6 / (OVERSAMPLE * 380e3)).floor();
+        let pass = 190e3;
+        let stop = (pass * 1.5f64).min(20e6 / decim - pass);
+        let one_stage = ntaps(20e6, pass, stop) as f64 / decim;
+
+        let d = Ddc::new(20e6, 0.0, 380e3);
+        assert_eq!(d.stage_layout().len(), 2, "{:?}", d.stage_layout());
+        assert!(
+            d.cost() < one_stage / 2.5,
+            "cost {:.1} vs single-stage {:.1} MAC/sample ({:?})",
+            d.cost(),
+            one_stage,
+            d.stage_layout()
+        );
+    }
+
+    #[test]
+    fn two_stages_still_reject_neighbours_and_aliases() {
+        let rate = 20e6;
+        for f in [0.6e6, 1.3e6, 5.0e6, -3.7e6] {
+            let mut d = Ddc::new(rate, 0.0, 380e3);
+            assert_eq!(d.stage_layout().len(), 2);
+            let s = settled(&mut d, &tone(rate, f, 600_000));
+            assert!(
+                power_db(&s) < -60.0,
+                "tone at {f} leaks at {} dB",
+                power_db(&s)
+            );
+        }
+        let mut d = Ddc::new(rate, 0.0, 380e3);
+        let s = settled(&mut d, &tone(rate, 150e3, 600_000));
+        assert!(power_db(&s).abs() < 0.5, "passband {} dB", power_db(&s));
     }
 
     #[test]
     fn block_size_does_not_change_the_output() {
         // A VFO is fed whatever block size the source produces, so the result
-        // must not depend on how the stream was chopped up.
-        let rate = 4e6;
-        let input = tone(rate, 333e3, 50_000);
+        // must not depend on how the stream was chopped up — on both paths.
+        for (rate, bw) in [(4e6, 200e3), (20e6, 380e3)] {
+            let input = tone(rate, 133e3, 120_000);
+            let mut a = Ddc::new(rate, 100e3, bw);
+            let mut one = Vec::new();
+            a.process(&input, &mut one);
 
-        let mut a = Ddc::new(rate, 300e3, 200e3);
-        let mut one = Vec::new();
-        a.process(&input, &mut one);
-
-        let mut b = Ddc::new(rate, 300e3, 200e3);
-        let mut many = Vec::new();
-        for chunk in input.chunks(777) {
-            b.process(chunk, &mut many);
-        }
-
-        assert_eq!(one.len(), many.len());
-        for (x, y) in one.iter().zip(&many) {
-            assert!((x - y).norm() < 1e-4, "{x} vs {y}");
+            let mut b = Ddc::new(rate, 100e3, bw);
+            let mut many = Vec::new();
+            for chunk in input.chunks(777) {
+                b.process(chunk, &mut many);
+            }
+            assert_eq!(one.len(), many.len());
+            for (x, y) in one.iter().zip(&many) {
+                assert!((x - y).norm() < 1e-4, "{x} vs {y}");
+            }
         }
     }
 
@@ -296,19 +470,20 @@ mod tests {
     fn retuning_moves_the_passband() {
         let rate = 4e6;
         let mut d = Ddc::new(rate, 0.0, 200e3);
-        let mut out = Vec::new();
         d.set_offset(1e6);
-        d.process(&tone(rate, 1e6, 100_000), &mut out);
-        let settled = &out[d.taps() / d.decimation() + 10..];
-        assert!(power_db(settled).abs() < 0.2);
+        let s = settled(&mut d, &tone(rate, 1e6, 100_000));
+        assert!(power_db(&s).abs() < 0.2);
         assert_eq!(d.offset_hz(), 1e6);
     }
 
     #[test]
     fn output_count_matches_decimation() {
-        let mut d = Ddc::new(10e6, 0.0, 1e6);
-        let mut out = Vec::new();
-        d.process(&vec![Iq::new(1.0, 0.0); 40_000], &mut out);
-        assert_eq!(out.len(), 40_000 / d.decimation());
+        for (rate, bw) in [(10e6, 1e6), (20e6, 380e3)] {
+            let mut d = Ddc::new(rate, 0.0, bw);
+            let n = 40_000 * d.decimation();
+            let mut out = Vec::new();
+            d.process(&vec![Iq::new(1.0, 0.0); n], &mut out);
+            assert_eq!(out.len(), n / d.decimation(), "{:?}", d.stage_layout());
+        }
     }
 }

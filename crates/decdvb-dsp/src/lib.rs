@@ -9,6 +9,7 @@
 
 pub mod agc;
 pub mod ddc;
+pub mod dot;
 pub mod fir;
 pub mod rrc;
 pub mod timing;

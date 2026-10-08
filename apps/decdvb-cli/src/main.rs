@@ -4,6 +4,8 @@
 //! file and report level/spectrum occupancy). `decode` and `modulate` arrive
 //! with the later milestones.
 
+mod scene;
+
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -72,6 +74,27 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         seed: u64,
     },
+    /// Write a multi-carrier 8 MS/s test capture: two DVB-S2 carriers (one
+    /// ACM), plain QPSK and a CW tone.
+    Scene {
+        /// Output file; `.cs8` is what a HackRF records.
+        #[arg(default_value = "decdvb-scene_8Msps.cs8")]
+        out: PathBuf,
+        #[arg(long, default_value_t = 4.0)]
+        seconds: f64,
+    },
+    /// Survey a capture: find every carrier and identify each one blind.
+    Scan {
+        file: PathBuf,
+        #[arg(long, value_parser = parse_format)]
+        format: Option<SampleFormat>,
+        /// Sample rate; taken from the file name (…_8Msps…) when omitted.
+        #[arg(long)]
+        rate: Option<f64>,
+        /// Give up waiting for results after this many seconds.
+        #[arg(long, default_value_t = 30.0)]
+        timeout: f64,
+    },
 }
 
 fn parse_format(s: &str) -> std::result::Result<SampleFormat, String> {
@@ -111,7 +134,118 @@ fn main() -> Result<()> {
             seconds,
             seed,
         }),
+        Command::Scene { out, seconds } => {
+            scene::write(&out, seconds)?;
+            println!(
+                "wrote {} — {seconds:.1} s at {} MS/s, cs8",
+                out.display(),
+                scene::RATE / 1e6
+            );
+            Ok(())
+        }
+        Command::Scan {
+            file,
+            format,
+            rate,
+            timeout,
+        } => scan(file, format, rate, timeout),
     }
+}
+
+/// Sample rate from a name like `…_8Msps…`, `…_500ksps…` or `…_2000000sps…`.
+fn rate_from_name(path: &std::path::Path) -> Option<f64> {
+    let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
+    stem.split(['_', '-', ' ']).find_map(|t| {
+        let n = t.strip_suffix("sps")?;
+        let (num, mult) = match n.chars().last()? {
+            'k' => (&n[..n.len() - 1], 1e3),
+            'm' => (&n[..n.len() - 1], 1e6),
+            _ => (n, 1.0),
+        };
+        num.parse::<f64>().ok().map(|v| v * mult)
+    })
+}
+
+fn scan(
+    file: PathBuf,
+    format: Option<SampleFormat>,
+    rate: Option<f64>,
+    timeout: f64,
+) -> Result<()> {
+    use decdvb_engine::{DecoderKind, Engine, EngineOptions, VfoSettings};
+    use std::time::{Duration, Instant};
+
+    let fmt = format
+        .or_else(|| format_from_path(&file))
+        .context("cannot tell the sample format from the extension — pass --format")?;
+    let rate = rate
+        .or_else(|| rate_from_name(&file))
+        .context("cannot tell the sample rate from the file name — pass --rate")?;
+    let reader = IqFileReader::open(&file, fmt, rate, 1 << 16)
+        .with_context(|| format!("opening {}", file.display()))?;
+    println!("scanning {} at {:.3} MS/s", reader.describe(), rate / 1e6);
+
+    let mut eng = Engine::start(
+        Box::new(reader),
+        EngineOptions {
+            realtime: false,
+            loop_file: true,
+            ..Default::default()
+        },
+    );
+
+    // Let the averaged spectrum settle, then take the carrier list.
+    let t0 = Instant::now();
+    std::thread::sleep(Duration::from_millis(1500));
+    let carriers = eng.front().carriers;
+    if carriers.is_empty() {
+        println!("no carriers found");
+        return Ok(());
+    }
+    println!("\n{} carriers:", carriers.len());
+
+    let mut ids = Vec::new();
+    for (i, c) in carriers.iter().enumerate() {
+        println!(
+            "  #{i}  {:+9.1} kHz  ~{:>8.1} kS/s  {:6.1} kHz wide  {:5.1} dB{}",
+            c.center_hz / 1e3,
+            c.symbol_rate_hz / 1e3,
+            c.bandwidth_hz / 1e3,
+            c.snr_db,
+            if c.narrow { "  (narrow)" } else { "" }
+        );
+        let bw = if c.narrow {
+            20e3
+        } else {
+            c.suggested_vfo_bandwidth()
+        };
+        ids.push(eng.add_vfo(VfoSettings::new(
+            format!("#{i}"),
+            c.center_hz,
+            bw,
+            DecoderKind::Identify,
+        )));
+    }
+
+    println!("\nidentifying…");
+    let mut done = vec![false; ids.len()];
+    while done.iter().any(|d| !d) && t0.elapsed().as_secs_f64() < timeout {
+        for (i, &id) in ids.iter().enumerate() {
+            if !done[i]
+                && let Some(ident) = eng.vfo_status(id).and_then(|s| s.identification)
+            {
+                println!("  #{i}  {}", ident.summary());
+                done[i] = true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for (i, d) in done.iter().enumerate() {
+        if !d {
+            println!("  #{i}  (no result within {timeout:.0} s)");
+        }
+    }
+    Ok(())
 }
 
 struct SynthArgs {

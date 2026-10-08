@@ -36,4 +36,16 @@ pub trait IqSource: Send {
 
     /// Human-readable description for the GUI/CLI status line.
     fn describe(&self) -> String;
+
+    /// Start again from the beginning, for looping a capture. Returns
+    /// `Ok(false)` for sources that cannot rewind (a live radio).
+    fn rewind(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Whether the source paces itself in real time (a radio does; a file
+    /// would otherwise be read as fast as the disk allows).
+    fn is_live(&self) -> bool {
+        false
+    }
 }

@@ -35,12 +35,15 @@ impl Shaper {
 
     /// Shape `symbols`, appending `symbols.len() * sps` samples to `out`.
     pub fn process(&mut self, symbols: &[Iq], out: &mut Vec<Iq>) {
-        out.reserve(symbols.len() * self.sps);
-        for &s in symbols {
-            out.push(self.fir.push(s * self.gain));
-            for _ in 1..self.sps {
-                out.push(self.fir.push(Iq::new(0.0, 0.0)));
+        // Zero-stuff a chunk at a time, then filter it as one block.
+        let mut stuffed = Vec::with_capacity(4096 * self.sps);
+        for chunk in symbols.chunks(4096) {
+            stuffed.clear();
+            for &s in chunk {
+                stuffed.push(s * self.gain);
+                stuffed.extend(std::iter::repeat_n(Iq::new(0.0, 0.0), self.sps - 1));
             }
+            self.fir.process(&stuffed, out);
         }
     }
 }

@@ -4,7 +4,7 @@
 //! HackRF's native signed 8-bit interleaved), `cs16` and `cf32`.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use decdvb_core::{Iq, Result, SampleFormat, bytes_to_iq};
@@ -99,6 +99,11 @@ impl IqSource for IqFileReader {
             self.fmt,
             self.sample_rate / 1e6
         )
+    }
+
+    fn rewind(&mut self) -> Result<bool> {
+        self.inner.seek(SeekFrom::Start(0))?;
+        Ok(true)
     }
 }
 

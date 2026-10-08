@@ -56,12 +56,74 @@ makes ACM possible at all, since every PLFRAME announces its own MODCOD.
   frequency offsets up to at least 1 % of the symbol rate. Verified: correct
   peak position for all 32 MODCODs, under noise, and under offset.
 
+### Done: PL scrambling, timing, streaming demodulator
+
+- `scramble` — Gold-code PL scrambling (§5.5.4); exact round trip, x LFSR
+  verified maximal-length.
+- `decdvb-dsp::timing` — Gardner TED + cubic Farrow interpolator, at
+  fractional samples per symbol; verified from 2.7 up to 84 sps.
+- `decdvb-engine::demod` — streaming PL demodulator: matched filter → AGC →
+  timing → PLHEADER correlation → **frame lock** → PLS decode → descrambling.
+  A frame is emitted only once the *next* header is found exactly where this
+  frame's PLS code predicted, which validates the PLS decode and the frame
+  length together — what makes following ACM safe. Follows a five-MODCOD ACM
+  sequence with zero losses, re-acquires after a dropout, never invents frames
+  from noise.
+
 ### Still to do
 
 1. Live HackRF source (`libloading` over `libhackrf`), cs8 at up to ~20 MS/s.
-2. Fractional resampler, AGC, DC/IQ-imbalance correction.
-3. Gardner timing recovery; coarse (FFT) + fine (PLL) carrier recovery.
-4. The lock state machine: searching → found → locked, predicting the next SOF
-   from `PlsInfo::plframe_len`.
-5. PL descrambling (gold code), pilot-aided phase tracking.
-6. Output: holds lock on a real signal and prints the MODCOD of every PLFRAME.
+2. Carrier recovery: coarse from the 4th-power line / header phase, fine from
+   pilots and a decision-directed loop — the payload still rotates.
+3. DC/IQ-imbalance correction for the HackRF's DC spur.
+
+## M1b — wideband waterfall + VFOs + Identify (done, 2026-10-08)
+
+Rory asked for an SDR++-style app: a big waterfall, VFOs dropped on it each
+running a decoder of choice, and a "what is this?" mode. Design in DESIGN.md
+§3a/§3b.
+
+- **Front end** (`frontend`): one thread reads the source in ~1/25 s blocks,
+  makes a waterfall row per block, keeps a smoothed spectrum, detects carriers
+  twice a second, and shares each block with every VFO by `Arc` (no copies).
+  A slow VFO has blocks dropped and counted rather than stalling the rest.
+- **VFOs** (`vfo`): one worker thread each; settings travel through a mailbox
+  slot so the GUI never blocks on a busy worker (a bounded channel would have).
+  Decoders: Identify, DVB-S2 → IP, DVB-S2 → TS (both run the PL demodulator
+  until FEC exists), IQ recorder, spectrum only.
+- **DDC**: NCO + one or two decimating FIR stages, the split chosen to minimise
+  multiply-adds; stopband just past the VFO's edge so a VFO delivers what its
+  edges show.
+- **Carrier detection** (`carriers`): runs over a 20th-percentile floor (a
+  busy span still finds the true noise), ignores the DC spur, separates
+  adjacent carriers, estimates each one's symbol rate from its noise bandwidth.
+- **Identify** (`identify`): see DESIGN.md §3b. The symbol rate from the cyclic
+  line of |x|² is accurate to ~1e-8 on test carriers. Adaptive listening: a
+  quick first look, then — if no headers were seen and the carrier is too slow
+  to have shown three frames — a longer listen sized from the measured rate,
+  the interim verdict marked provisional. Rests 3 s between checks once sure.
+- **GUI**: spectrum + ring-texture waterfall, zoom/pan, VFO boxes with live
+  badges, green brackets on detected carriers (click to claim), side bar with
+  VFO list (CPU per VFO), settings, Identify card, MODCOD table, constellation,
+  zoomed spectrum. Unattended mode for screenshots/smoke tests:
+  `--claim-carriers --select N --after S --screenshot out.png`.
+- **CLI**: `scene` (the multi-carrier test capture), `scan` (find and identify
+  every carrier).
+
+Verified on the `scene` capture: all four carriers found (centres within
+0.2 kHz, symbol rates within 1–2 %) and all four identified correctly — DVB-S2
+CCM QPSK 1/2; DVB-S2 ACM QPSK 1/2 → 8PSK 3/5 → 16APSK 2/3; plain QPSK as
+"possibly DVB-S (not verified)"; a CW as a narrow carrier.
+
+Bugs found by that real run and fixed, each with a regression test:
+- the DDC stopband sat at the aliasing limit, passing a neighbour ~1.7 MHz away
+  into a 1.5 MHz VFO and collapsing the symbol-rate estimate to 47.5 kS/s;
+- the timing loop's buffer trim overran at > 8 samples/symbol (panic);
+- the timing loop's gains were in samples, not symbols, so it ran 1/sps too
+  slow — 84× at 84 sps;
+- an Identify VFO dragged to another carrier kept analysing the old signal.
+
+CPU per VFO on the scene went from 45/3/30/38 % to 11/3/8/6 % (two-stage DDC,
+vectorisable FIR inner loop, Identify resting once sure). Measured and
+rejected: AVX2 run-time dispatch with a flat tap layout — slower on these
+window lengths (notes in `decdvb-dsp::dot`).

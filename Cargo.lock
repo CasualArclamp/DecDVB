@@ -512,6 +512,7 @@ dependencies = [
  "decdvb-dsp",
  "decdvb-engine",
  "decdvb-io",
+ "decdvb-mod",
 ]
 
 [[package]]
@@ -586,6 +587,7 @@ dependencies = [
  "decdvb-io",
  "eframe",
  "egui_plot",
+ "image",
  "rfd",
  "winit",
 ]

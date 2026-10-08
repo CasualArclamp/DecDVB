@@ -519,11 +519,34 @@ pub fn detect_dvbs2(sym: &[Iq]) -> Dvbs2Info {
     info
 }
 
-/// Identify the carrier in `x`, a VFO's baseband at `rate`.
+/// Identify the carrier in `x`, a VFO's baseband at `rate`, using the whole
+/// band.
 pub fn identify(x: &[Iq], rate: f64) -> Identification {
+    identify_in(x, rate, None)
+}
+
+/// Identify the carrier in `x`, considering only the central `bandwidth` Hz —
+/// the VFO's width as drawn. Outside it, the DDC's stopband sits tens of dB
+/// below the real noise and would drag the floor estimate down (counting
+/// in-band noise as signal), so those bins are replaced by the in-band floor.
+pub fn identify_in(x: &[Iq], rate: f64, bandwidth: Option<f64>) -> Identification {
     // 1. Where is the energy?
     let mut spec = Spectrum::new(FFT_SIZE);
-    let db = spec.compute(x);
+    let mut db = spec.compute(x);
+    if let Some(bw) = bandwidth.filter(|&b| b > 0.0 && b < rate) {
+        let n = db.len();
+        let inside = |k: usize| ((k as f64 / n as f64) - 0.5).abs() * rate <= bw / 2.0;
+        let mut band: Vec<f32> = (0..n).filter(|&k| inside(k)).map(|k| db[k]).collect();
+        if band.len() >= 16 {
+            band.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let floor = band[band.len() / 5];
+            for (k, d) in db.iter_mut().enumerate() {
+                if !inside(k) {
+                    *d = floor;
+                }
+            }
+        }
+    }
     let Some(band) = estimate_band(&db, rate, 0.99) else {
         return Identification::bare(Verdict::NoSignal, 0.0, 0.0, 0.0);
     };

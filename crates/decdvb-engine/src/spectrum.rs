@@ -45,12 +45,25 @@ impl Spectrum {
     /// Average the periodogram over `samples` and return it in dB, FFT-shifted
     /// so index 0 is the most negative frequency and the centre is DC.
     pub fn compute(&mut self, samples: &[Iq]) -> Vec<f32> {
+        self.compute_max(samples, usize::MAX)
+    }
+
+    /// As [`Self::compute`], but average at most `max_segments` FFTs, spread
+    /// evenly over the block. A 20 MS/s waterfall row covers ~800 k samples;
+    /// 64 well-spread segments give a smooth row at a fraction of the cost of
+    /// transforming all of them.
+    pub fn compute_max(&mut self, samples: &[Iq], max_segments: usize) -> Vec<f32> {
         self.accum.fill(0.0);
         if samples.len() < self.size {
             return vec![-200.0; self.size];
         }
 
-        let hop = self.size / 2;
+        let full = (samples.len() - self.size) / (self.size / 2) + 1;
+        let hop = if full > max_segments {
+            (samples.len() - self.size) / max_segments.max(1)
+        } else {
+            self.size / 2
+        };
         let mut segments = 0usize;
         let mut start = 0usize;
         while start + self.size <= samples.len() {

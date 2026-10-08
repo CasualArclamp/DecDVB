@@ -4,13 +4,23 @@
 //! spectrum and constellation views. The demodulator, FEC and GSE stages slot
 //! in here from M1 onward — see `docs/DESIGN.md`.
 
+pub mod carriers;
+pub mod demod;
 pub mod estimate;
+pub mod frontend;
 pub mod identify;
 pub mod spectrum;
+pub mod vfo;
 
+pub use carriers::{Carrier, detect_carriers};
+pub use demod::{Demod, LockState, PlFrame};
 pub use estimate::{BandEstimate, estimate_band};
-pub use identify::{ConstellationGuess, Identification, RateSource, Verdict, identify};
+pub use frontend::{Engine, EngineOptions, FrontStatus, SourceState};
+pub use identify::{
+    ConstellationGuess, Identification, RateSource, Verdict, identify, identify_in,
+};
 pub use spectrum::Spectrum;
+pub use vfo::{DecoderKind, VfoId, VfoSettings, VfoStatus};
 
 use decdvb_core::{Iq, Metrics, Result, RxConfig};
 use decdvb_io::IqSource;

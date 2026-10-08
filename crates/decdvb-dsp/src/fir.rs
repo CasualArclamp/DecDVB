@@ -2,31 +2,34 @@
 
 use decdvb_core::Iq;
 
+use crate::dot::dot_cr;
+
 /// A complex-in/complex-out FIR with real taps, holding state across calls so
 /// it can be fed block by block without edge artefacts.
 ///
-/// Rust note: the history is a fixed-length `Vec` used as a ring buffer; the
-/// index wraps with `%`, which the compiler turns into a mask only for
-/// power-of-two lengths, so this is written as an explicit compare instead.
+/// The history is a plain `Vec` holding the last `taps − 1` inputs followed by
+/// the new block, so every output is one contiguous dot product (see
+/// [`dot_cr`]); a ring buffer would save the copy but wrap its index on every
+/// tap, which stops the inner loop vectorising.
 pub struct Fir {
-    taps: Vec<f32>,
-    history: Vec<Iq>,
-    pos: usize,
+    /// Taps reversed, so the dot product runs over the history forwards.
+    taps_rev: Vec<f32>,
+    buf: Vec<Iq>,
 }
 
 impl Fir {
-    pub fn new(taps: Vec<f32>) -> Self {
+    pub fn new(mut taps: Vec<f32>) -> Self {
         assert!(!taps.is_empty(), "a filter needs at least one tap");
+        taps.reverse();
         let n = taps.len();
         Fir {
-            taps,
-            history: vec![Iq::new(0.0, 0.0); n],
-            pos: 0,
+            taps_rev: taps,
+            buf: vec![Iq::new(0.0, 0.0); n - 1],
         }
     }
 
     pub fn len(&self) -> usize {
-        self.taps.len()
+        self.taps_rev.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -35,37 +38,32 @@ impl Fir {
 
     /// Group delay in samples (half the tap count for a symmetric filter).
     pub fn delay(&self) -> usize {
-        self.taps.len() / 2
+        self.taps_rev.len() / 2
     }
 
-    /// Push one sample and get the filtered output.
+    /// Push one sample and get the filtered output. Convenient but slow per
+    /// sample; prefer [`Self::process`] for blocks.
     pub fn push(&mut self, x: Iq) -> Iq {
-        let n = self.taps.len();
-        self.history[self.pos] = x;
-        self.pos = if self.pos + 1 == n { 0 } else { self.pos + 1 };
-
-        // Convolve: the newest sample multiplies taps[0].
-        let mut acc = Iq::new(0.0, 0.0);
-        let mut idx = self.pos;
-        for &tap in self.taps.iter().rev() {
-            acc += self.history[idx] * tap;
-            idx = if idx + 1 == n { 0 } else { idx + 1 };
-        }
-        acc
+        let mut out = Vec::with_capacity(1);
+        self.process(&[x], &mut out);
+        out[0]
     }
 
     /// Filter a whole block, appending to `out`.
     pub fn process(&mut self, input: &[Iq], out: &mut Vec<Iq>) {
+        let l = self.taps_rev.len();
+        self.buf.extend_from_slice(input);
         out.reserve(input.len());
-        for &x in input {
-            out.push(self.push(x));
+        for end in l - 1..self.buf.len() {
+            out.push(dot_cr(&self.buf[end + 1 - l..=end], &self.taps_rev));
         }
+        let drop = self.buf.len() - (l - 1);
+        self.buf.drain(..drop);
     }
 
     /// Clear the history (e.g. after a retune).
     pub fn reset(&mut self) {
-        self.history.fill(Iq::new(0.0, 0.0));
-        self.pos = 0;
+        self.buf.fill(Iq::new(0.0, 0.0));
     }
 }
 
@@ -78,7 +76,6 @@ mod tests {
         let taps = vec![0.5, -0.25, 0.125];
         let mut f = Fir::new(taps.clone());
         let mut out = Vec::new();
-        // An impulse followed by zeros reads the taps out in order.
         let input = [
             Iq::new(1.0, 0.0),
             Iq::new(0.0, 0.0),
@@ -98,11 +95,9 @@ mod tests {
 
     #[test]
     fn dc_gain_is_the_tap_sum() {
-        let taps = vec![0.25f32; 4];
-        let mut f = Fir::new(taps);
+        let mut f = Fir::new(vec![0.25f32; 4]);
         let mut out = Vec::new();
         f.process(&[Iq::new(1.0, 0.0); 16], &mut out);
-        // Settled output after the filter fills.
         assert!((out[15].re - 1.0).abs() < 1e-6, "{}", out[15].re);
     }
 
@@ -123,7 +118,26 @@ mod tests {
         f.reset();
         out.clear();
         f.process(&[Iq::new(1.0, 0.0)], &mut out);
-        // Only the new sample contributes.
         assert!((out[0].re - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn push_and_process_agree_across_blocks() {
+        let taps: Vec<f32> = (0..37).map(|k| ((k as f32) * 0.3).sin() / 10.0).collect();
+        let input: Vec<Iq> = (0..500)
+            .map(|k| Iq::new((k as f32 * 0.1).cos(), (k as f32 * 0.07).sin()))
+            .collect();
+
+        let mut a = Fir::new(taps.clone());
+        let by_push: Vec<Iq> = input.iter().map(|&x| a.push(x)).collect();
+
+        let mut b = Fir::new(taps);
+        let mut by_block = Vec::new();
+        for c in input.chunks(61) {
+            b.process(c, &mut by_block);
+        }
+        for (p, q) in by_push.iter().zip(&by_block) {
+            assert!((p - q).norm() < 1e-5);
+        }
     }
 }

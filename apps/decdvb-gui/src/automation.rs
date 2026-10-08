@@ -1,0 +1,130 @@
+//! Unattended runs, for documentation screenshots and smoke tests (the same
+//! idea as DecDRM's): `decdvb-gui capture.cs8 --claim-carriers --after 8
+//! --screenshot shot.png` opens the capture, drops a VFO on every detected
+//! carrier, waits, saves a screenshot of the window and quits.
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use eframe::egui;
+
+#[derive(Debug, Default)]
+pub struct Options {
+    pub file: Option<PathBuf>,
+    pub screenshot: Option<PathBuf>,
+    /// Seconds after start to take the screenshot (or quit).
+    pub after: Option<f64>,
+    /// Claim every detected carrier with the default decoder.
+    pub claim_carriers: bool,
+    /// Select the n-th VFO (1-based) once claimed.
+    pub select: Option<usize>,
+}
+
+impl Options {
+    /// Parse `std::env::args_os()`: a file, then the flags above.
+    pub fn from_args() -> Result<Self, String> {
+        let mut o = Options::default();
+        let mut args = std::env::args_os().skip(1);
+        while let Some(a) = args.next() {
+            match a.to_str() {
+                Some("--screenshot") => {
+                    o.screenshot = Some(args.next().ok_or("--screenshot needs a path")?.into());
+                }
+                Some("--after") => {
+                    let v = args.next().ok_or("--after needs seconds")?;
+                    o.after = Some(
+                        v.to_str()
+                            .and_then(|s| s.parse().ok())
+                            .ok_or("--after needs a number of seconds")?,
+                    );
+                }
+                Some("--claim-carriers") => o.claim_carriers = true,
+                Some("--select") => {
+                    let v = args.next().ok_or("--select needs a VFO number")?;
+                    o.select = Some(
+                        v.to_str()
+                            .and_then(|s| s.parse().ok())
+                            .ok_or("--select needs a VFO number")?,
+                    );
+                }
+                Some(s) if s.starts_with("--") => return Err(format!("unknown option {s}")),
+                _ => o.file = Some(a.into()),
+            }
+        }
+        if o.screenshot.is_some() && o.after.is_none() {
+            o.after = Some(5.0);
+        }
+        Ok(o)
+    }
+}
+
+/// Drives an unattended run.
+pub struct Automation {
+    start: Instant,
+    after: Option<f64>,
+    screenshot: Option<PathBuf>,
+    requested_at: Option<Instant>,
+    pub claim_carriers: bool,
+    pub claimed: bool,
+    pub select: Option<usize>,
+}
+
+impl Automation {
+    pub fn new(o: &Options) -> Self {
+        Automation {
+            start: Instant::now(),
+            after: o.after,
+            screenshot: o.screenshot.clone(),
+            requested_at: None,
+            claim_carriers: o.claim_carriers,
+            claimed: false,
+            select: o.select,
+        }
+    }
+
+    pub fn active(&self) -> bool {
+        self.after.is_some()
+    }
+
+    pub fn tick(&mut self, ctx: &egui::Context) {
+        let Some(after) = self.after else { return };
+        let now = Instant::now();
+        if now.duration_since(self.start).as_secs_f64() < after {
+            return;
+        }
+        match (&self.screenshot, self.requested_at) {
+            (Some(_), None) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                self.requested_at = Some(now);
+            }
+            (Some(_), Some(t)) if now.duration_since(t) < Duration::from_secs(3) => {}
+            (Some(_), Some(_)) => {
+                eprintln!("screenshot not delivered; quitting");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            (None, _) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        }
+    }
+
+    /// Save a delivered screenshot and quit.
+    pub fn handle_screenshot(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.screenshot.clone() else {
+            return;
+        };
+        let image = ctx.input(|i| {
+            i.raw.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        let Some(image) = image else { return };
+        let rgba: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
+        let (w, h) = (image.size[0] as u32, image.size[1] as u32);
+        match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
+            Ok(()) => eprintln!("screenshot saved to {}", path.display()),
+            Err(e) => eprintln!("cannot save screenshot {}: {e}", path.display()),
+        }
+        self.screenshot = None;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+}

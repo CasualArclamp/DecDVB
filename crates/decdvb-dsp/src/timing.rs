@@ -147,12 +147,16 @@ impl SymbolSync {
                 self.err_avg = 0.99 * self.err_avg + 0.01 * e.abs();
 
                 // PI loop: the integrator tracks the period, the proportional
-                // path nudges the phase.
-                self.sps += self.k2 * e as f64;
+                // path nudges the phase. Gardner measures the error in symbol
+                // periods, but both corrections act in samples, so they scale
+                // by samples-per-symbol — without that the loop bandwidth fell
+                // as 1/sps (84× too slow at sps 84).
+                let e_samples = e as f64 * self.sps_nominal;
+                self.sps += self.k2 * e_samples;
                 let lo = self.sps_nominal * (1.0 - self.max_dev);
                 let hi = self.sps_nominal * (1.0 + self.max_dev);
                 self.sps = self.sps.clamp(lo, hi);
-                self.t_next += self.sps + self.k1 * e as f64;
+                self.t_next += self.sps + self.k1 * e_samples;
             } else {
                 self.have_prev = true;
                 self.t_next += self.sps;
@@ -164,7 +168,11 @@ impl SymbolSync {
 
         // Drop consumed samples, keeping the mid-point's and interpolator's
         // look-back.
-        let keep_from = (self.t_next - self.sps / 2.0 - 2.0).floor().max(0.0) as usize;
+        // The last step can leave `t_next` up to about sps/2 past the end of
+        // the buffer, so clamp: at high samples-per-symbol the unclamped figure
+        // ran past the end (found at sps = 84, not caught by tests at ≤ 4).
+        let keep_from =
+            ((self.t_next - self.sps / 2.0 - 2.0).floor().max(0.0) as usize).min(self.buf.len());
         if keep_from > 0 {
             self.buf.drain(..keep_from);
             self.t_next -= keep_from as f64;
@@ -323,6 +331,23 @@ mod tests {
         let mut out = Vec::new();
         ss.process(&x, &mut out);
         assert!(out.len() > 1900);
+    }
+
+    #[test]
+    fn works_at_high_samples_per_symbol() {
+        // Regression: a narrow carrier in a wide VFO has many samples per
+        // symbol, and the buffer trim used to run off the end above sps ≈ 8.
+        for sps in [9.5f64, 20.0, 84.2] {
+            let (x, _) = qpsk_rc(1500, sps, 0.35, 0.3, 0.0, 9);
+            let mut ss = SymbolSync::new(sps, 0.01, 0.02);
+            let mut out = Vec::new();
+            for c in x.chunks(1000) {
+                ss.process(c, &mut out);
+            }
+            assert!(out.len() > 1400, "sps {sps}: only {} symbols", out.len());
+            let evm = evm_db(&out, 700);
+            assert!(evm < -20.0, "sps {sps}: EVM {evm:.1} dB");
+        }
     }
 
     #[test]
