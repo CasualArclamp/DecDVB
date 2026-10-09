@@ -126,6 +126,9 @@ enum Command {
         /// if a decoder cannot keep up).
         #[arg(long)]
         fast: bool,
+        /// Record this E1 timeslot (or D&I++ channel) to a .wav in --out.
+        #[arg(long)]
+        e1_record: Option<u8>,
     },
 }
 
@@ -192,6 +195,7 @@ fn main() -> Result<()> {
             modulation,
             out,
             fast,
+            e1_record,
         } => decode::decode(decode::DecodeArgs {
             file,
             format,
@@ -203,6 +207,7 @@ fn main() -> Result<()> {
             modulation,
             out,
             fast,
+            e1_record,
         }),
     }
 }

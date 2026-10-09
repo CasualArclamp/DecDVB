@@ -684,7 +684,7 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
 fn e1_card(ui: &mut Ui, e: &decdvb_engine::E1View, v: &UiVfo, actions: &mut Vec<Action>) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        ui.label(RichText::new("E1 voice (G.704 / G.711 A-law)").strong());
+        ui.label(RichText::new(format!("Voice: {} (G.711 A-law)", e.source)).strong());
         if v.settings.e1_play.is_some() {
             volume_control(ui);
         }
@@ -742,9 +742,13 @@ fn e1_card(ui: &mut Ui, e: &decdvb_engine::E1View, v: &UiVfo, actions: &mut Vec<
                 .num_columns(5)
                 .striped(true)
                 .show(ui, |ui| {
-                    for ts in 1..32u8 {
+                    // D&I++ carries n timeslots, shown as channels 1..=n
+                    // (which E1 timeslots they were is not sent).
+                    let last = e.channels.unwrap_or(31);
+                    for ts in 1..=last {
                         let db = e.levels_db[ts as usize];
-                        ui.label(RichText::new(format!("TS {ts:2}")).monospace());
+                        let name = if e.channels.is_some() { "ch" } else { "TS" };
+                        ui.label(RichText::new(format!("{name} {ts:2}")).monospace());
                         level_bar(ui, db);
                         let what = if ts == 16 && st.cas {
                             "signalling"

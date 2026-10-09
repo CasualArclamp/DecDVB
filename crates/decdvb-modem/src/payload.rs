@@ -4,14 +4,18 @@
 //! format nor the scrambler is signalled, so both are found by trying each
 //! candidate on a stretch of data and keeping the one under which frames
 //! check out: HDLC frames whose FCS is right, TS packets whose sync bytes
-//! recur every 188 bytes, or E1 frames whose alignment signal recurs every
-//! 512 bits (an E1 carried transparently, see [`crate::e1`]).
+//! recur every 188 bytes, E1 frames whose alignment signal recurs every 512
+//! bits (an E1 carried transparently, see [`crate::e1`]), or Comtech
+//! Drop & Insert++ frames (see [`crate::dandi`]). A format that frames the
+//! whole stream (TS, E1, D&I++) must account for at least half of it: three
+//! TS sync bytes in a row turn up by chance in a long enough listen.
 //!
 //! The scramblers tried are the RCV-20x's polynomial 1 + x² + x³ + x⁹ + x¹²
 //! (as a self-synchronising descrambler, either way round, and additive per
 //! frame), and the self-synchronising ones of ITU-T V.35 (taps 3, 20,
 //! without its 32-bit run counter) and V.29/V.27 (taps 18, 23).
 
+use crate::dandi::{DiPlusRx, DiPlusStats};
 use crate::e1::{E1Rx, TIMESLOTS};
 use crate::tpc2964::additive_sequence;
 
@@ -342,6 +346,8 @@ pub enum Format {
     Hdlc,
     Ts,
     E1,
+    /// Comtech Drop & Insert++.
+    DiPlus,
 }
 
 /// The data of one frame, made useful.
@@ -352,6 +358,8 @@ pub struct PayloadOut {
     pub ts: Vec<[u8; 188]>,
     /// E1 frames: 32 timeslot bytes each.
     pub e1: Vec<[u8; TIMESLOTS]>,
+    /// D&I++ timeslot bytes, in order.
+    pub dandi: Vec<u8>,
     /// The descrambled data, MSB first, while the format is unknown or for
     /// recording.
     pub raw: Vec<u8>,
@@ -362,6 +370,7 @@ impl PayloadOut {
         self.frames.clear();
         self.ts.clear();
         self.e1.clear();
+        self.dandi.clear();
         self.raw.clear();
     }
 }
@@ -375,6 +384,8 @@ pub struct PayloadStats {
     pub ts_packets: u64,
     /// E1 framing, when that is what the data are.
     pub e1: Option<crate::e1::E1Stats>,
+    /// D&I++ framing, likewise.
+    pub dandi: Option<DiPlusStats>,
     /// Frames of data looked at before deciding (or so far).
     pub probed: u64,
 }
@@ -393,6 +404,7 @@ pub struct PayloadRx {
     hdlc: Hdlc,
     ts: TsAlign,
     e1: E1Rx,
+    dandi: DiPlusRx,
     /// Bits not yet packed into `raw` bytes.
     raw_bits: Vec<u8>,
     pub stats: PayloadStats,
@@ -409,6 +421,7 @@ impl PayloadRx {
             hdlc: Hdlc::default(),
             ts: TsAlign::default(),
             e1: E1Rx::new(),
+            dandi: DiPlusRx::new(),
             raw_bits: Vec::new(),
             stats: PayloadStats::default(),
         }
@@ -429,28 +442,46 @@ impl PayloadRx {
         if self.held.len() < PROBE_MIN || !self.held.len().is_multiple_of(PROBE_MIN) {
             return;
         }
+        // Score: bits a format accounts for (HDLC: a nominal frame's worth
+        // per good frame, so a few good frames win over nothing).
         let mut best: Option<(u64, Descrambler, Format, Fcs)> = None;
+        let held_bits: u64 = self.held.iter().map(|f| f.len() as u64).sum();
         for kind in Descrambler::all() {
             let mut d = Running::new(kind, self.frame_len);
-            let (mut hdlc, mut ts, mut e1) = (Hdlc::default(), TsAlign::default(), E1Rx::new());
-            let (mut frames, mut pkts, mut e1f) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut hdlc, mut ts, mut e1, mut di) = (
+                Hdlc::default(),
+                TsAlign::default(),
+                E1Rx::new(),
+                DiPlusRx::new(),
+            );
+            let (mut frames, mut pkts, mut e1f, mut dib) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for f in &self.held {
                 let mut bits = f.clone();
                 d.frame(&mut bits);
                 hdlc.push(&bits, &mut frames);
                 ts.push(&bits, &mut pkts);
                 e1.push(&bits, &mut e1f);
+                di.push(&bits, &mut dib);
             }
             let fcs = frames.first().map_or(Fcs::Crc16, |f| f.1);
-            // E1 frames are counted in TS-packet-sized lots, so the formats
-            // weigh alike (a TS packet is 1504 bits, an E1 frame 256).
-            let e1_units = e1.stats.frames * 256 / 1504;
-            for (n, fmt) in [
-                (hdlc.good, Format::Hdlc),
-                (ts.packets, Format::Ts),
-                (e1_units, Format::E1),
-            ] {
-                if n >= PROBE_UNITS && best.is_none_or(|b| n > b.0) {
+            let framed = |covered: u64| (2 * covered >= held_bits).then_some(covered);
+            let candidates = [
+                (
+                    (hdlc.good >= PROBE_UNITS).then_some(hdlc.good * 1500),
+                    Format::Hdlc,
+                ),
+                (framed(ts.packets * 1504), Format::Ts),
+                (framed(e1.stats.frames * 256), Format::E1),
+                (
+                    framed(di.stats.frames * crate::dandi::FRAME as u64),
+                    Format::DiPlus,
+                ),
+            ];
+            for (score, fmt) in candidates {
+                if let Some(n) = score
+                    && best.is_none_or(|b| n > b.0)
+                {
                     best = Some((n, kind, fmt, fcs));
                 }
             }
@@ -461,6 +492,7 @@ impl PayloadRx {
                 match (fmt, fcs) {
                     (Format::Ts, _) => "MPEG-TS",
                     (Format::E1, _) => "E1 (G.704 framing)",
+                    (Format::DiPlus, _) => "E1 timeslots, Comtech D&I++ framing",
                     (Format::Hdlc, Fcs::Crc16) => "HDLC (FCS-16)",
                     (Format::Hdlc, Fcs::Crc32) => "HDLC (FCS-32)",
                 },
@@ -496,6 +528,10 @@ impl PayloadRx {
             Format::E1 => {
                 self.e1.push(&bits, &mut out.e1);
                 self.stats.e1 = Some(self.e1.stats.clone());
+            }
+            Format::DiPlus => {
+                self.dandi.push(&bits, &mut out.dandi);
+                self.stats.dandi = Some(self.dandi.stats.clone());
             }
         }
         if raw {
@@ -658,6 +694,35 @@ mod tests {
         assert!(rx.stats.found.as_ref().unwrap().contains("taps 3, 20"));
         assert!(frames.len() > 300, "{}", frames.len());
         assert!(frames.iter().all(|f| f[1] == 0xD5));
+    }
+
+    #[test]
+    fn finds_a_scrambled_dandi_plus() {
+        const L: usize = 2223;
+        let mut bits = vec![1, 0];
+        for k in 0..60u32 {
+            let mut d = [0xD5u8; crate::dandi::DATA_BYTES];
+            for (i, v) in d.iter_mut().enumerate() {
+                *v ^= ((i as u32 + k) % 5) as u8;
+            }
+            crate::dandi::frame(&d, &mut bits);
+        }
+        let kind = Descrambler::SelfSync(&[3, 20]);
+        let sent = scramble(kind, L, &bits);
+        let mut rx = PayloadRx::new(L);
+        let mut out = PayloadOut::default();
+        let mut bytes = Vec::new();
+        for f in sent.as_chunks::<L>().0 {
+            rx.push(f, &mut out);
+            bytes.append(&mut out.dandi);
+        }
+        assert_eq!(rx.format(), Some(Format::DiPlus), "{:?}", rx.stats);
+        assert!(rx.stats.found.as_ref().unwrap().contains("taps 3, 20"));
+        assert!(
+            bytes.len() > 40 * crate::dandi::DATA_BYTES,
+            "{}",
+            bytes.len()
+        );
     }
 
     #[test]

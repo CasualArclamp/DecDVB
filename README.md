@@ -30,7 +30,8 @@ TPC 2964 carrier). Every carrier was found and identified blind.*
 | DVB-S2/S2X PL demodulation: frame lock, MODCOD per frame (ACM) | ✅ |
 | Carrier recovery: a locked constellation and MER, for Identify and DVB-S2 VFOs | ✅ |
 | **DVB-S → MPEG-TS** (EN 300 421): code rate, rotation and inversion found blind; Viterbi, RS, the same TS outputs | ✅ |
-| **TPC 2964 → IP / TS** (Intelsat IESS-315 turbo product code, BPSK/QPSK): frame structure, scrambling and payload found from the signal; HDLC → IP, or MPEG-TS | ✅ (synthetic signals; awaiting a real carrier) |
+| **TPC 2964 → IP / TS / voice** (Intelsat IESS-315 turbo product code, BPSK/QPSK): frame structure, scrambling and payload found from the signal; HDLC → IP, MPEG-TS, E1 and Comtech D&I++ voice | ✅ confirmed on a live Comtech CDM-600L carrier |
+| **E1 voice**: G.704 E1 or Comtech Drop & Insert++ timeslots, G.711 A-law — levels per channel, listen, record `.wav` | ✅ |
 | **Generic PSK/APSK/QAM → symbols** (`.bin`, one byte per symbol), BPSK…32APSK and 8/16/64QAM, for non-DVB carriers | ✅ |
 | Narrow carriers: VFOs down to 500 Hz, ~10 kBd SCPC carriers lock | ✅ |
 | IQ recorder and spectrum-only VFOs | ✅ |
@@ -186,6 +187,22 @@ decoded data to a `.bin`. Identify recognises the carrier by its unique
 word. What each search found is shown, so you can tell a finding from a
 default. It is confirmed on synthetic carriers; a recording of a real one
 would settle the details the documents leave open.
+
+### Voice over E1 (G.704, Comtech D&I++)
+
+Modems carrying telephony or radio links (airband voice, for one) send
+64 kbit/s G.711 channels: a whole E1, or — Comtech's **Drop & Insert++** —
+the chosen timeslots in frames of 2944 bits (64 overhead, 2880 data; the
+layout is not published and was worked out from a CDM-600L carrier: a
+24-bit header, then five blocks of 72 bytes each after 10 bits of
+overhead). Behind the TPC 2964 decoder the payload search finds either,
+under the V.35 descrambler or any other it tries, and the **Voice** card
+lists the channels with their levels: **▶** listens (the app's player and
+volume), **●** records a `.wav`. Offline:
+
+```bash
+decdvb decode capture_148148Sps.cf32 --decoder tpc --out dir --e1-record 1
+```
 
 ### Generic PSK → symbols
 

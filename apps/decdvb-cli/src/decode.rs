@@ -22,6 +22,7 @@ pub struct DecodeArgs {
     pub modulation: Option<String>,
     pub out: Option<PathBuf>,
     pub fast: bool,
+    pub e1_record: Option<u8>,
 }
 
 fn decoder_by_name(name: &str) -> Result<DecoderKind> {
@@ -83,6 +84,10 @@ pub fn decode(a: DecodeArgs) -> Result<()> {
         s.record = true;
         s.record_dir = dir.clone();
     }
+    if a.e1_record.is_some() && a.out.is_none() {
+        bail!("--e1-record needs --out");
+    }
+    s.e1_record = a.e1_record;
     let id = eng.add_vfo(s);
 
     let t0 = Instant::now();
@@ -182,6 +187,10 @@ fn report(st: &VfoStatus) {
             e.stats.losses,
             if e.stats.cas { " · CAS" } else { "" }
         );
+        println!("  {}", e.source);
+        if let Some((p, n)) = &e.record_file {
+            println!("  recorded to {} ({n} bytes)", p.display());
+        }
         for (ts, db) in e.levels_db.iter().enumerate().skip(1) {
             if *db > -60.0 {
                 println!("  TS {ts:2}: {db:6.1} dBFS");

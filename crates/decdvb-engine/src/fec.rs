@@ -345,6 +345,11 @@ pub struct FecStats {
 /// An E1's state, for display.
 #[derive(Debug, Clone, Default)]
 pub struct E1View {
+    /// How the channels are carried: "E1 (G.704)" or "D&I++".
+    pub source: String,
+    /// D&I++: the number of 64 kbit/s timeslots carried (channels 1..=n);
+    /// `None` for a whole E1 (timeslots 1–31).
+    pub channels: Option<u8>,
     pub stats: decdvb_modem::e1::E1Stats,
     /// Level of each timeslot over the last half second, dBFS (A-law
     /// decoded; idle channels sit near −70, data near −5).
@@ -378,6 +383,10 @@ struct E1Stage {
     record_rtp: (u16, u32),
     record_last: Option<(PathBuf, u64)>,
     error: Option<String>,
+    /// D&I++: timeslots carried, and the frame being filled from its bytes.
+    dandi: Option<u8>,
+    dandi_frame: [u8; decdvb_modem::e1::TIMESLOTS],
+    dandi_next: usize,
 }
 
 /// Frames in a level chunk (10 ms), and chunks in a reading (half a
@@ -422,7 +431,31 @@ impl E1Stage {
             record_rtp: (0, 0),
             record_last: None,
             error: None,
+            dandi: None,
+            dandi_frame: [0xD5; decdvb_modem::e1::TIMESLOTS],
+            dandi_next: 0,
         }
+    }
+
+    /// D&I++ bytes, `n` timeslots taking turns: made into E1-shaped frames
+    /// (channel k in timeslot k, the rest idle A-law) for the meters,
+    /// player and recorder.
+    fn dandi_bytes(&mut self, n: u8, bytes: &[u8]) {
+        let n = n.clamp(1, 31) as usize;
+        if self.dandi != Some(n as u8) {
+            self.dandi = Some(n as u8);
+            self.dandi_next = 0;
+        }
+        let mut frames = Vec::with_capacity(bytes.len() / n + 1);
+        for &b in bytes {
+            self.dandi_frame[1 + self.dandi_next] = b;
+            self.dandi_next += 1;
+            if self.dandi_next == n {
+                frames.push(self.dandi_frame);
+                self.dandi_next = 0;
+            }
+        }
+        self.frames(&frames);
     }
 
     fn follow(&mut self, o: &FecOutput) {
@@ -529,6 +562,11 @@ impl E1Stage {
 
     fn view(&self, stats: decdvb_modem::e1::E1Stats) -> E1View {
         E1View {
+            source: match self.dandi {
+                Some(n) => format!("Comtech D&I++, {n} × 64 kbit/s"),
+                None => "E1 (G.704)".into(),
+            },
+            channels: self.dandi,
             stats,
             levels_db: self.levels_db.clone(),
             playing: self.play_want.filter(|_| self.player.is_some()),
@@ -1422,6 +1460,17 @@ fn run(
                         stage.follow(&o);
                         stage.frames(&payload_out.e1);
                     }
+                    if !payload_out.dandi.is_empty() {
+                        // Timeslots carried: the data rate — the symbol rate
+                        // through the code — is n × 64 kbit/s × 46/45 (the
+                        // D&I++ overhead).
+                        let bps = symbol_rate * if qpsk { 2.0 } else { 1.0 } * DATA as f64
+                            / decdvb_modem::tpc2964::FRAME as f64;
+                        let n = (bps * 45.0 / 46.0 / 64e3).round().clamp(1.0, 31.0) as u8;
+                        let stage = e1.get_or_insert_with(E1Stage::new);
+                        stage.follow(&o);
+                        stage.dandi_bytes(n, &payload_out.dandi);
+                    }
                     for (frame, fcs) in &payload_out.frames {
                         if let Some((pkt, info)) = hdlc_ip(frame) {
                             let ipst = ip.get_or_insert_with(IpStage::new);
@@ -1457,7 +1506,17 @@ fn run(
                 s.text = tpc_text.as_ref().map(|t| t.view());
                 if let Some(stage) = &mut e1 {
                     stage.follow(&o);
-                    s.e1 = Some(stage.view(pay.stats.e1.clone().unwrap_or_default()));
+                    let st = match &pay.stats.dandi {
+                        Some(d) => decdvb_modem::e1::E1Stats {
+                            locked: d.locked,
+                            frames: d.frames,
+                            fas_errors: d.bad_frames,
+                            losses: d.losses,
+                            cas: false,
+                        },
+                        None => pay.stats.e1.clone().unwrap_or_default(),
+                    };
+                    s.e1 = Some(stage.view(st));
                 }
                 s.raw_file = raw.path.clone().map(|p| (p, raw.bytes));
                 s.raw_active = raw.file.is_some();

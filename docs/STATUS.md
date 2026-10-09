@@ -702,3 +702,32 @@ in between, data ≈ −5) and plays one / records one to `.wav` by handing
 E1 card with a level bar, ▶ and ● per timeslot. Test: a scrambled E1 in TPC
 2964 with a tone in TS 7 — found, metered, played, recorded. Drop-and-insert
 (IBS-framed n×64k) is not handled yet: waiting on what the CDM-600 sends.
+
+## First live Comtech carriers: CDM-600L TPC 2964 and D&I++ voice (2026-10-09)
+
+Rory recorded his own carriers on Horizons 3e (169°E): a CDM-600L and a
+Q-Flex.
+
+- **CDM-600L** (43.6 kS/s QPSK): Identify named it from the TPC 2964 UW, and
+  the TPC decoder took it: UW every 2964 bits, structure row by row,
+  x⁶ + x + 1, code bits unscrambled (the search's own finding, fit 10 % at a
+  raw BER of 0.6 %), 426 of 443 frames decoded.
+- The payload: data rate 65 423 bit/s = 64 000 × 46/45 — Comtech **D&I++**
+  (CDM-625 manual: 2944-bit frames, 64 overhead + 2880 data). Under the
+  V.35 descrambler (taps 3, 20) the data fold at 2944 bits into a 24-bit
+  header `000001010111101000111000` and four 10-bit overheads
+  (`0111111111` ×3, the last with a varying bit) between five 576-bit blocks;
+  the data are byte-aligned G.711 A-law, 360 bytes (45 ms) a frame. The
+  audio: open-squelch hiss and a stretch of steady 100 Hz hum (pitch
+  r = 0.8 in 61/63 blocks) — coherent sound, so the layout is right.
+  `decdvb-modem::dandi` deframes it; the payload search tries it; the FEC
+  thread works out the timeslots from the symbol rate (n × 64k × 46/45) and
+  feeds them to the E1 voice stage; the GUI's Voice card shows "ch 1..n".
+- **False MPEG-TS**: three sync bytes 188 apart turn up by chance in a long
+  probe, so the CDM-600L read "MPEG-TS" (5–10 packets, random PIDs). TS, E1
+  and D&I++ must now account for at least half of the probed bits.
+- `decdvb decode <capture> --decoder … [--out d --e1-record n]`.
+- **Q-Flex** capture (95 kS/s QPSK): a structure repeating every 23 076
+  symbols (~10 %), no header DecDVB knows — FastLink or Paradise TPC; open.
+- With several D&I++ timeslots the byte order (alternating) is assumed, not
+  confirmed.

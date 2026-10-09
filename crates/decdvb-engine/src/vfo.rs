@@ -2097,6 +2097,71 @@ mod tests {
     }
 
     #[test]
+    fn tpc2964_vfo_plays_a_comtech_dandi_plus_channel() {
+        use decdvb_mod::Shaper;
+        use decdvb_modem::dandi::{DATA_BYTES, frame};
+        use decdvb_modem::e1::alaw_encode;
+        use decdvb_modem::payload::SelfSyncScrambler;
+        use decdvb_modem::tpc2964::{DATA, Structure, TpcTx, modulate};
+        // A CDM-600-style carrier: one 64 kbit/s timeslot (a 440 Hz tone)
+        // in D&I++ frames, V.35-scrambled, TPC 2964 on QPSK. Its symbol rate
+        // follows from the data rate: 64000 × 46/45 / (2 × 0.75).
+        let mut data = Vec::new();
+        let mut n = 0usize;
+        for _ in 0..120 {
+            let mut d = [0u8; DATA_BYTES];
+            for v in d.iter_mut() {
+                let t = n as f32 / 8000.0;
+                *v = alaw_encode(0.3 * (std::f32::consts::TAU * 440.0 * t).sin());
+                n += 1;
+            }
+            frame(&d, &mut data);
+        }
+        SelfSyncScrambler::new(&[3, 20]).scramble(&mut data);
+        let tx = TpcTx::new(Structure::TEST);
+        let mut bits = Vec::new();
+        for d in data.as_chunks::<DATA>().0 {
+            tx.frame(d, &mut bits);
+        }
+        let mut syms = Vec::new();
+        modulate(&bits[300..], true, &mut syms);
+        // 4 samples a symbol: the band is 4 × 43 616 S/s wide.
+        let rs = 64_000.0 * 46.0 / 45.0 / 1.5;
+        let mut sh = Shaper::new(4, 0.35, 16);
+        let mut x = Vec::new();
+        sh.process(&syms, &mut x);
+        let rate = 4.0 * rs;
+        let settings = VfoSettings::new("DI", 0.0, 0.8 * rate, DecoderKind::Tpc2964);
+        let status = Arc::new(Mutex::new(VfoStatus::default()));
+        let mut wk = Worker::new(rate, settings, status.clone(), Arc::new(AtomicU64::new(0)));
+        feed(&mut wk, &x, 65_536);
+        let t0 = Instant::now();
+        let e = loop {
+            wk.publish(0);
+            let f = status.lock().unwrap().fec.clone();
+            if let Some(e) = f
+                .as_ref()
+                .and_then(|f| f.e1.clone())
+                .filter(|e| e.levels_db.len() == 32)
+            {
+                break e;
+            }
+            if t0.elapsed().as_secs() >= 30 {
+                let st = status.lock().unwrap();
+                panic!(
+                    "no D&I++: {} / {:?}",
+                    st.message,
+                    st.fec.as_ref().map(|f| (&f.tpc, &f.payload))
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(e.channels, Some(1), "{}", e.source);
+        assert!(e.source.contains("D&I++"), "{}", e.source);
+        assert!(e.levels_db[1] > -20.0, "channel 1 at {} dB", e.levels_db[1]);
+    }
+
+    #[test]
     fn finds_multicast_radio_in_mpe_on_a_ts_carrier() {
         use decdvb_mod::PlFramer;
         let settings = VfoSettings::new("TS", 40_000.0, 190_000.0, DecoderKind::Dvbs2Ts);

@@ -13,6 +13,7 @@
 //! - [`text`]: live text search in any bit stream, every reading at once.
 
 pub mod conv;
+pub mod dandi;
 pub mod dvbs;
 pub mod e1;
 pub mod interleave;
