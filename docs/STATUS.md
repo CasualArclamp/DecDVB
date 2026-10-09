@@ -1362,3 +1362,14 @@ payload` and `decode` print them. On the recordings: qflex_3 one call at
 395.3 s for 13.7 s on channels 0, 1, 2, 15; the 19:54 one at 18.9 s for
 12.4 s on 0, 1, 2 (15 not yet proven in 37 s). So a long unattended
 session shows when anyone spoke, and auto-record keeps the data.
+
+Codec lead: G.728 (LD-CELP, 16 kbit/s, 10-bit codewords) is what ATC voice
+equipment of this kind uses for 16 kbit/s sub-channels (e.g. a SolaCom
+patent: a 64 kbit/s ATS-QSIG channel split into four 16 kbit/s ones, three
+of G.728 voice). The CDM-600L's E1 TS1 codec is exactly such a 16 kbit/s
+sub-channel (bits 2–3 of each octet), and its combined stream agrees with
+itself 10 bits on (0.63, against ~0.53 at the lags either side), its
+silence made of near-all-ones 10-bit words — the "0 every fifth bit" of
+each 8 kbit/s half. The Q-Flex calls are 16 kbit/s across four channels
+too. Testing it needs a G.728 decoder, i.e. the codebooks of ITU-T G.728
+(not fetched: ask first).
