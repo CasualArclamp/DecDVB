@@ -476,6 +476,183 @@ impl DvbsRx {
     }
 }
 
+/// What a [`ViterbiRx`] has found.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ViterbiStats {
+    /// The code rate and orientation found, once locked.
+    pub rate: Option<Rate>,
+    pub orientation: Option<String>,
+    /// Coded bits the decoder corrected, fraction, at the last check.
+    pub channel_ber: f32,
+    pub bits: u64,
+    /// Searches tried, and locks lost (a later check no longer fitting).
+    pub searches: u64,
+    pub losses: u64,
+}
+
+/// Data bits per block a [`ViterbiRx`] hands on.
+pub const VITERBI_BLOCK: usize = 4096;
+/// Blocks between checks that the locked hypothesis still fits.
+const RECHECK: usize = 8;
+
+/// The K = 7 code of EN 300 421 §4.4.3 on its own — IESS-308/309 SCPC
+/// carriers and the like, whatever they carry: the same blind search over
+/// rate (1/2 to 7/8), puncturing phase and orientation as [`DvbsRx`], then
+/// continuous Viterbi decoding, the data handed on in blocks of
+/// [`VITERBI_BLOCK`] bits (0/1) with no transport layer assumed.
+pub struct ViterbiRx {
+    stage: Stage,
+    held: Vec<Iq>,
+    soft: Vec<f32>,
+    xy: Vec<(f32, f32)>,
+    viterbi: Viterbi,
+    decided: Vec<u8>,
+    block: Vec<u8>,
+    /// Recent symbols for the periodic check, and blocks since it.
+    recent: VecDeque<Iq>,
+    since_check: usize,
+    pub stats: ViterbiStats,
+}
+
+impl Default for ViterbiRx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ViterbiRx {
+    pub fn new() -> Self {
+        ViterbiRx {
+            stage: Stage::Search,
+            held: Vec::new(),
+            soft: Vec::new(),
+            xy: Vec::new(),
+            viterbi: Viterbi::new(),
+            decided: Vec::new(),
+            block: Vec::new(),
+            recent: VecDeque::with_capacity(SEARCH),
+            since_check: 0,
+            stats: ViterbiStats::default(),
+        }
+    }
+
+    fn restart(&mut self) {
+        self.stage = Stage::Search;
+        self.held.clear();
+        self.soft.clear();
+        self.viterbi.reset();
+        self.block.clear();
+        self.recent.clear();
+        self.stats.rate = None;
+        self.stats.orientation = None;
+    }
+
+    pub fn push(&mut self, symbols: &[Iq], out: &mut Vec<Vec<u8>>) {
+        for &s in symbols {
+            if self.recent.len() == SEARCH {
+                self.recent.pop_front();
+            }
+            self.recent.push_back(s);
+        }
+        match self.stage {
+            Stage::Search => {
+                self.held.extend_from_slice(symbols);
+                if self.held.len() < SEARCH {
+                    return;
+                }
+                self.stats.searches += 1;
+                let block = &self.held[..SEARCH];
+                let scored: Vec<(Hypothesis, f32)> = Hypothesis::all()
+                    .into_iter()
+                    .map(|h| (h, h.score(block)))
+                    .collect();
+                // As DvbsRx: each score against its own rate's median.
+                let best = scored
+                    .iter()
+                    .map(|&(h, sc)| {
+                        let mut same: Vec<f32> = scored
+                            .iter()
+                            .filter(|(o, _)| o.rate == h.rate)
+                            .map(|&(_, s)| s)
+                            .collect();
+                        same.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        let median = same[same.len() / 2].max(1e-3);
+                        (h, sc, sc / median)
+                    })
+                    .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap())
+                    .unwrap();
+                if best.2 > RATIO_OK {
+                    self.held.drain(..SEARCH / 2);
+                    return;
+                }
+                let hyp = best.0;
+                self.stats.rate = Some(hyp.rate);
+                self.stats.channel_ber = best.1;
+                self.stats.orientation = Some(format!(
+                    "{}{}",
+                    if hyp.rotated {
+                        "turned 90°"
+                    } else {
+                        "not turned"
+                    },
+                    if hyp.inverted { ", mirrored" } else { "" }
+                ));
+                self.stage = Stage::Locked { hyp };
+                self.since_check = 0;
+                let held = std::mem::take(&mut self.held);
+                hyp.soft(&held, &mut self.soft);
+                self.soft.drain(..hyp.offset);
+                self.decode(out);
+            }
+            Stage::Locked { hyp } => {
+                hyp.soft(symbols, &mut self.soft);
+                self.decode(out);
+            }
+        }
+    }
+
+    fn decode(&mut self, out: &mut Vec<Vec<u8>>) {
+        let Stage::Locked { hyp } = self.stage else {
+            return;
+        };
+        let c = hyp.rate.coded();
+        let whole = self.soft.len() / c * c;
+        self.xy.clear();
+        conv::depuncture(hyp.rate, &self.soft[..whole], &mut self.xy);
+        self.soft.drain(..whole);
+        self.decided.clear();
+        for &(x, y) in &self.xy {
+            self.viterbi.push(x, y, &mut self.decided);
+        }
+        self.stats.bits += self.decided.len() as u64;
+        for &b in &self.decided {
+            self.block.push(b);
+            if self.block.len() == VITERBI_BLOCK {
+                out.push(std::mem::take(&mut self.block));
+                self.since_check += 1;
+            }
+        }
+        // Still the right code? The newest symbols under the same
+        // hypothesis (the puncturing phase may have moved: any phase of
+        // this rate and orientation will do).
+        if self.since_check >= RECHECK && self.recent.len() == SEARCH {
+            self.since_check = 0;
+            let recent: Vec<Iq> = self.recent.iter().copied().collect();
+            let fits = Hypothesis::all()
+                .into_iter()
+                .filter(|h| h.rate == hyp.rate)
+                .map(|h| h.score(&recent))
+                .fold(f32::INFINITY, f32::min);
+            if fits > 0.15 {
+                self.stats.losses += 1;
+                self.restart();
+            } else {
+                self.stats.channel_ber = fits;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,6 +686,62 @@ mod tests {
             let (a, b) = (u(), u());
             ((-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()) as f32
         }
+    }
+
+    #[test]
+    fn viterbi_rx_decodes_any_k7_stream() {
+        // Random data, rate 3/4 punctured, QPSK, turned 90° and mirrored,
+        // noise at Es/N0 7 dB: the data come back (perhaps inverted).
+        let mut r = noise(11);
+        let data: Vec<u8> = (0..60_000).map(|_| u8::from(r() > 0.0)).collect();
+        let mut enc = Encoder::new(Rate::R3_4);
+        let mut coded = Vec::new();
+        for &b in &data {
+            enc.push(b, &mut coded);
+        }
+        let sigma = (10f32.powf(-7.0 / 10.0) / 2.0).sqrt();
+        let mut n = noise(3);
+        let a = std::f32::consts::FRAC_1_SQRT_2;
+        let syms: Vec<Iq> = coded
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| {
+                let s = Iq::new(
+                    if p[0] == 1 { -a } else { a },
+                    if p[1] == 1 { -a } else { a },
+                );
+                s.conj() * Iq::new(0.0, 1.0) + Iq::new(n() * sigma, n() * sigma)
+            })
+            .collect();
+        let mut rx = ViterbiRx::new();
+        let mut out = Vec::new();
+        for c in syms[333..].chunks(4000) {
+            rx.push(c, &mut out);
+        }
+        assert_eq!(rx.stats.rate, Some(Rate::R3_4), "{:?}", rx.stats);
+        let got: Vec<u8> = out.concat();
+        assert!(got.len() > 30_000, "{} bits", got.len());
+        // Where the decoded bits sit in the data, and which way up.
+        let probe = &got[100..164];
+        let (at, inv) = (0..data.len() - 64)
+            .flat_map(|k| [(k, 0u8), (k, 1u8)])
+            .find(|&(k, inv)| {
+                data[k..k + 64]
+                    .iter()
+                    .zip(probe)
+                    .all(|(&d, &g)| d ^ inv == g)
+            })
+            .expect("decoded bits not found in the data");
+        let start = at - 100;
+        let wrong = got
+            .iter()
+            .zip(&data[start..])
+            .skip(100)
+            .filter(|&(&g, &d)| g != d ^ inv)
+            .count();
+        assert!(wrong < 10, "{wrong} wrong of {}", got.len());
+        assert_eq!(rx.stats.losses, 0);
     }
 
     #[test]

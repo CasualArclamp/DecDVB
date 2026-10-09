@@ -33,6 +33,7 @@ fn decoder_by_name(name: &str) -> Result<DecoderKind> {
         "dvbs" => DecoderKind::DvbsTs,
         "tpc" | "tpc2964" => DecoderKind::Tpc2964,
         "fastlink" | "fl" => DecoderKind::FastLink,
+        "viterbi" | "vit" => DecoderKind::Viterbi,
         "cid" | "carrier-id" => DecoderKind::CarrierId,
         "psk" => DecoderKind::PskSymbols,
         other => bail!("unknown decoder `{other}` (id, ip, ts, dvbs, tpc, psk)"),
@@ -200,6 +201,17 @@ fn report(st: &VfoStatus) {
             t.channel_ber(),
             t.slips,
             t.uw_misses
+        );
+    }
+    if let Some(v) = &f.viterbi {
+        println!(
+            "viterbi: rate {}, {}, channel BER {:.2e}, {} bits, {} searches, {} relocks",
+            v.rate.map_or("not found", |r| r.name()),
+            v.orientation.as_deref().unwrap_or("-"),
+            v.channel_ber,
+            v.bits,
+            v.searches,
+            v.losses
         );
     }
     if let Some(t) = &f.fastlink {

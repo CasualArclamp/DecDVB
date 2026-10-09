@@ -351,6 +351,10 @@ pub enum Format {
     DiPlus,
     /// Paradise closed network plus ESC.
     ParadiseEsc,
+    /// No framing known, but the descrambled data are mostly an idle fill
+    /// (constant, 1010… or a repeated byte): the scrambler is found even
+    /// though what the data carry is not.
+    Idle,
 }
 
 /// The data of one frame, made useful.
@@ -406,6 +410,10 @@ const PROBE_MIN: usize = 4;
 const PROBE_MAX: usize = 32;
 /// Checked units (HDLC frames, TS packets) needed to decide.
 const PROBE_UNITS: u64 = 3;
+/// Share of descrambled bits repeating the bit 1, 2 or 8 places before
+/// (idle fill) that names the scrambler when no framing does: random data
+/// sit at 0.5.
+const IDLE_SHARE: f64 = 0.75;
 
 /// Finds the descrambler and format of a modem's data, then follows them.
 pub struct PayloadRx {
@@ -459,6 +467,8 @@ impl PayloadRx {
         // per good frame, so a few good frames win over nothing).
         let mut best: Option<(u64, Descrambler, Format, Fcs)> = None;
         let held_bits: u64 = self.held.iter().map(|f| f.len() as u64).sum();
+        // The most idle-looking descrambling, should nothing frame.
+        let mut idle: Option<(f64, Descrambler)> = None;
         for kind in Descrambler::all() {
             let mut d = Running::new(kind, self.frame_len);
             let (mut hdlc, mut ts, mut e1, mut di, mut pe) = (
@@ -476,6 +486,9 @@ impl PayloadRx {
                 Vec::new(),
                 Vec::new(),
             );
+            // Bits equal to the one 1, 2 and 8 places before.
+            let mut same = [0u64; 3];
+            let mut prev: Vec<u8> = Vec::new();
             for f in &self.held {
                 let mut bits = f.clone();
                 d.frame(&mut bits);
@@ -484,6 +497,18 @@ impl PayloadRx {
                 e1.push(&bits, &mut e1f);
                 di.push(&bits, &mut dib);
                 pe.push(&bits, &mut ped, &mut pee);
+                prev.extend_from_slice(&bits);
+                let n = prev.len();
+                for (k, lag) in [1usize, 2, 8].into_iter().enumerate() {
+                    let from = (n - bits.len()).max(lag);
+                    same[k] += (from..n).filter(|&i| prev[i] == prev[i - lag]).count() as u64;
+                }
+                let keep = prev.len().saturating_sub(8);
+                prev.drain(..keep);
+            }
+            let share = same.iter().copied().max().unwrap_or(0) as f64 / held_bits.max(1) as f64;
+            if idle.is_none_or(|(s, _)| share > s) {
+                idle = Some((share, kind));
             }
             let fcs = frames.first().map_or(Fcs::Crc16, |f| f.1);
             let framed = |covered: u64| (2 * covered >= held_bits).then_some(covered);
@@ -511,6 +536,16 @@ impl PayloadRx {
                 }
             }
         }
+        // Only once the framing formats have had a fair look (an idle
+        // timeslot's fill would otherwise win before its frames align).
+        if best.is_none()
+            && self.held.len() >= 2 * PROBE_MIN
+            && held_bits >= 30_000
+            && let Some((share, kind)) = idle
+            && share >= IDLE_SHARE
+        {
+            best = Some((0, kind, Format::Idle, Fcs::Crc16));
+        }
         if let Some((_, kind, fmt, fcs)) = best {
             self.stats.found = Some(format!(
                 "{}, {}",
@@ -519,6 +554,7 @@ impl PayloadRx {
                     (Format::E1, _) => "E1 (G.704 framing)",
                     (Format::DiPlus, _) => "E1 timeslots, Comtech D&I++ framing",
                     (Format::ParadiseEsc, _) => "Paradise closed network + ESC framing",
+                    (Format::Idle, _) => "idle fill between bursts (format not known)",
                     (Format::Hdlc, Fcs::Crc16) => "HDLC (FCS-16)",
                     (Format::Hdlc, Fcs::Crc32) => "HDLC (FCS-32)",
                 },
@@ -563,6 +599,8 @@ impl PayloadRx {
                 self.paradise.push(&bits, &mut out.inner, &mut out.esc);
                 self.stats.paradise = Some(self.paradise.stats.clone());
             }
+            // Descrambled, for the text finder and the data file.
+            Format::Idle => out.inner.extend_from_slice(&bits),
         }
         if raw {
             self.pack(&bits, out);
@@ -753,6 +791,37 @@ mod tests {
             "{}",
             bytes.len()
         );
+    }
+
+    #[test]
+    fn idle_fill_names_the_scrambler() {
+        // 0x55 fill with a varying byte every 16 and a burst of random
+        // data, V.35-scrambled: no framing known, but the scrambler is.
+        const L: usize = 4096;
+        let mut next = rng(5);
+        let mut bits = Vec::new();
+        for k in 0..4400u32 {
+            let byte = if k % 16 == 0 {
+                (k / 16) as u8
+            } else if (900..1300).contains(&k) {
+                next() as u8
+            } else {
+                0x55
+            };
+            bits.extend((0..8).map(|i| (byte >> (7 - i)) & 1));
+        }
+        let kind = Descrambler::SelfSync(&[3, 20]);
+        let sent = scramble(kind, L, &bits);
+        let mut rx = PayloadRx::new(L);
+        let mut out = PayloadOut::default();
+        let mut inner = Vec::new();
+        for f in sent.as_chunks::<L>().0 {
+            rx.push(f, &mut out);
+            inner.append(&mut out.inner);
+        }
+        assert_eq!(rx.format(), Some(Format::Idle), "{:?}", rx.stats);
+        assert!(rx.stats.found.as_ref().unwrap().contains("taps 3, 20"));
+        assert!(!inner.is_empty());
     }
 
     #[test]

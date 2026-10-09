@@ -57,6 +57,9 @@ pub(crate) enum FecInput {
     },
     /// Carrier-locked QPSK symbols of a Q-Flex FastLink carrier.
     FastLink(Vec<Iq>),
+    /// Carrier-locked QPSK symbols of a K = 7 convolutional-code carrier
+    /// (IESS-308/309 and the like).
+    Viterbi(Vec<Iq>),
 }
 
 /// LLR quantization: steps per LLR unit (the decoder is happy from 2 to 8).
@@ -334,6 +337,8 @@ pub struct FecStats {
     pub tpc: Option<decdvb_modem::tpc2964::TpcStats>,
     /// Q-Flex FastLink: frame sync and LDPC decoding.
     pub fastlink: Option<decdvb_modem::fastlink::FastLinkStats>,
+    /// A K = 7 convolutional code: the rate and orientation found.
+    pub viterbi: Option<decdvb_modem::dvbs::ViterbiStats>,
     /// What a modem's data carry (TPC 2964).
     pub payload: Option<decdvb_modem::payload::PayloadStats>,
     /// The raw data file (TPC 2964, while recording) and its bytes.
@@ -760,6 +765,11 @@ impl FecWorker {
     /// Queue a block of Q-Flex FastLink symbols.
     pub fn offer_fastlink(&self, symbols: Vec<Iq>) {
         self.send(FecInput::FastLink(symbols));
+    }
+
+    /// Queue a block of symbols of a K = 7 convolutional-code carrier.
+    pub fn offer_viterbi(&self, symbols: Vec<Iq>) {
+        self.send(FecInput::Viterbi(symbols));
     }
 
     fn send(&self, input: FecInput) {
@@ -1442,6 +1452,7 @@ fn run(
     let mut dvbs_out = Vec::new();
     let mut tpc: Option<decdvb_modem::tpc2964::TpcRx> = None;
     let mut fastlink: Option<decdvb_modem::fastlink::FastLinkRx> = None;
+    let mut viterbi: Option<decdvb_modem::dvbs::ViterbiRx> = None;
     let mut tpc_frames = Vec::new();
     let mut payload: Option<decdvb_modem::payload::PayloadRx> = None;
     let mut payload_out = decdvb_modem::payload::PayloadOut::default();
@@ -1453,7 +1464,7 @@ fn run(
         let f = match input {
             FecInput::Frame(f) => f,
             // `name @ (A | B)` binds the whole input whichever it is.
-            modem @ (FecInput::Tpc { .. } | FecInput::FastLink(_)) => {
+            modem @ (FecInput::Tpc { .. } | FecInput::FastLink(_) | FecInput::Viterbi(_)) => {
                 // A coded modem's data blocks: TPC 2964 (frame sync and the
                 // code's structure found blind, turbo decoding) or Q-Flex
                 // FastLink (measured LDPC code); then, for either, the
@@ -1480,6 +1491,18 @@ fn run(
                             FRAME_DATA,
                             bps,
                             "fastlink",
+                        )
+                    }
+                    FecInput::Viterbi(symbols) => {
+                        use decdvb_modem::dvbs::{VITERBI_BLOCK, ViterbiRx};
+                        let rx = viterbi.get_or_insert_with(ViterbiRx::new);
+                        rx.push(&symbols, &mut tpc_frames);
+                        let bps = 2.0 * symbol_rate * rx.stats.rate.map_or(0.5, |r| r.value());
+                        (
+                            symbols.len() as f64 / symbol_rate,
+                            VITERBI_BLOCK,
+                            bps,
+                            "viterbi",
                         )
                     }
                     _ => unreachable!("matched above"),
@@ -1563,6 +1586,7 @@ fn run(
                 }
                 s.tpc = tpc.as_ref().map(|r| r.stats.clone());
                 s.fastlink = fastlink.as_ref().map(|r| r.stats.clone());
+                s.viterbi = viterbi.as_ref().map(|r| r.stats.clone());
                 s.payload = Some(pay.stats.clone());
                 s.text = tpc_text.as_ref().map(|t| t.view());
                 if let Some(stage) = &mut e1 {

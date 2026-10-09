@@ -32,6 +32,7 @@ TPC 2964 carrier). Every carrier was found and identified blind.*
 | **DVB-S → MPEG-TS** (EN 300 421): code rate, rotation and inversion found blind; Viterbi, RS, the same TS outputs | ✅ |
 | **TPC 2964 → IP / TS / voice** (Intelsat IESS-315 turbo product code, BPSK/QPSK): frame structure, scrambling and payload found from the signal; HDLC → IP, MPEG-TS, E1 and Comtech D&I++ voice | ✅ confirmed on a live Comtech CDM-600L carrier |
 | **Q-Flex FastLink → data** (Paradise, QPSK 0.710): sync word, the (2880, 2048) LDPC code and the frame scrambler, all measured from a live carrier; the data go to the same payload search and text finder | ✅ decodes a live Q-Flex (payload format not yet known) |
+| **Viterbi K=7 → data** (IESS-308/309 SCPC and the like): rate 1/2–7/8, puncturing and orientation found blind; then the payload search (HDLC, TS, E1, D&I++, Paradise framing, or just the scrambler from the idle fill) | ✅ decodes a live 10.24 kBd SCPC carrier (rate 1/2, V.35) |
 | **Carrier ID (DVB-CID, ETSI TS 103 129)**: the spread-spectrum identifier under a carrier — the uplink modulator's unique ID (and MAC), position, telephone and text | ✅ to the specification, on synthetic carriers (no CID among the recordings yet) |
 | **E1 voice**: G.704 E1 or Comtech Drop & Insert++ timeslots, G.711 A-law — levels per channel, listen, record `.wav` | ✅ |
 | **Generic PSK/APSK/QAM → symbols** (`.bin`, one byte per symbol), BPSK…32APSK and 8/16/64QAM, for non-DVB carriers | ✅ |

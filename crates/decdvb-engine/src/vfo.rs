@@ -45,6 +45,10 @@ pub enum DecoderKind {
     /// LDPC decoding and descrambling as measured on a live carrier; the
     /// data go to the same payload search as TPC 2964's.
     FastLink,
+    /// A K = 7 convolutional code (EN 300 421's, as IESS-308/309 SCPC
+    /// carriers use): rate and orientation found blind, then the payload
+    /// search on the decoded bits.
+    Viterbi,
     /// DVB-CID (ETSI TS 103 129): the carrier identification signal under a
     /// host carrier — the uplink modulator's unique ID, position, telephone
     /// and text.
@@ -59,13 +63,14 @@ pub enum DecoderKind {
 }
 
 impl DecoderKind {
-    pub const ALL: [DecoderKind; 10] = [
+    pub const ALL: [DecoderKind; 11] = [
         DecoderKind::Identify,
         DecoderKind::Dvbs2Ip,
         DecoderKind::Dvbs2Ts,
         DecoderKind::DvbsTs,
         DecoderKind::Tpc2964,
         DecoderKind::FastLink,
+        DecoderKind::Viterbi,
         DecoderKind::CarrierId,
         DecoderKind::PskSymbols,
         DecoderKind::IqRecord,
@@ -80,6 +85,7 @@ impl DecoderKind {
             DecoderKind::DvbsTs => "DVB-S → MPEG-TS",
             DecoderKind::Tpc2964 => "TPC 2964 (IESS-315) → IP / TS",
             DecoderKind::FastLink => "Q-Flex FastLink (QPSK 0.710) → data",
+            DecoderKind::Viterbi => "Viterbi K=7 (IESS-308/309 SCPC) → data",
             DecoderKind::CarrierId => "Carrier ID (DVB-CID)",
             DecoderKind::PskSymbols => "Generic PSK → symbols (.bin)",
             DecoderKind::IqRecord => "IQ recorder",
@@ -96,6 +102,7 @@ impl DecoderKind {
                 | DecoderKind::DvbsTs
                 | DecoderKind::Tpc2964
                 | DecoderKind::FastLink
+                | DecoderKind::Viterbi
         )
     }
 
@@ -109,6 +116,7 @@ impl DecoderKind {
                 | DecoderKind::DvbsTs
                 | DecoderKind::Tpc2964
                 | DecoderKind::FastLink
+                | DecoderKind::Viterbi
                 | DecoderKind::PskSymbols
         )
     }
@@ -121,6 +129,7 @@ impl DecoderKind {
             DecoderKind::DvbsTs => "S→TS",
             DecoderKind::Tpc2964 => "TPC",
             DecoderKind::FastLink => "FL",
+            DecoderKind::Viterbi => "VIT",
             DecoderKind::CarrierId => "CID",
             DecoderKind::PskSymbols => "PSK",
             DecoderKind::IqRecord => "REC",
@@ -517,7 +526,10 @@ impl Worker {
                 demod: None,
                 fec: None,
             },
-            DecoderKind::DvbsTs | DecoderKind::Tpc2964 | DecoderKind::FastLink => Decoder::Modem {
+            DecoderKind::DvbsTs
+            | DecoderKind::Tpc2964
+            | DecoderKind::FastLink
+            | DecoderKind::Viterbi => Decoder::Modem {
                 kind: s.decoder,
                 buf: Vec::new(),
                 demod: None,
@@ -585,7 +597,21 @@ impl Worker {
         mailbox: Arc<Mutex<Option<VfoSettings>>>,
         stop: Arc<AtomicBool>,
     ) {
-        while let Ok(msg) = rx.recv() {
+        loop {
+            // With no input for a while (a file that ended, a paused
+            // source) publish anyway: the FEC and CID threads may still be
+            // finishing, and their state should show.
+            let msg = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                Ok(m) => m,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    self.publish(0);
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -1110,6 +1136,8 @@ impl Worker {
                         tpc_message(&lock, f.as_ref())
                     } else if *kind == DecoderKind::FastLink {
                         fastlink_message(&lock, f.as_ref())
+                    } else if *kind == DecoderKind::Viterbi {
+                        viterbi_message(&lock, f.as_ref())
                     } else {
                         match f.as_ref().and_then(|f| f.dvbs.as_ref().map(|v| (v, &f.ts))) {
                             Some((v, ts)) if v.rate.is_some() => {
@@ -1216,8 +1244,30 @@ fn offer_symbols(
     match kind {
         DecoderKind::Tpc2964 => w.offer_tpc(s, modulation != decdvb_core::Modulation::Bpsk),
         DecoderKind::FastLink => w.offer_fastlink(s),
+        DecoderKind::Viterbi => w.offer_viterbi(s),
         _ => w.offer_dvbs(s),
     }
+}
+
+/// A Viterbi VFO's status line.
+fn viterbi_message(lock: &str, f: Option<&crate::fec::FecStats>) -> String {
+    let Some(v) = f.and_then(|f| f.viterbi.as_ref()) else {
+        return format!("{lock} · finding the code rate");
+    };
+    let Some(rate) = v.rate else {
+        return format!("{lock} · finding the code rate ({} tries)", v.searches);
+    };
+    let payload = f
+        .and_then(|f| f.payload.as_ref())
+        .and_then(|p| p.found.as_deref())
+        .map_or("payload not recognised yet".to_string(), |p| {
+            p.split(',').next().unwrap_or(p).to_string()
+        });
+    format!(
+        "{lock} · rate {} · BER {:.1e} · {payload}",
+        rate.name(),
+        v.channel_ber
+    )
 }
 
 /// A FastLink VFO's status line.
@@ -1297,7 +1347,10 @@ fn fec_output(s: &VfoSettings, ddc: &Ddc) -> FecOutput {
         record: s.record
             && matches!(
                 s.decoder,
-                DecoderKind::Dvbs2Ip | DecoderKind::Tpc2964 | DecoderKind::FastLink
+                DecoderKind::Dvbs2Ip
+                    | DecoderKind::Tpc2964
+                    | DecoderKind::FastLink
+                    | DecoderKind::Viterbi
             ),
         dir: s.record_dir.clone(),
         name: s.name.clone(),

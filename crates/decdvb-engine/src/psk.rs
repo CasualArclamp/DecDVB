@@ -21,6 +21,15 @@ use decdvb_modem::text::{TextFinder, TextView};
 /// Locked symbols kept for display.
 const RECENT: usize = 3000;
 
+/// The carrier loop's noise bandwidth (Bn·T) for a symbol rate. 0.008 suits
+/// carriers of ~40 kBd and up; slower ones need the loop at least ~250 Hz
+/// wide to follow the LNB's phase noise: a 10.24 kBd QPSK carrier off a
+/// consumer LNB stayed a ring at 0.008 (MER 8 dB, i.e. unlocked) and locked at
+/// 0.02–0.04 (MER 15 dB).
+fn pll_bandwidth(symbol_rate: f64) -> f64 {
+    (250.0 / symbol_rate).clamp(0.008, 0.04)
+}
+
 /// Streaming generic demodulator.
 pub struct PskDemod {
     mf: Fir,
@@ -58,7 +67,7 @@ impl PskDemod {
             mf: Fir::new(rrc_taps(sps, alpha, 12)),
             agc: Agc::new(1.0, 0.2),
             sync: SymbolSync::new(sps, 0.005, 0.02),
-            pll: CarrierPll::new(0.008, offset_cycles),
+            pll: CarrierPll::new(pll_bandwidth(rs), offset_cycles),
             cst: Constellation::generic(modulation),
             rate,
             filtered: Vec::new(),

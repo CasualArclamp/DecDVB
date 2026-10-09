@@ -212,6 +212,23 @@ pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
                 (None, _) => format!("acq {:.0} %", st.progress * 100.0),
             }
         }
+        DecoderKind::Viterbi => {
+            let v = st
+                .fec
+                .as_ref()
+                .and_then(|f| f.viterbi.as_ref().map(|v| (f, v)));
+            match (&st.carrier, v) {
+                (Some(c), Some((f, v))) if v.rate.is_some() => format!(
+                    "{} VIT {} · {}{}",
+                    if c.locked { "LOCK" } else { "no lock" },
+                    v.rate.map_or("?", |r| r.name()),
+                    format::bitrate(f.payload_bps),
+                    if f.raw_active { " ● REC" } else { "" }
+                ),
+                (Some(c), _) => format!("{} · rate?", if c.locked { "LOCK" } else { "no lock" }),
+                (None, _) => format!("acq {:.0} %", st.progress * 100.0),
+            }
+        }
         DecoderKind::CarrierId => match &st.cid {
             Some(c) => match c.stats.report.guid {
                 Some(g) => format!("CID {}", decdvb_engine::cid::guid_text(g)),

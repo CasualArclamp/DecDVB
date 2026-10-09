@@ -839,6 +839,37 @@ The FastLink data rate, 134 925 bit/s, is exactly 21/20 of Rory's
   timeslot's octet is not settled: neither a byte nor a bit split gives the
   CDM-600L timeslot's 1 ms idle cycle (this mux idles on a 4 ms cycle).
 
+## Narrow SCPC carriers: PLL bandwidth, Viterbi decoder (2026-10-09)
+
+Rory's screenshots of five ~10 kBd carriers near 12.3337 GHz showed a ring
+for a constellation while the demodulator said "locked, MER 8.8 dB". A ring
+scores ~7 dB against QPSK decisions, so it never locked: at Bn·T 0.008 the
+carrier loop is ~80 Hz wide at 10 kBd, too narrow for the LNB's phase noise.
+A decision-directed loop at 0.02–0.04 gives 15 dB on the same capture. The
+PSK demodulator now sets Bn·T = clamp(250 Hz / Rs, 0.008, 0.04) — unchanged
+from ~31 kBd up — and the capture demodulates at MER 12.4 dB.
+
+- The carrier: QPSK 10 240 Bd. Not plain QPSK-with-noise but proper QPSK
+  (symbol-to-symbol phase steps ¼ 0, ¼ ±π/2, ⅛ each ±π). A window-rank test
+  (rows of 40 symbol pairs: rank = 40 + code memory) found memory 6, and the
+  null space gave the taps of 133/171 written backwards — the K = 7 code of
+  DVB-S and IESS-308/309 (an earlier syndrome check of mine had the window
+  reversed). The DVB-S receiver did find rate 1/2 but restarted for want of
+  TS sync bytes: hence `ViterbiRx` (dvbs.rs) — the same blind search, no
+  transport layer — and the **Viterbi K=7** VFO decoder / `--decoder viterbi`.
+- On the capture: rate 1/2, mirrored, channel BER 7 × 10⁻⁴. Under V.35
+  (taps 3, 20) the data are 0x55 fill in 16-byte blocks (one varying byte,
+  cycling ff e0 00 5c / 00 1f ff a3, then 15 × 55h — 10 240 = 9600 × 16/15,
+  EDMAC-like) between half-second bursts of random-looking data. The payload
+  search now names a scrambler from idle fill alone (`Format::Idle`: bits
+  repeating 1, 2 or 8 back ≥ 75 %, once the framing formats had 8 probes).
+- A VFO publishes its status every 250 ms with no input as well: on a short
+  file played fast the last publish came before the FEC thread caught up.
+- The 128 kBd QPSK carrier next to them (Rory's second capture, MER 9.3 dB):
+  no K = 7 rate, no TPC 2964 UW, no repeating unique word in 8 s, not an
+  uncoded scrambled stream. Open; a long code (IESS-308 sequential K = 36)
+  is not ruled out at that error rate.
+
 ## DVB-CID (2026-10-09)
 
 Rory asked for "DVB-CI": the carrier ID (ETSI TS 103 129 V1.1.1, fetched

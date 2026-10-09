@@ -340,7 +340,10 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
             if s.decoder.outputs_ts() {
                 let ts = st.fec.as_ref().and_then(|f| f.ts.as_ref());
                 // A coded modem's raw data are recorded as well as the TS.
-                let tpc = matches!(s.decoder, DecoderKind::Tpc2964 | DecoderKind::FastLink);
+                let tpc = matches!(
+                    s.decoder,
+                    DecoderKind::Tpc2964 | DecoderKind::FastLink | DecoderKind::Viterbi
+                );
                 ui.label(if tpc { "Record" } else { "TS file" });
                 ui.horizontal(|ui| {
                     let (label, tip) = match (s.record, tpc) {
@@ -602,13 +605,13 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
 
     if matches!(
         v.settings.decoder,
-        DecoderKind::Tpc2964 | DecoderKind::FastLink
+        DecoderKind::Tpc2964 | DecoderKind::FastLink | DecoderKind::Viterbi
     ) && let Some(c) = &st.carrier
     {
-        if v.settings.decoder == DecoderKind::FastLink {
-            fastlink_card(ui, c, &st);
-        } else {
-            tpc_card(ui, c, &st);
+        match v.settings.decoder {
+            DecoderKind::FastLink => fastlink_card(ui, c, &st),
+            DecoderKind::Viterbi => viterbi_card(ui, c, &st),
+            _ => tpc_card(ui, c, &st),
         }
         if let Some(e) = st.fec.as_ref().and_then(|f| f.e1.as_ref()) {
             e1_card(ui, e, v, &mut actions);
@@ -1168,6 +1171,52 @@ fn cid_card(ui: &mut Ui, c: &decdvb_engine::CidView) {
             );
             ui.end_row();
         }
+    });
+}
+
+/// A K = 7 convolutional-code VFO: the carrier, the rate found, and what the
+/// data carry.
+fn viterbi_card(ui: &mut Ui, c: &CarrierState, st: &VfoStatus) {
+    let good = Color32::from_rgb(110, 220, 110);
+    let wait = Color32::from_rgb(240, 200, 80);
+    ui.add_space(6.0);
+    ui.label(RichText::new("Viterbi K=7 (IESS-308/309)").strong());
+    let f = st.fec.as_ref();
+    let v = f.and_then(|f| f.viterbi.as_ref());
+    egui::Grid::new("viterbi").num_columns(2).show(ui, |ui| {
+        carrier_rows(ui, c);
+        if let Some(rs) = st.symbol_rate {
+            ui.label("Symbol rate");
+            ui.label(format::rate(rs));
+            ui.end_row();
+        }
+        ui.label("Code");
+        match v.and_then(|v| v.rate.map(|r| (v, r))) {
+            Some((v, r)) => ui.colored_label(
+                good,
+                format!(
+                    "rate {} · {} · channel BER {:.1e}{}",
+                    r.name(),
+                    v.orientation.as_deref().unwrap_or("?"),
+                    v.channel_ber,
+                    if v.losses > 0 {
+                        format!(" · {} relocks", v.losses)
+                    } else {
+                        String::new()
+                    }
+                ),
+            ),
+            None => ui.colored_label(
+                wait,
+                format!("finding the rate… ({} tries)", v.map_or(0, |v| v.searches)),
+            ),
+        }
+        .on_hover_text(
+            "The 171/133 code of DVB-S and IESS-308/309, rate 1/2 to 7/8: rate, \
+             puncturing phase and orientation found by decoding and re-encoding.",
+        );
+        ui.end_row();
+        payload_rows(ui, f);
     });
 }
 
