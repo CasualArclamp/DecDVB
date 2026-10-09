@@ -30,7 +30,9 @@ use decdvb_modem::tpc2964::{Structure, TpcHdlcTx, modulate};
 
 pub const RATE: f64 = 8e6;
 
-struct Rng(u64);
+/// xorshift64* (test signals only). `pub(crate)`: visible to the other
+/// generators in this binary, not outside it.
+pub(crate) struct Rng(pub(crate) u64);
 impl Rng {
     fn next(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
@@ -41,7 +43,7 @@ impl Rng {
     fn uniform(&mut self) -> f64 {
         (self.next() >> 11) as f64 / (1u64 << 53) as f64
     }
-    fn gauss(&mut self) -> Iq {
+    pub(crate) fn gauss(&mut self) -> Iq {
         let u1 = self.uniform().max(1e-300);
         let u2 = self.uniform();
         let r = (-2.0 * u1.ln()).sqrt();

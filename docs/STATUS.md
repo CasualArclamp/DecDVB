@@ -957,3 +957,19 @@ the search that found the code (a single spike, and one bright cell near
 under it: peak 6.6 dB, found at code phase 1299. The frequency reads from
 Identify's estimate of the host's centre, here 310 Hz high, so the CID shows
 at −80 Hz rather than +220.
+
+## Test signals in tests/; a DVB-CID generator (2026-10-09)
+
+`decdvb cid` writes a DVB-S2 QPSK 1/2 carrier (1.12 MBd, α 0.20, the test
+TS) with a DVB-CID under it at 224 kchip/s, −27.5 dB, +220 Hz; 3.36 MS/s so
+both are whole samples (3 a symbol, 15 a chip). The CID frames cycle the
+fields set by the new `CidReport::set_position / set_telephone /
+set_user_text` (inverses of the decoders; §4.2's example bits come out
+exactly) two to a frame (`frame_fields`), the UW complemented on odd frames;
+the capture opens a second before a frame so the receiver is locked when it
+starts. 30 s holds one whole frame (identifier, position); all six take
+108 s. `decdvb test-signals [dir]` writes the scene and the CID capture into
+`tests/` (git keeps only its README). Checked with the CLI: the CID decodes
+(identifier, MAC, position), Identify calls the host DVB-S2 QPSK 1/2 with
+pilots, and its TS decodes. The CID's offset reads +523 Hz: Identify's
+centre for the host is ~300 Hz low, as on the GUI test (−80 Hz there).

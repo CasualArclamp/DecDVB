@@ -6,6 +6,9 @@
 /samples
 /captures
 /out
+# Test signals (`decdvb test-signals`): generated locally, never committed.
+/tests/*
+!/tests/README.md
 # Portable builds; the exes are published on GitHub releases instead.
 /exe/*.exe
 *.pcap

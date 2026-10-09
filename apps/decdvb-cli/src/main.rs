@@ -4,6 +4,7 @@
 //! file and report level/spectrum occupancy). `decode` and `modulate` arrive
 //! with the later milestones.
 
+mod cidgen;
 mod decode;
 mod scene;
 
@@ -83,6 +84,15 @@ enum Command {
         out: PathBuf,
         #[arg(long, default_value_t = 4.0)]
         seconds: f64,
+    },
+    /// Write a test capture of a DVB-S2 carrier with a DVB-CID (carrier ID,
+    /// ETSI TS 103 129) under it: identifier, position, telephone and text.
+    Cid(cidgen::CidArgs),
+    /// Write every test signal (the scene and the CID capture) into a
+    /// folder.
+    TestSignals {
+        #[arg(default_value = "tests")]
+        dir: PathBuf,
     },
     /// Survey a capture: find every carrier and identify each one blind.
     Scan {
@@ -176,6 +186,25 @@ fn main() -> Result<()> {
                 out.display(),
                 scene::RATE / 1e6
             );
+            Ok(())
+        }
+        Command::Cid(a) => {
+            let cycle = cidgen::write(&a)?;
+            println!("{}", cidgen::summary(&a, cycle));
+            Ok(())
+        }
+        Command::TestSignals { dir } => {
+            std::fs::create_dir_all(&dir)?;
+            let out = dir.join("decdvb-scene_8Msps.cs8");
+            scene::write(&out, 4.0)?;
+            println!(
+                "wrote {} — 4.0 s at {} MS/s, cs8",
+                out.display(),
+                scene::RATE / 1e6
+            );
+            let a = cidgen::CidArgs::defaults(dir.join(cidgen::DEFAULT_NAME));
+            let cycle = cidgen::write(&a)?;
+            println!("{}", cidgen::summary(&a, cycle));
             Ok(())
         }
         Command::Scan {

@@ -448,6 +448,86 @@ pub struct CidReport {
 }
 
 impl CidReport {
+    /// Set the position fields from degrees, north and east positive (the
+    /// inverse of [`CidReport::latitude`] and [`CidReport::longitude`]:
+    /// NMEA ddmm.mm and dddmm.mm in hundredths, shifted left 4 and 3, the
+    /// low bit set for south and west, §4.2).
+    pub fn set_position(&mut self, latitude: f64, longitude: f64) {
+        // Whole hundredths of a minute, so 59.996′ rounds up into the
+        // next degree rather than to 60.00′.
+        let nmea = |deg: f64| {
+            let h = (deg.abs() * 6000.0).round() as u32;
+            (h / 6000) * 10_000 + h % 6000
+        };
+        self.fields[1] = Some((nmea(latitude.clamp(-90.0, 90.0)) << 4) | u32::from(latitude < 0.0));
+        self.fields[2] =
+            Some((nmea(longitude.clamp(-180.0, 180.0)) << 3) | u32::from(longitude < 0.0));
+    }
+
+    /// Set the telephone fields (§4.2, table 2): 18 BCD digits, "ext" as
+    /// Dh, the rest filled with Fh. Anything else in `number` (spaces,
+    /// "+", dots) is skipped.
+    pub fn set_telephone(&mut self, number: &str) {
+        let lower = number.to_ascii_lowercase();
+        let (main, ext) = match lower.split_once("ext") {
+            Some((m, e)) => (m, Some(e)),
+            None => (lower.as_str(), None),
+        };
+        let digits = |t: &str| {
+            t.bytes()
+                .filter(u8::is_ascii_digit)
+                .map(|d| u32::from(d - b'0'))
+                .collect::<Vec<_>>()
+        };
+        let mut nibbles = digits(main);
+        if let Some(e) = ext {
+            nibbles.push(0xD);
+            nibbles.extend(digits(e));
+        }
+        nibbles.resize(18, 0xF);
+        for (k, six) in nibbles.chunks(6).enumerate() {
+            self.fields[3 + k] = Some(six.iter().fold(0, |a, &n| (a << 4) | n));
+        }
+    }
+
+    /// Set the user text fields (§4.2): up to 24 seven-bit ASCII
+    /// characters, NUL-padded; anything outside printable ASCII becomes "?".
+    pub fn set_user_text(&mut self, text: &str) {
+        let mut bits = Vec::with_capacity(168);
+        for c in text.chars().take(24) {
+            let c = if (' '..='~').contains(&c) {
+                c as u32
+            } else {
+                u32::from(b'?')
+            };
+            bits.extend((0..7).rev().map(|i| (c >> i) & 1));
+        }
+        bits.resize(168, 0);
+        for (k, f) in bits.chunks(24).enumerate() {
+            self.fields[6 + k] = Some(f.iter().fold(0, |a, &b| (a << 1) | b));
+        }
+    }
+
+    /// The fields set, two to a frame in content-ID order (a lone last one
+    /// shares its frame with the first): the frames a transmitter cycles
+    /// through.
+    pub fn frame_fields(&self) -> Vec<[Field; 2]> {
+        let set: Vec<Field> = self
+            .fields
+            .iter()
+            .enumerate()
+            .filter_map(|(id, v)| {
+                v.map(|info| Field {
+                    content_id: id as u8,
+                    info,
+                })
+            })
+            .collect();
+        set.chunks(2)
+            .map(|p| [p[0], *p.get(1).unwrap_or(&set[0])])
+            .collect()
+    }
+
     pub fn add(&mut self, f: &CidFrame) {
         self.guid = Some(f.guid);
         for field in f.fields {
@@ -979,6 +1059,34 @@ mod tests {
         }
         assert_eq!(bch_correct(&mut w), Some(6));
         assert_eq!(w, clean);
+    }
+
+    #[test]
+    fn report_fields_encode_and_decode() {
+        let mut r = CidReport::default();
+        r.set_position(-(12.0 + 45.9 / 60.0), 23.0 + 34.45 / 60.0);
+        // §4.2's own example bits.
+        assert_eq!(r.fields[1], Some(0b0001_1110_0110_1010_1110_0001));
+        assert_eq!(r.fields[2], Some(0b0001_1100_0111_1111_0010_1000));
+        r.set_position(51.4779, -0.0015);
+        let (lat, lon) = (r.latitude().unwrap(), r.longitude().unwrap());
+        assert!(
+            (lat - 51.4779).abs() < 1e-4 && (lon - -0.0015).abs() < 1e-4,
+            "{lat} {lon}"
+        );
+        r.set_telephone("+1 480 333 2200 ext. 1835");
+        assert_eq!(r.telephone().as_deref(), Some("+14803332200 ext. 1835"));
+        r.set_user_text("DecDVB test carrier");
+        assert_eq!(r.user_text().as_deref(), Some("DecDVB test carrier"));
+        // Two fields a frame; 12 set, so 6 frames, every ID once.
+        let frames = r.frame_fields();
+        assert_eq!(frames.len(), 6);
+        let mut back = CidReport::default();
+        for (k, pair) in frames.iter().enumerate() {
+            let bits = build_frame(7, *pair, k % 2 == 1);
+            back.add(&parse_frame(&bits).expect("a frame"));
+        }
+        assert_eq!(back.fields[1..], r.fields[1..]);
     }
 
     #[test]

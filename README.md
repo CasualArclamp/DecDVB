@@ -220,11 +220,17 @@ operator entered them, its position, a telephone number and a short text.
 Put a **Carrier ID (DVB-CID)** VFO on a carrier (at least 1.35 × the chip
 rate wide: 151 kHz below 512 kBd, 302 kHz above): it measures the carrier,
 searches for the spreading code (a fraction of a second), then reads frames —
-one every 36 s (18 s on carriers of 512 kBd and up). Offline:
+one every 36 s (18 s on carriers of 512 kBd and up). Under **Code search** the
+card shows the acquisition itself: correlation over the 4096 code phases, and
+code phase × frequency around the peak. Offline:
 
 ```bash
 decdvb decode capture_1000000Sps.cf32 --decoder cid --fast
 ```
+
+No CID to hand? `decdvb cid` writes one under a DVB-S2 carrier, with your
+choice of identifier, position, telephone and text (see
+[`tests/`](tests/README.md)).
 
 ### Generic PSK → symbols
 
@@ -301,6 +307,8 @@ demodulating with what it found, so the constellation and MER stay live.
 ```bash
 decdvb scan capture_8Msps.cs8     # find every carrier and identify each
 decdvb scene                      # write the 8 MS/s test scene above
+decdvb cid                        # a DVB-S2 carrier with a DVB-CID under it
+decdvb test-signals tests         # both, into tests/ (see tests/README.md)
 decdvb modcods                    # the DVB-S2 MODCOD table
 ```
 
