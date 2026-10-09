@@ -279,6 +279,31 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                 ui.end_row();
             }
 
+            if s.decoder == DecoderKind::CarrierId {
+                ui.label("Sensitivity");
+                let b = egui::Button::new(if s.cid_low_snr {
+                    "Low-SNR mode: on"
+                } else {
+                    "Low-SNR mode: off"
+                })
+                .selected(s.cid_low_snr);
+                if ui
+                    .add(b)
+                    .on_hover_text(
+                        "For a CID far under its carrier (a code-search peak around 2 dB): \
+                         searches start at 96 bits and go to 384 (7 s of signal at 224 \
+                         kchip/s), lock at a looser threshold (down to 1.3 dB — a false \
+                         lock in about one search in a hundred, which the tracker drops), \
+                         and track with gentle loops and a Costas loop throughout. Frames \
+                         decode down to about 1 dB a bit.",
+                    )
+                    .clicked()
+                {
+                    s.cid_low_snr = !s.cid_low_snr;
+                }
+                ui.end_row();
+            }
+
             if s.decoder == DecoderKind::FastLink {
                 ui.label("Auto-record");
                 ui.checkbox(&mut s.record_on_activity, "when a TDM channel goes active")
@@ -1167,12 +1192,19 @@ fn cid_card(ui: &mut Ui, c: &decdvb_engine::CidView) {
                 ),
             );
         } else {
-            ui.colored_label(wait, format!("searching… ({} tries)", s.searches))
-                .on_hover_text(
-                    "4096 chips a bit, ±1.7 kHz around the carrier's centre. A CID sits \
+            ui.colored_label(
+                wait,
+                format!(
+                    "searching… ({} tries{})",
+                    s.searches,
+                    if c.low_snr { ", low-SNR mode" } else { "" }
+                ),
+            )
+            .on_hover_text(
+                "4096 chips a bit, ±1.7 kHz around the carrier's centre. A CID sits \
                      27.5 dB under its carrier; a frame takes 976 bits (36 s at \
                      112 kchip/s, 18 s at 224).",
-                );
+            );
         }
         ui.end_row();
         if s.acquired {

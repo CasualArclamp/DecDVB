@@ -161,6 +161,9 @@ pub struct VfoSettings {
     /// Q-Flex FastLink: record the data whenever a channel of the TDM
     /// multiplex inside goes active (the 10 s before included).
     pub record_on_activity: bool,
+    /// DVB-CID: low-SNR mode (searches 96–384 bits deep, a looser
+    /// threshold, gentle tracking throughout) for a CID far under spec.
+    pub cid_low_snr: bool,
     /// Write the decoder's output to a file: symbols (generic PSK) or IP
     /// packets as PCAP (DVB-S2 → GSE/IP). Off by default — the decoder shows
     /// what it finds until recording is asked for.
@@ -205,6 +208,7 @@ impl VfoSettings {
             find_text: true,
             symbol_labels: crate::psk::SymbolLabels::Standard,
             record_on_activity: false,
+            cid_low_snr: false,
             record: false,
             gse_variant: None,
             // Local only: a player on this machine. Point them elsewhere on
@@ -871,7 +875,10 @@ impl Worker {
                 }
             },
             Decoder::Cid { buf, worker } => match worker {
-                Some(w) => w.offer(self.bb.clone()),
+                Some(w) => {
+                    w.set_low_snr(self.settings.cid_low_snr);
+                    w.offer(self.bb.clone());
+                }
                 None => {
                     buf.extend_from_slice(&self.bb);
                     if buf.len() >= first_look(out_rate) {

@@ -143,6 +143,9 @@ enum Command {
         /// by position (`natural`), or Gray-coded by position (`gray`).
         #[arg(long, default_value = "standard")]
         labels: String,
+        /// cid: low-SNR mode (searches 96–384 bits deep, looser threshold).
+        #[arg(long)]
+        low_snr: bool,
     },
 }
 
@@ -230,6 +233,7 @@ fn main() -> Result<()> {
             fast,
             e1_record,
             labels,
+            low_snr,
         } => decode::decode(decode::DecodeArgs {
             file,
             format,
@@ -243,6 +247,7 @@ fn main() -> Result<()> {
             fast,
             e1_record,
             labels,
+            low_snr,
         }),
     }
 }

@@ -1136,3 +1136,24 @@ real CID ~10 dB under the specified level. For those:
   chance match fails the CRC).
 Test (ignored, `--release`): a CID 41 dB under the noise (~1.4 dB a bit)
 is found by a deeper search, tracked, and its frame decoded.
+
+## DVB-CID low-SNR mode (2026-10-09)
+
+A "Low-SNR mode" button on the Carrier ID VFO (`VfoSettings::cid_low_snr`,
+CLI `--low-snr`), taken up by the CID thread live: searches start at 96
+bits and go to 384 (7 s at 224 kchip/s), with a false lock allowed once in
+100 searches (thresholds 2.6, 1.7, 1.3 dB); tracking is the deep kind
+throughout. Searches now run on up to 8 cores (each bit's spectrum once,
+the cells split across threads). Deep tracking gained:
+- a Costas loop after a 200-bit frequency pull-in (wide ~4 Hz for 300 bits,
+  then ~1.5 Hz), so bits are detected coherently;
+- the acquisition's code phase interpolated to a quarter chip, and the
+  timing loop quick for 200 bits then slow;
+- in low-SNR mode the frame's four copies combined coherently (each copy's
+  sign from correlating whole copies) before the differential decoding,
+  the summed-differential way as fallback.
+Measured (simulation, CID at x dB under unit noise a sample, 4 per chip):
+normal mode locks to −42..−43 dB; low-SNR mode to −46 dB (−45: normal
+cannot, low can — test); frames decode to about −42 dB (~1 dB a bit) in
+either. Tracking shows ~0.6–1.3 dB less than ideal: the 4-per-chip grid
+(chip edges between samples) and timing dither — 8 per chip would halve it.

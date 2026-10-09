@@ -3,7 +3,7 @@
 //! the CID's band kept, then the signal is resampled to four samples per
 //! chip for `decdvb_modem::cid::CidRx`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -31,6 +31,8 @@ pub struct CidView {
     /// The VFO is wide enough for the CID's whole band (1.35 × chip rate).
     pub wide_enough: bool,
     pub stats: CidStats,
+    /// Low-SNR mode is on (deep searches to 384 bits, looser threshold).
+    pub low_snr: bool,
     /// Blocks dropped because the thread was behind.
     pub dropped: u64,
 }
@@ -53,6 +55,9 @@ pub(crate) struct CidWorker {
     /// Samples lost and not yet reported to the thread. `AtomicU64`: a
     /// counter changed through a shared reference (`offer` takes `&self`).
     gap: AtomicU64,
+    /// Low-SNR mode, read by the thread before each block (`Arc`: owned by
+    /// both this handle and the thread).
+    low_snr: Arc<AtomicBool>,
 }
 
 impl CidWorker {
@@ -76,6 +81,8 @@ impl CidWorker {
             ..Default::default()
         }));
         let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE);
+        let low_snr = Arc::new(AtomicBool::new(false));
+        let low = Arc::clone(&low_snr);
         let v = view.clone();
         let join = std::thread::Builder::new()
             .name("decdvb-cid".into())
@@ -102,8 +109,11 @@ impl CidWorker {
                     at4.clear();
                     rs.process(&mixed, &mut at4);
                     frames.clear();
+                    cid.set_low_snr(low.load(Ordering::Relaxed));
                     cid.push(&at4, &mut frames);
-                    v.lock().unwrap().stats = cid.stats.clone();
+                    let mut view = v.lock().unwrap();
+                    view.stats = cid.stats.clone();
+                    view.low_snr = cid.low_snr();
                 }
             })
             .expect("spawn CID thread");
@@ -113,7 +123,13 @@ impl CidWorker {
             join: Some(join),
             lossless,
             gap: AtomicU64::new(0),
+            low_snr,
         }
+    }
+
+    /// Low-SNR mode on or off (taken up with the next block).
+    pub fn set_low_snr(&self, on: bool) {
+        self.low_snr.store(on, Ordering::Relaxed);
     }
 
     /// Queue a block of the VFO's baseband; drop it (counted, and its

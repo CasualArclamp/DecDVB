@@ -698,9 +698,25 @@ const PROFILE_POINTS: usize = 512;
 /// nothing, 48 and 96 — each doubling lowers the level noise can reach,
 /// and so the threshold, by 1–1.2 dB.
 const ACQ_LEVELS: [usize; 4] = [24, 48, 96, 192];
+/// Low-SNR mode: deep from the start, to 384 bits (7 s at 224 kchip/s),
+/// and a false lock allowed in one search in a hundred (the tracker drops
+/// one within seconds): thresholds 2.6, 1.7, 1.2 dB — a CID peaking near
+/// 2 dB stands clear.
+const ACQ_LEVELS_LOW: [usize; 3] = [96, 192, 384];
+const ACQ_FALSE_RATE_LOW: f64 = 1e-2;
 /// Levels from here on are deep: the CID found this way is weak (about 0
 /// dB a bit), so tracking holds on with gentler loops and a lower floor.
 const DEEP: usize = 2;
+/// Deep tracking: bits of frequency pull-in before the Costas loop takes
+/// over, and its gains.
+const PLL_AFTER: u32 = 200;
+/// The loop's gains: wide (~4 Hz, ωₙT ≈ 0.14) for 300 bits to pull in what
+/// the frequency loop left (a few Hz), then narrow (~1.5 Hz, ωₙT ≈ 0.05).
+const PLL_WIDE: u32 = 300;
+const PLL_K1_WIDE: f64 = 0.2;
+const PLL_K2_WIDE: f64 = 0.02;
+const PLL_K1: f64 = 0.073;
+const PLL_K2: f64 = 0.0027;
 const ACQ_ESCALATE: u32 = 3;
 /// How far either side of ±220 Hz to look, by default.
 pub const ACQ_SPAN_HZ: f64 = 1500.0;
@@ -713,8 +729,8 @@ const ACQ_FALSE_RATE: f64 = 1e-4;
 /// (Chernoff); x is set so that the largest of the cells does that once in
 /// 1/ACQ_FALSE_RATE searches. (~1 M cells: 24 bits 4.9 dB, 48 bits 3.7 dB,
 /// 96 bits 2.7 dB.)
-fn acq_threshold(bits: usize, cells: usize) -> f32 {
-    let target = (cells as f64 / ACQ_FALSE_RATE).ln() / bits as f64;
+fn acq_threshold(bits: usize, cells: usize, false_rate: f64) -> f32 {
+    let target = (cells as f64 / false_rate).ln() / bits as f64;
     // x − 1 − ln x rises from 0 at x = 1: bisect.
     let (mut lo, mut hi) = (1.0f64, 20.0f64);
     for _ in 0..60 {
@@ -751,6 +767,14 @@ pub struct CidRx {
     power: f32,
     noise: f32,
     soft: Vec<f32>,
+    /// Each bit (the newer of `soft`'s pair) detected coherently: turned by
+    /// the phase of the bits' squares averaged over ~10 bits, over the bit
+    /// amplitude. Low-SNR mode combines the frame's four copies on these
+    /// before the differential decoding.
+    coh: Vec<f32>,
+    coh_ref: Iq,
+    /// Bits since the code was found.
+    since_lock: u32,
     /// Bits already taken by a decoded frame (an index into `soft`).
     next_frame: Option<usize>,
     /// The display's phase reference: the bits' squares averaged (the
@@ -763,6 +787,8 @@ pub struct CidRx {
     level: usize,
     fails: u32,
     span_hz: f64,
+    /// Low-SNR mode (see ACQ_LEVELS_LOW).
+    low_snr: bool,
     /// The half-bit frequency estimate, averaged (it resolves the quiet
     /// detector's ambiguity; one bit's is too noisy for a weak CID).
     coarse_avg: f64,
@@ -792,12 +818,16 @@ impl CidRx {
             power: 0.0,
             noise: 0.0,
             soft: Vec::new(),
+            coh: Vec::new(),
+            coh_ref: Iq::new(0.0, 0.0),
+            since_lock: 0,
             next_frame: None,
             disp: Iq::new(0.0, 0.0),
             epl_avg: [0.0; 3],
             level: 0,
             fails: 0,
             span_hz: ACQ_SPAN_HZ,
+            low_snr: false,
             coarse_avg: 0.0,
             stats: CidStats::default(),
         }
@@ -839,6 +869,30 @@ impl CidRx {
         }
     }
 
+    /// Low-SNR mode on or off: searches start deep and go to 384 bits with
+    /// a looser threshold, and tracking is the gentle kind throughout. (A
+    /// search under way restarts at the mode's first depth.)
+    pub fn set_low_snr(&mut self, on: bool) {
+        if on != self.low_snr {
+            self.low_snr = on;
+            self.level = 0;
+            self.fails = 0;
+        }
+    }
+
+    pub fn low_snr(&self) -> bool {
+        self.low_snr
+    }
+
+    /// The search depths of the mode, and its false-lock rate.
+    fn levels(&self) -> (&'static [usize], f64) {
+        if self.low_snr {
+            (&ACQ_LEVELS_LOW, ACQ_FALSE_RATE_LOW)
+        } else {
+            (&ACQ_LEVELS, ACQ_FALSE_RATE)
+        }
+    }
+
     /// Search ±(220 Hz + `span_hz`) about the centre rather than the default
     /// (a host whose centre is only roughly known).
     pub fn with_span(mut self, span_hz: f64) -> Self {
@@ -851,7 +905,8 @@ impl CidRx {
     fn acquire(&mut self) -> bool {
         let l4 = CHIPS * SPS;
         let l2 = 2 * CHIPS;
-        let acq_bits = ACQ_LEVELS[self.level];
+        let (levels, false_rate) = self.levels();
+        let acq_bits = levels[self.level];
         if self.held.len() < acq_bits * l4 + 4 {
             return false;
         }
@@ -867,38 +922,68 @@ impl CidRx {
             .iter()
             .map(|p| (p[0] + p[1]) * 0.5)
             .collect();
-        let cells = 2 * (2 * k_max as usize + 1);
+        let n_k = 2 * k_max as usize + 1;
+        let cells = 2 * n_k;
+        // Each bit period's spectrum, plain and shifted half a bin (for the
+        // in-between frequencies): spectra[2·b + half].
+        let shift: Vec<Iq> = (0..l2)
+            .map(|n| Iq::from_polar(1.0, -std::f32::consts::PI * n as f32 / l2 as f32))
+            .collect();
+        let spectra: Vec<Vec<Iq>> = (0..2 * acq_bits)
+            .map(|i| {
+                let (b, half) = (i / 2, i % 2);
+                let mut s: Vec<Iq> = x2[b * l2..(b + 1) * l2].to_vec();
+                if half == 1 {
+                    for (v, r) in s.iter_mut().zip(&shift) {
+                        *v *= r;
+                    }
+                }
+                self.fft.process(&mut s);
+                s
+            })
+            .collect();
+        // Cells over the cores: each thread owns a run of cells (code phase
+        // × one frequency) and walks the bit periods in order, so each
+        // spectrum is read from cache by every cell it serves.
+        // (`thread::scope` lets the threads borrow `spectra` and their slice
+        // of `acc`, and joins them before it returns.)
         let mut acc = vec![0f32; cells * l2];
-        let mut spec = vec![Iq::new(0.0, 0.0); l2];
-        let mut work = vec![Iq::new(0.0, 0.0); l2];
-        for b in 0..acq_bits {
-            for half in 0..2 {
-                // A half-bin shift for the in-between frequencies.
-                for (n, s) in spec.iter_mut().enumerate() {
-                    let ph = -std::f64::consts::PI * half as f64 * n as f64 / l2 as f64;
-                    *s = x2[b * l2 + n] * Iq::new(ph.cos() as f32, ph.sin() as f32);
-                }
-                self.fft.process(&mut spec);
-                for k in -k_max..=k_max {
-                    for (m, w) in work.iter_mut().enumerate() {
-                        let src = (m as isize + k).rem_euclid(l2 as isize) as usize;
-                        *w = spec[src] * self.code2_conj[m];
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .clamp(1, 8);
+        let per = cells.div_ceil(threads);
+        let (ifft, code) = (&self.ifft, &self.code2_conj);
+        std::thread::scope(|scope| {
+            for (t, chunk) in acc.chunks_mut(per * l2).enumerate() {
+                let spectra = &spectra;
+                scope.spawn(move || {
+                    let mut work = vec![Iq::new(0.0, 0.0); l2];
+                    let mut scratch = vec![Iq::new(0.0, 0.0); ifft.get_inplace_scratch_len()];
+                    for b in 0..acq_bits {
+                        for (c, a) in chunk.chunks_mut(l2).enumerate() {
+                            let cell = t * per + c;
+                            let (half, k) = (cell / n_k, (cell % n_k) as isize - k_max);
+                            let spec = &spectra[2 * b + half];
+                            for (m, w) in work.iter_mut().enumerate() {
+                                let src = (m as isize + k).rem_euclid(l2 as isize) as usize;
+                                *w = spec[src] * code[m];
+                            }
+                            ifft.process_with_scratch(&mut work, &mut scratch);
+                            for (x, w) in a.iter_mut().zip(&work) {
+                                *x += w.norm_sqr();
+                            }
+                        }
                     }
-                    self.ifft.process(&mut work);
-                    let cell = half * (2 * k_max as usize + 1) + (k + k_max) as usize;
-                    for (a, w) in acc[cell * l2..(cell + 1) * l2].iter_mut().zip(&work) {
-                        *a += w.norm_sqr();
-                    }
-                }
+                });
             }
-        }
+        });
         let mean = acc.iter().sum::<f32>() / acc.len() as f32;
         let (best, &peak) = acc
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(b.1))
             .expect("cells");
-        let threshold = acq_threshold(acq_bits, acc.len());
+        let threshold = acq_threshold(acq_bits, acc.len(), false_rate);
         let map = search_map(&acc, mean, best, k_max, bin, threshold, acq_bits);
         self.stats.search = Some(Arc::new(map));
         if peak < threshold * mean {
@@ -906,7 +991,7 @@ impl CidRx {
             // after a few, look deeper.
             self.held.drain(..(acq_bits - 1) * l4);
             self.fails += 1;
-            if self.fails >= ACQ_ESCALATE && self.level + 1 < ACQ_LEVELS.len() {
+            if self.fails >= ACQ_ESCALATE && self.level + 1 < levels.len() {
                 self.level += 1;
                 self.fails = 0;
             }
@@ -929,8 +1014,25 @@ impl CidRx {
                 freq += (0.5 * (ym - yp) / den).clamp(-0.5, 0.5) * 0.5 * bin;
             }
         }
-        // A bit starts at sample `2·lag` (four per chip) in the block.
-        self.track = Some((2 * lag, 0.0, freq, 0.0, Iq::new(0.0, 0.0)));
+        // A bit starts at sample `2·lag` (four per chip) in the block — to a
+        // quarter chip, the neighbouring code phases say which side (a weak
+        // CID's slow timing loop would take hundreds of bits to get there).
+        let row = &acc[cell * l2..(cell + 1) * l2];
+        let (lm, l0, lp) = (
+            f64::from(row[(lag + l2 - 1) % l2]),
+            f64::from(row[lag]),
+            f64::from(row[(lag + 1) % l2]),
+        );
+        let den = lm - 2.0 * l0 + lp;
+        let nudge = if den < 0.0 {
+            // In half chips, then samples (two a half chip), rounded.
+            (0.5 * (lm - lp) / den * 2.0).round().clamp(-1.0, 1.0) as isize
+        } else {
+            0
+        };
+        let start = (2 * lag as isize + nudge).max(0) as usize;
+        self.track = Some((start, 0.0, freq, 0.0, Iq::new(0.0, 0.0)));
+        self.since_lock = 0;
         self.stats.acquired = true;
         self.stats.offset_hz = freq;
         self.weak = 0;
@@ -1004,7 +1106,7 @@ impl CidRx {
         // weak CID's ratio wanders under the floor now and then, noise's
         // stays there. (Found deep, the floor is 1 dB: a CID ~0 dB a bit
         // sits near 2.)
-        let deep = self.level >= DEEP;
+        let deep = self.low_snr || self.level >= DEEP;
         let floor = if deep { 1.25 } else { 2.0 };
         self.weak = if self.power < floor * self.noise {
             self.weak + 1
@@ -1017,6 +1119,7 @@ impl CidRx {
             self.held.drain(..t);
             self.next_frame = None;
             self.soft.clear();
+            self.coh.clear();
             return false;
         }
         // For display: the bit turned onto the real axis, at unit power.
@@ -1037,10 +1140,22 @@ impl CidRx {
         live.epl = self.epl_avg.map(|a| a / pn);
         // Differential detection: the phase step from the last bit.
         let mut freq = freq;
+        // Deep, once pulled in: a Costas loop holds the carrier's phase, so
+        // a bit is its real part. Before that, the phase of the bits'
+        // squares averaged (squares remove the data; the 180° left is the
+        // differential decoding's to take care of).
+        let pll = deep && self.since_lock >= PLL_AFTER;
+        self.coh_ref = self.coh_ref * 0.9 + p * p * 0.1;
+        let coherent = if pll {
+            p.re * scale
+        } else {
+            (p * Iq::from_polar(1.0, -self.coh_ref.arg() / 2.0)).re * scale
+        };
         if prev.norm_sqr() > 0.0 {
             let d = p * prev.conj();
             let soft = d.re / self.power.max(1e-30);
             self.soft.push(soft);
+            self.coh.push(coherent);
             CidLive::keep(&mut live.diffs, d * scale * scale, LIVE_BITS);
             CidLive::keep(&mut live.soft, soft, FRAME_BITS);
             self.stats.bits += 1;
@@ -1060,7 +1175,20 @@ impl CidRx {
         };
         self.coarse_avg = 0.9 * self.coarse_avg + 0.1 * coarse_hz;
         let gain = if deep { 0.01 } else { 0.1 };
-        if prev.norm_sqr() > 0.0 {
+        let mut phase_fix = 0.0;
+        if pll {
+            // Costas, second order, ~1.5 Hz: phase error from the square
+            // (data gone), corrections k₁ to the phase, k₂ to the
+            // frequency (ωₙT ≈ 0.05 at 55 bit/s, ζ = 0.7).
+            let err = f64::from((p * p).arg()) / 2.0;
+            let (k1, k2) = if self.since_lock < PLL_AFTER + PLL_WIDE {
+                (PLL_K1_WIDE, PLL_K2_WIDE)
+            } else {
+                (PLL_K1, PLL_K2)
+            };
+            phase_fix = k1 * err / std::f64::consts::TAU;
+            freq += k2 * err / (std::f64::consts::TAU * bit_s);
+        } else if prev.norm_sqr() > 0.0 {
             let d = p * prev.conj();
             let fine_hz = f64::from((d * d).arg()) / 2.0 / (std::f64::consts::TAU * bit_s);
             let amb = 1.0 / (2.0 * bit_s);
@@ -1073,7 +1201,14 @@ impl CidRx {
         }
         // Timing: early against late, a quarter chip either side.
         let (ea, la) = (e.norm(), l.norm());
-        let dll = if deep { 0.05 } else { 0.2 };
+        // Deep: quicker for the first 200 bits (pulling in), then slow (a
+        // CID's chip timing barely moves; the discriminator is noisy).
+        self.since_lock += 1;
+        let dll = match (deep, self.since_lock < 200) {
+            (false, _) => 0.2,
+            (true, true) => 0.05,
+            (true, false) => 0.01,
+        };
         let mut terr = terr + dll * f64::from((ea - la) / (ea + la).max(1e-30));
         let mut next = t + l4;
         if terr > 0.5 {
@@ -1083,7 +1218,7 @@ impl CidRx {
             next += 1;
             terr += 1.0;
         }
-        let phase = (phase + freq * (next - t) as f64 / self.fs).fract();
+        let phase = (phase + freq * (next - t) as f64 / self.fs + phase_fix).rem_euclid(1.0);
         self.stats.offset_hz = freq;
         self.track = Some((next, phase, freq, terr, p));
         true
@@ -1144,6 +1279,33 @@ impl CidRx {
         }
     }
 
+    /// The first `n` bits of a frame starting at `p` (≥ 1), its four copies
+    /// combined coherently: each copy's sign lined up with the first's by
+    /// correlating whole copies (the differential encoder may start a copy
+    /// either way up), summed, then differentially decoded.
+    fn coherent_bits(&self, p: usize, n: usize) -> Vec<u8> {
+        let c = &self.coh;
+        let sign = |r: usize| {
+            let dot: f32 = (0..FRAME_BITS)
+                .map(|i| c[p + r * FRAME_BITS + i] * c[p + i])
+                .sum();
+            if dot < 0.0 { -1.0 } else { 1.0 }
+        };
+        let signs: Vec<f32> = (0..REPEAT)
+            .map(|r| if r == 0 { 1.0 } else { sign(r) })
+            .collect();
+        let sum = |i: usize| -> f32 {
+            (0..REPEAT)
+                .map(|r| signs[r] * c[p - 1 + r * FRAME_BITS + i])
+                .sum()
+        };
+        // sum(i) is bit i − 1 of the frame; a bit is 1 where the phase
+        // turned over from the one before.
+        (1..=n)
+            .map(|i| u8::from(sum(i) * sum(i - 1) < 0.0))
+            .collect()
+    }
+
     /// Find frames in the bits: the unique word four times, 244 bits apart.
     fn frames(&mut self, out: &mut Vec<CidFrame>) {
         let span = REPEAT * FRAME_BITS;
@@ -1169,11 +1331,24 @@ impl CidRx {
                         (v ^ UW).count_ones().min((v ^ !UW & UW_MASK).count_ones()) <= 3
                     };
                     let last = self.soft.len() - span;
-                    match (0..=last).find(|&p| uw_at(p)) {
+                    let low = self.low_snr;
+                    let found = (0..=last).find(|&p| {
+                        if low {
+                            p >= 1 && {
+                                let bits = self.coherent_bits(p, UW_BITS);
+                                let v = bits.iter().fold(0u32, |a, &b| (a << 1) | u32::from(b));
+                                (v ^ UW).count_ones().min((v ^ !UW & UW_MASK).count_ones()) <= 3
+                            }
+                        } else {
+                            uw_at(p)
+                        }
+                    });
+                    match found {
                         Some(p) => p,
                         None => {
                             // Keep the tail where a frame could still start.
                             self.soft.drain(..last);
+                            self.coh.drain(..last);
                             return;
                         }
                     }
@@ -1191,7 +1366,15 @@ impl CidRx {
                     )
                 })
                 .collect();
-            match parse_frame(&combined) {
+            // Low-SNR mode: the coherent combination first, the summed
+            // differential decisions if that fails.
+            let parsed = if self.low_snr && start >= 1 {
+                parse_frame(&self.coherent_bits(start, FRAME_BITS))
+                    .or_else(|| parse_frame(&combined))
+            } else {
+                parse_frame(&combined)
+            };
+            match parsed {
                 Some(f) => {
                     self.stats.frames += 1;
                     self.stats.scrambler = Some(f.scrambler);
@@ -1203,6 +1386,7 @@ impl CidRx {
                     self.stats.bad_frames += 1;
                     self.next_frame = None;
                     self.soft.drain(..start + 1);
+                    self.coh.drain(..start + 1);
                     continue;
                 }
             }
@@ -1211,6 +1395,7 @@ impl CidRx {
                 && p > 4 * span
             {
                 self.soft.drain(..p);
+                self.coh.drain(..p);
                 self.next_frame = Some(0);
             }
         }
@@ -1314,7 +1499,7 @@ mod tests {
     #[test]
     fn deeper_searches_lower_the_threshold() {
         let cells = 1_060_000;
-        let db = |b| 10.0 * acq_threshold(b, cells).log10();
+        let db = |b| 10.0 * acq_threshold(b, cells, ACQ_FALSE_RATE).log10();
         assert!((db(24) - 4.9).abs() < 0.15, "{}", db(24));
         assert!((db(48) - 3.7).abs() < 0.15, "{}", db(48));
         assert!((db(96) - 2.7).abs() < 0.15, "{}", db(96));
@@ -1469,10 +1654,9 @@ mod tests {
         (rx, out)
     }
 
-    /// Heavy (a minute in a debug build): run with `--ignored --release`.
-    #[test]
-    #[ignore]
-    fn finds_and_reads_a_cid_near_0_db_a_bit() {
+    /// A CID `db` under the noise (in a sample), the receiver in low-SNR
+    /// mode or not: (receiver, frames).
+    fn weak_cid(db: f32, low_snr: bool) -> (CidRx, Vec<CidFrame>) {
         // About 1.4 dB a bit after despreading (41 dB under the noise in
         // the band): the 24-bit search cannot see it, a deeper one can;
         // tracking holds at that level and the frame decodes from its four
@@ -1520,9 +1704,10 @@ mod tests {
             }
             a * 1.732
         };
-        let amp = 10f32.powf(-41.0 / 20.0);
+        let amp = 10f32.powf(db / 20.0);
         let skip = 500 * CHIPS * SPS + 999;
         let mut rx = CidRx::new(chip_rate);
+        rx.set_low_snr(low_snr);
         let mut out = Vec::new();
         let mut block = Vec::with_capacity(100_000);
         for n in skip..(chips.len() + 4 * CHIPS) * SPS {
@@ -1542,6 +1727,20 @@ mod tests {
             }
         }
         rx.push(&block, &mut out);
+        (rx, out)
+    }
+
+    /// Heavy (a minute in a debug build): run with `--ignored --release`.
+    #[test]
+    #[ignore]
+    fn finds_and_reads_a_cid_near_0_db_a_bit() {
+        // About 1.4 dB a bit after despreading (41 dB under the noise in
+        // the band): the 24-bit search cannot see it, a deeper one can;
+        // tracking holds at that level and the frame decodes from its four
+        // copies summed.
+        let guid = 0x0006_B0FF_FF01_AC07;
+        let f0 = 180.0;
+        let (rx, out) = weak_cid(-41.0, false);
         let m = rx.stats.search.as_deref().expect("searched");
         assert!(
             m.bits >= 48,
@@ -1564,6 +1763,26 @@ mod tests {
             (rx.stats.live.uw_copies, rx.stats.live.aligned)
         );
         assert!(out.iter().all(|f| f.guid == guid));
+    }
+
+    /// Heavy: run with `--ignored --release`.
+    #[test]
+    #[ignore]
+    fn low_snr_mode_locks_where_normal_mode_cannot() {
+        // About −4 dB a bit (45 dB under the noise): the normal searches
+        // top out at 192 bits, the peak (~1.5 dB) under their threshold;
+        // low-SNR mode's 384-bit searches, looser threshold (1.3 dB) find
+        // and hold it. (Frames decode down to about −42 dB, ~1 dB a bit.)
+        let (normal, _) = weak_cid(-45.0, false);
+        assert!(!normal.stats.acquired, "normal mode locked");
+        let (low, _) = weak_cid(-45.0, true);
+        assert!(low.stats.acquired, "{} searches", low.stats.searches);
+        assert_eq!(low.stats.search.as_deref().map(|m| m.bits), Some(384));
+        assert!(
+            (low.stats.offset_hz - 180.0).abs() < 10.0,
+            "{} Hz",
+            low.stats.offset_hz
+        );
     }
 
     #[test]

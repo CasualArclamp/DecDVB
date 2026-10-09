@@ -25,6 +25,8 @@ pub struct DecodeArgs {
     pub e1_record: Option<u8>,
     /// psk: how the .bin numbers the symbols.
     pub labels: String,
+    /// cid: low-SNR mode.
+    pub low_snr: bool,
 }
 
 fn decoder_by_name(name: &str) -> Result<DecoderKind> {
@@ -94,6 +96,7 @@ pub fn decode(a: DecodeArgs) -> Result<()> {
             other => bail!("--labels: `{other}` (want standard, natural or gray)"),
         };
     }
+    s.cid_low_snr = a.low_snr;
     if let Some(dir) = &a.out {
         s.record = true;
         s.record_dir = dir.clone();
