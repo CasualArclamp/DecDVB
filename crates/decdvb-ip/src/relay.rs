@@ -71,9 +71,11 @@ fn local_sdp(s: &AudioStream, port: u16) -> String {
     let lines: Vec<String> = match &s.sdp {
         Some(sdp) => {
             let mut done_m = false;
+            // Any line ending (some encoders end lines in a bare CR); the
+            // file written uses CRLF throughout.
             sdp.raw
-                .lines()
-                .map(|l| l.trim_end_matches('\r'))
+                .split(['\r', '\n'])
+                .filter(|l| !l.is_empty())
                 .map(|l| {
                     if l.starts_with("c=") {
                         "c=IN IP4 127.0.0.1".to_string()

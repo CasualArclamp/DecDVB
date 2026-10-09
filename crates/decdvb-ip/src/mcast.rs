@@ -139,8 +139,9 @@ impl SdpInfo {
             raw: text.to_string(),
             ..Default::default()
         };
-        for line in text.lines() {
-            let line = line.trim_end_matches('\r');
+        // Lines end in CRLF or LF (RFC 4566 §5) — or a bare CR, as the
+        // encoders on a live DVB-S2 radio multiplex send.
+        for line in text.split(['\r', '\n']) {
             let Some((k, v)) = line.split_once('=') else {
                 continue;
             };
@@ -198,8 +199,7 @@ impl SdpInfo {
                 out.push((g, port));
             }
         };
-        for line in self.raw.lines() {
-            let line = line.trim_end_matches('\r');
+        for line in self.raw.split(['\r', '\n']) {
             let Some((k, v)) = line.split_once('=') else {
                 continue;
             };
@@ -669,6 +669,37 @@ mod tests {
         assert_eq!(v.len(), 2, "{v:?}");
         assert!(v.iter().all(|a| a.name() == "Classic_Hits"), "{v:?}");
         assert_eq!(s.stations().len(), 2);
+    }
+
+    #[test]
+    fn sap_with_bare_cr_lines_names_the_station() {
+        // As sent on a live DVB-S2 radio multiplex: SAP to 224.2.127.254,
+        // SDP lines ended by a bare CR.
+        let mut s = McastScanner::new();
+        let sdp = "v=0\ro=- 1 47 IN IP4 192.168.1.11\rs=Newstalk_ZB\ri=Newstalk_ZB\r                   a=X-PID:1001\rm=audio 10001 RTP/AVP 14\rc=IN IP4 230.0.0.1\ra=bitrate:0\r";
+        feed(
+            &mut s,
+            &udp_v4(
+                [192, 168, 1, 11],
+                [224, 2, 127, 254],
+                9875,
+                9875,
+                &sap_packet([192, 168, 1, 11], 47, sdp),
+            ),
+        );
+        for k in 0..10u16 {
+            let mut payload = vec![0u8; 4];
+            payload.extend_from_slice(&silent_mp2_frame());
+            let rtp = rtp_packet(14, k, k as u32 * 2160, 0x99, &payload);
+            feed(
+                &mut s,
+                &udp_v4([10, 152, 26, 11], [230, 0, 0, 1], 4000, 10001, &rtp),
+            );
+        }
+        let v = s.streams();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name(), "Newstalk_ZB");
+        assert_eq!(v[0].sdp.as_ref().unwrap().pt, Some(14));
     }
 
     #[test]
