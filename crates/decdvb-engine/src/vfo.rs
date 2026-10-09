@@ -156,6 +156,8 @@ pub struct VfoSettings {
     /// Generic PSK: look for text in the decided bits, every way of reading
     /// them at once.
     pub find_text: bool,
+    /// Generic PSK: how the symbols written to the .bin are numbered.
+    pub symbol_labels: crate::psk::SymbolLabels,
     /// Write the decoder's output to a file: symbols (generic PSK) or IP
     /// packets as PCAP (DVB-S2 → GSE/IP). Off by default — the decoder shows
     /// what it finds until recording is asked for.
@@ -198,6 +200,7 @@ impl VfoSettings {
             gold_code: 0,
             psk_modulation: None,
             find_text: true,
+            symbol_labels: crate::psk::SymbolLabels::Standard,
             record: false,
             gse_variant: None,
             // Local only: a player on this machine. Point them elsewhere on
@@ -921,7 +924,8 @@ impl Worker {
                         open_failed,
                     };
                     file.follow(&self.settings, d, *carrier_hz);
-                    write_symbols(writer, written, &self.syms, &mut self.sym_bytes);
+                    let table = d.label_table(self.settings.symbol_labels);
+                    write_symbols(writer, written, &self.syms, &table, &mut self.sym_bytes);
                     match (self.settings.find_text, text.as_mut()) {
                         (true, Some(t)) => t.push(&self.syms),
                         (true, None) => {
@@ -967,7 +971,8 @@ impl Worker {
                                 open_failed,
                             };
                             file.follow(&self.settings, &d, *carrier_hz);
-                            write_symbols(writer, written, &self.syms, &mut self.sym_bytes);
+                            let table = d.label_table(self.settings.symbol_labels);
+                            write_symbols(writer, written, &self.syms, &table, &mut self.sym_bytes);
                             *demod = Some(d);
                         } else {
                             buf.clear();
@@ -1535,15 +1540,21 @@ fn unix_stamp() -> u64 {
 /// Append hard decisions to the symbol file, one byte per symbol: the
 /// symbol's bit label under the DVB-S2 mapping (EN 302 307-1 §5.4; BPSK 0 ->
 /// +1). A write error closes the file rather than retrying every block.
+/// Append the symbols' bytes: each hard index through `table` (see
+/// [`crate::psk::SymbolLabels`]).
 fn write_symbols(
     writer: &mut Option<BufWriter<File>>,
     written: &mut u64,
     syms: &[(u8, Iq)],
+    table: &[u8],
     scratch: &mut Vec<u8>,
 ) {
     let Some(w) = writer else { return };
     scratch.clear();
-    scratch.extend(syms.iter().map(|&(i, _)| i));
+    scratch.extend(
+        syms.iter()
+            .map(|&(i, _)| table.get(i as usize).copied().unwrap_or(i)),
+    );
     if w.write_all(scratch).is_ok() {
         *written += syms.len() as u64;
     } else {

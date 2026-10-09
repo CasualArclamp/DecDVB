@@ -23,6 +23,8 @@ pub struct DecodeArgs {
     pub out: Option<PathBuf>,
     pub fast: bool,
     pub e1_record: Option<u8>,
+    /// psk: how the .bin numbers the symbols.
+    pub labels: String,
 }
 
 fn decoder_by_name(name: &str) -> Result<DecoderKind> {
@@ -82,6 +84,15 @@ pub fn decode(a: DecodeArgs) -> Result<()> {
     s.symbol_rate = a.symbol_rate;
     if let Some(m) = &a.modulation {
         s.psk_modulation = Some(modulation_by_name(m)?);
+    }
+    {
+        use decdvb_engine::psk::SymbolLabels;
+        s.symbol_labels = match a.labels.to_ascii_lowercase().as_str() {
+            "standard" | "std" => SymbolLabels::Standard,
+            "natural" | "position" => SymbolLabels::Natural,
+            "gray" | "grey" => SymbolLabels::Gray,
+            other => bail!("--labels: `{other}` (want standard, natural or gray)"),
+        };
     }
     if let Some(dir) = &a.out {
         s.record = true;

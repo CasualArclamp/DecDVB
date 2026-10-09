@@ -30,6 +30,97 @@ fn pll_bandwidth(symbol_rate: f64) -> f64 {
     (250.0 / symbol_rate).clamp(0.008, 0.04)
 }
 
+/// How the symbols written to a .bin file are numbered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SymbolLabels {
+    /// As the modulation's standard labels them (DVB-S2's mappings, the
+    /// RCV-20x manual's for its QAMs): the hard index itself.
+    #[default]
+    Standard,
+    /// By position: PSK points in order round the circle from the first
+    /// one counter-clockwise of 0°, square QAM by column and row (x index
+    /// then y index, each counted from the lowest).
+    Natural,
+    /// The Gray code of the natural number (per axis for QAM): neighbouring
+    /// points differ in one bit, as most modems map them.
+    Gray,
+}
+
+impl SymbolLabels {
+    pub const ALL: [SymbolLabels; 3] = [
+        SymbolLabels::Standard,
+        SymbolLabels::Natural,
+        SymbolLabels::Gray,
+    ];
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            SymbolLabels::Standard => "standard labels",
+            SymbolLabels::Natural => "natural (by position)",
+            SymbolLabels::Gray => "Gray code",
+        }
+    }
+
+    /// Label → byte for `cst`. APSK rings and 8QAM have no single natural
+    /// order: they keep their standard labels.
+    fn table(&self, cst: &Constellation) -> Vec<u8> {
+        let n = cst.points.len();
+        let standard: Vec<u8> = (0..n).map(|l| l as u8).collect();
+        if *self == SymbolLabels::Standard {
+            return standard;
+        }
+        let gray = |k: usize| k ^ (k >> 1);
+        let radii: Vec<f32> = cst.points.iter().map(|p| p.norm()).collect();
+        let one_ring = radii
+            .iter()
+            .all(|r| (r - radii[0]).abs() < 0.02 * radii[0].max(1e-6));
+        if one_ring {
+            // PSK: rank by angle in [0, 2π).
+            let angle = |l: usize| {
+                let a = cst.points[l].arg();
+                if a < -1e-4 {
+                    a + std::f32::consts::TAU
+                } else {
+                    a.max(0.0)
+                }
+            };
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by(|&a, &b| angle(a).total_cmp(&angle(b)));
+            let mut t = standard.clone();
+            for (k, &l) in order.iter().enumerate() {
+                t[l] = match self {
+                    SymbolLabels::Gray => gray(k) as u8,
+                    _ => k as u8,
+                };
+            }
+            return t;
+        }
+        // Square QAM: distinct x and y levels, as many of each.
+        let levels = |f: fn(&Iq) -> f32| {
+            let mut v: Vec<f32> = cst.points.iter().map(f).collect();
+            v.sort_by(f32::total_cmp);
+            v.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+            v
+        };
+        let (xs, ys) = (levels(|p| p.re), levels(|p| p.im));
+        if xs.len() * ys.len() != n || xs.len() != ys.len() {
+            return standard;
+        }
+        let bits = xs.len().trailing_zeros();
+        let at = |v: &[f32], x: f32| v.iter().position(|&l| (l - x).abs() < 1e-3).unwrap_or(0);
+        (0..n)
+            .map(|l| {
+                let (xi, yi) = (at(&xs, cst.points[l].re), at(&ys, cst.points[l].im));
+                let (xi, yi) = match self {
+                    SymbolLabels::Gray => (gray(xi), gray(yi)),
+                    _ => (xi, yi),
+                };
+                ((xi << bits) | yi) as u8
+            })
+            .collect()
+    }
+}
+
 /// Streaming generic demodulator.
 pub struct PskDemod {
     mf: Fir,
@@ -99,6 +190,12 @@ impl PskDemod {
                 .collect();
         }
         self
+    }
+
+    /// Each point's label (the hard index) to the byte written for it,
+    /// under `labels`.
+    pub fn label_table(&self, labels: SymbolLabels) -> Vec<u8> {
+        labels.table(&self.cst)
     }
 
     pub fn modulation(&self) -> Modulation {
@@ -257,6 +354,63 @@ impl TextSearch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symbol_labels_number_by_position_and_gray() {
+        let d = |m| PskDemod::new(1.0, 0.25, 0.35, m, 0.0);
+        // QPSK: points at 45°, 135°, 225°, 315° → 0, 1, 2, 3; Gray 0, 1, 3, 2.
+        for (labels, want) in [
+            (SymbolLabels::Natural, [0u8, 1, 2, 3]),
+            (SymbolLabels::Gray, [0, 1, 3, 2]),
+        ] {
+            let q = d(Modulation::Qpsk);
+            let t = q.label_table(labels);
+            let mut by_angle: Vec<(f32, u8)> = q
+                .cst
+                .points
+                .iter()
+                .enumerate()
+                .map(|(l, p)| (p.arg().rem_euclid(std::f32::consts::TAU), t[l]))
+                .collect();
+            by_angle.sort_by(|a, b| a.0.total_cmp(&b.0));
+            assert_eq!(by_angle.iter().map(|x| x.1).collect::<Vec<_>>(), want);
+        }
+        // 8PSK under Gray: neighbours round the circle differ in one bit.
+        let e = d(Modulation::Psk8);
+        let t = e.label_table(SymbolLabels::Gray);
+        let mut by_angle: Vec<(f32, u8)> = e
+            .cst
+            .points
+            .iter()
+            .enumerate()
+            .map(|(l, p)| (p.arg().rem_euclid(std::f32::consts::TAU), t[l]))
+            .collect();
+        by_angle.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for k in 0..8 {
+            let (a, b) = (by_angle[k].1, by_angle[(k + 1) % 8].1);
+            assert_eq!((a ^ b).count_ones(), 1, "{by_angle:?}");
+        }
+        // 16QAM under Gray: horizontal and vertical neighbours, one bit.
+        let q16 = d(Modulation::Qam16);
+        let t = q16.label_table(SymbolLabels::Gray);
+        let pts = &q16.cst.points;
+        for a in 0..16 {
+            for b in 0..16 {
+                let dd = (pts[a] - pts[b]).norm();
+                let min = pts
+                    .iter()
+                    .flat_map(|p| pts.iter().map(move |q| (p - q).norm()))
+                    .filter(|&x| x > 1e-6)
+                    .fold(f32::MAX, f32::min);
+                if (dd - min).abs() < 1e-3 {
+                    assert_eq!((t[a] ^ t[b]).count_ones(), 1);
+                }
+            }
+        }
+        // Standard: the labels themselves.
+        let s = d(Modulation::Psk8).label_table(SymbolLabels::Standard);
+        assert_eq!(s, (0..8).collect::<Vec<u8>>());
+    }
     use decdvb_mod::Shaper;
 
     #[test]

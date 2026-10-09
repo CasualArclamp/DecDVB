@@ -1096,3 +1096,15 @@ threshold would lock on noise. What was wrong:
   between the two halves of a bit (same data bit, unambiguous within ±1 bit
   rate) and tracks with the quiet squared detector. Test: locks true at
   +20, +97, +300, −150 Hz (+20 false-locked before).
+
+## Generic PSK: symbol numbering in the .bin (2026-10-09)
+
+`VfoSettings::symbol_labels` (`psk::SymbolLabels`): the byte written per
+symbol is the standard label (as before: DVB-S2's mappings, the RCV-20x
+manual's for its QAMs), the point's position (PSK: by angle from the first
+point counter-clockwise of 0°; square QAM: x index then y index from the
+lowest), or the Gray code of the position (per axis for QAM; neighbours
+differ in one bit). APSK and 8QAM keep their labels. GUI: "Numbering" under
+the PSK constellation; CLI: `decode --decoder psk --labels natural|gray`.
+Checked on the 10 kBd QPSK capture: Gray is a fixed relabelling of the
+standard labels (0→0, 1→2, 2→1, 3→3).

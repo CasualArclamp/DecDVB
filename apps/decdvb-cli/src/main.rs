@@ -139,6 +139,10 @@ enum Command {
         /// Record this E1 timeslot (or D&I++ channel) to a .wav in --out.
         #[arg(long)]
         e1_record: Option<u8>,
+        /// psk: number the symbols in the .bin as the standard labels them,
+        /// by position (`natural`), or Gray-coded by position (`gray`).
+        #[arg(long, default_value = "standard")]
+        labels: String,
     },
 }
 
@@ -225,6 +229,7 @@ fn main() -> Result<()> {
             out,
             fast,
             e1_record,
+            labels,
         } => decode::decode(decode::DecodeArgs {
             file,
             format,
@@ -237,6 +242,7 @@ fn main() -> Result<()> {
             out,
             fast,
             e1_record,
+            labels,
         }),
     }
 }

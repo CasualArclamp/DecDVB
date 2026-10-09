@@ -232,6 +232,21 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                     });
                 ui.end_row();
 
+                // How the .bin numbers the points.
+                ui.label("Numbering");
+                egui::ComboBox::from_id_salt("psk_labels")
+                    .selected_text(s.symbol_labels.name())
+                    .show_ui(ui, |ui| {
+                        for l in decdvb_engine::psk::SymbolLabels::ALL {
+                            ui.selectable_value(&mut s.symbol_labels, l, l.name());
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "The byte written for each symbol: the standard label (DVB-S2's or                          the modem manual's mapping), its position (round the circle for                          PSK, column and row for square QAM), or the Gray code of the                          position (per axis for QAM). APSK and 8QAM keep their labels.",
+                    );
+                ui.end_row();
+
                 // Symbols go to a file only while this is on; until then the
                 // decoder just shows the locked constellation.
                 ui.label("Symbols");
