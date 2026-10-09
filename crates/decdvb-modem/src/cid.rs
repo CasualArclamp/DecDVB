@@ -532,7 +532,43 @@ pub struct CidStats {
     pub bad_frames: u64,
     pub report: CidReport,
     pub scrambler: Option<ScramblerOrder>,
+    /// The latest code search (the one that found the code, while it is
+    /// tracked). `Arc`: a shared, reference-counted pointer, so copying the
+    /// stats out for display many times a second copies a pointer, not the
+    /// map.
+    pub search: Option<Arc<CidSearch>>,
 }
+
+/// One code search, for display: correlation power over code phase and
+/// frequency, in dB over the mean of every cell searched.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CidSearch {
+    /// The strongest cell, and the level the search must reach to lock.
+    pub peak_db: f32,
+    pub threshold_db: f32,
+    /// The strongest cell's code phase (chips into the analysis block, at
+    /// half-chip steps) and frequency (Hz from the host carrier's centre).
+    pub code_phase: f64,
+    pub freq_hz: f64,
+    /// At that frequency, every code phase: point `i` is the strongest of
+    /// chips `i·profile_step` up to the next.
+    pub profile: Vec<f32>,
+    pub profile_step: usize,
+    /// Around the strongest cell: `surface[r][c]` is frequency
+    /// `freq0_hz + r·freq_step_hz` (each row the strongest of the
+    /// frequencies it covers) and code phase `phase0 + c` chips, modulo
+    /// 4096.
+    pub surface: Vec<Vec<f32>>,
+    pub freq0_hz: f64,
+    pub freq_step_hz: f64,
+    pub phase0: i64,
+}
+
+/// The search map's shape: rows of frequency at most, code phases either
+/// side of the peak, profile points.
+const MAP_ROWS: usize = 64;
+const MAP_HALF_WIDTH: i64 = 24;
+const PROFILE_POINTS: usize = 512;
 
 /// Bit periods gathered for a search; how far either side of ±220 Hz to
 /// look; the search's threshold (peak over mean of the accumulated
@@ -668,6 +704,7 @@ impl CidRx {
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(b.1))
             .expect("cells");
+        self.stats.search = Some(Arc::new(search_map(&acc, mean, best, k_max, bin)));
         if peak < ACQ_THRESHOLD * mean {
             // Nothing: keep the newest bit period for the next try.
             self.held.drain(..(ACQ_BITS - 1) * l4);
@@ -845,6 +882,56 @@ impl CidRx {
     }
 }
 
+/// The display map of a search: `acc` holds `2·(2·k_max + 1)` frequency
+/// cells of `2·CHIPS` code phases (two per chip), cell `half·n + k + k_max`
+/// at `(k + half/2)·bin` Hz; `best` is the strongest entry.
+fn search_map(acc: &[f32], mean: f32, best: usize, k_max: isize, bin: f64) -> CidSearch {
+    let l2 = 2 * CHIPS;
+    let n = 2 * k_max as usize + 1;
+    let db = |v: f32| (10.0 * (v / mean.max(1e-30)).log10()).max(-10.0);
+    let (cell, lag) = (best / l2, best % l2);
+    let cell_freq = |c: usize| ((c % n) as f64 - k_max as f64 + 0.5 * (c / n) as f64) * bin;
+    // Frequency order: k, k + ½, k + 1, … is cell (j % 2)·n + j / 2.
+    let by_freq = |j: usize| (j % 2) * n + j / 2;
+    let row = |c: usize| &acc[c * l2..(c + 1) * l2];
+    let profile_step = CHIPS / PROFILE_POINTS;
+    let profile = row(cell)
+        .chunks(2 * profile_step)
+        .map(|w| db(w.iter().copied().fold(0.0, f32::max)))
+        .collect();
+    let pool = (2 * n).div_ceil(MAP_ROWS);
+    let surface = (0..2 * n)
+        .step_by(pool)
+        .map(|j0| {
+            (-MAP_HALF_WIDTH..=MAP_HALF_WIDTH)
+                .map(|c| {
+                    let mut m = 0f32;
+                    for j in j0..(j0 + pool).min(2 * n) {
+                        let r = row(by_freq(j));
+                        for h in 0..2 {
+                            let at = (lag as i64 + 2 * c + h).rem_euclid(l2 as i64) as usize;
+                            m = m.max(r[at]);
+                        }
+                    }
+                    db(m)
+                })
+                .collect()
+        })
+        .collect();
+    CidSearch {
+        peak_db: db(acc[best]),
+        threshold_db: 10.0 * ACQ_THRESHOLD.log10(),
+        code_phase: lag as f64 / 2.0,
+        freq_hz: cell_freq(cell),
+        profile,
+        profile_step,
+        surface,
+        freq0_hz: (-(k_max as f64) + 0.25 * (pool - 1) as f64) * bin,
+        freq_step_hz: 0.5 * pool as f64 * bin,
+        phase0: (lag / 2) as i64 - MAP_HALF_WIDTH,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,5 +1075,33 @@ mod tests {
             assert_eq!(f.guid, guid);
         }
         assert_eq!(rx.stats.report.guid, Some(guid));
+
+        // The search that found it, as the display gets it: the peak over
+        // the threshold, at the right frequency, in the map's middle column
+        // and in the profile at its code phase.
+        let m = rx.stats.search.as_deref().expect("a search map");
+        assert!(m.peak_db > m.threshold_db, "{} dB", m.peak_db);
+        assert!((m.freq_hz - f0).abs() < 30.0, "{} Hz", m.freq_hz);
+        assert_eq!(m.profile.len(), PROFILE_POINTS);
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        assert_eq!(argmax(&m.profile), m.code_phase as usize / m.profile_step);
+        let (r, c) = m
+            .surface
+            .iter()
+            .enumerate()
+            .map(|(r, row)| (r, argmax(row), row[argmax(row)]))
+            .max_by(|a, b| a.2.total_cmp(&b.2))
+            .map(|(r, c, _)| (r, c))
+            .unwrap();
+        assert_eq!(c as i64, MAP_HALF_WIDTH);
+        let row_hz = m.freq0_hz + r as f64 * m.freq_step_hz;
+        assert!((row_hz - f0).abs() <= m.freq_step_hz, "{row_hz} Hz");
+        assert!(m.surface.len() <= MAP_ROWS);
     }
 }

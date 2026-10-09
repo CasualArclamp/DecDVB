@@ -11,7 +11,9 @@ use decdvb_core::Iq;
 use decdvb_dsp::Ddc;
 use decdvb_modem::cid::{CidRx, SPS, chip_rate};
 // What a CID VFO's view holds, and how to show it, for the apps.
-pub use decdvb_modem::cid::{CidReport, CidStats, ScramblerOrder, guid_mac, guid_text};
+pub use decdvb_modem::cid::{
+    CHIPS, CidReport, CidSearch, CidStats, ScramblerOrder, guid_mac, guid_text,
+};
 
 /// A CID VFO's state, for display.
 #[derive(Debug, Clone, Default)]

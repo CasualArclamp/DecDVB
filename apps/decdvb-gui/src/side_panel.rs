@@ -1172,6 +1172,169 @@ fn cid_card(ui: &mut Ui, c: &decdvb_engine::CidView) {
             ui.end_row();
         }
     });
+    // `as_deref` turns the `Option<Arc<CidSearch>>` into an
+    // `Option<&CidSearch>`, borrowing through the pointer.
+    if let Some(m) = s.search.as_deref() {
+        egui::CollapsingHeader::new("Code search")
+            .id_salt("cid_search")
+            .default_open(true)
+            .show(ui, |ui| cid_search(ui, m, s.acquired));
+    }
+}
+
+/// The latest code search: correlation against the code at every code
+/// phase (at the strongest frequency), then the map of code phase ×
+/// frequency around the strongest cell.
+fn cid_search(ui: &mut Ui, m: &decdvb_engine::cid::CidSearch, acquired: bool) {
+    let good = Color32::from_rgb(110, 220, 110);
+    let wait = Color32::from_rgb(240, 200, 80);
+    let above = m.peak_db >= m.threshold_db;
+    ui.label(
+        RichText::new(format!(
+            "{} search · peak {:.1} dB over the mean (locks at {:.1}) · {:+.0} Hz · \
+             code phase {:.1}",
+            if acquired { "locking" } else { "latest" },
+            m.peak_db,
+            m.threshold_db,
+            m.freq_hz,
+            m.code_phase
+        ))
+        .small()
+        .color(if above { good } else { wait }),
+    );
+
+    // Correlation over code phase.
+    let step = m.profile_step as f64;
+    let line: PlotPoints = m
+        .profile
+        .iter()
+        .enumerate()
+        .map(|(i, &d)| [(i as f64 + 0.5) * step, d as f64])
+        .collect();
+    let thr: PlotPoints = vec![
+        [0.0, m.threshold_db as f64],
+        [cid_chips(), m.threshold_db as f64],
+    ]
+    .into();
+    Plot::new("cid_profile")
+        .height(110.0)
+        .x_axis_label("code phase (chips)")
+        .y_axis_label("dB")
+        .include_x(0.0)
+        .include_x(cid_chips())
+        .include_y(0.0)
+        .include_y(m.peak_db.max(m.threshold_db) as f64 + 1.0)
+        .allow_drag(false)
+        .allow_zoom(false)
+        .allow_scroll(false)
+        .allow_boxed_zoom(false)
+        .show(ui, |pl| {
+            pl.line(
+                Line::new("correlation", line)
+                    .color(Color32::from_rgb(120, 200, 255))
+                    .width(1.0),
+            );
+            pl.line(
+                Line::new("lock threshold", thr)
+                    .color(wait.gamma_multiply(0.6))
+                    .style(egui_plot::LineStyle::dashed_loose()),
+            );
+            pl.points(
+                Points::new("peak", vec![[m.code_phase, m.peak_db as f64]])
+                    .radius(3.5)
+                    .color(if above { good } else { wait }),
+            );
+        });
+
+    // Code phase × frequency around the peak.
+    let rows = m.surface.len();
+    let cols = m.surface.first().map_or(0, Vec::len);
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    let (left, bottom) = (54.0, 16.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 170.0), Sense::hover());
+    let plot = egui::Rect::from_min_max(rect.min + vec2(left, 0.0), rect.max - vec2(0.0, bottom));
+    let painter = ui.painter_at(rect);
+    let pal = crate::waterfall::palette();
+    let top = m.peak_db.max(m.threshold_db + 1.0);
+    let (cw, ch) = (plot.width() / cols as f32, plot.height() / rows as f32);
+    for (r, row) in m.surface.iter().enumerate() {
+        for (c, &v) in row.iter().enumerate() {
+            let t = (v / top).clamp(0.0, 1.0).powf(1.5);
+            let x = plot.left() + c as f32 * cw;
+            // Row 0 is the lowest frequency: at the bottom.
+            let y = plot.bottom() - (r + 1) as f32 * ch;
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(x, y), vec2(cw + 0.5, ch + 0.5)),
+                0.0,
+                pal[(t * 255.0) as usize],
+            );
+        }
+    }
+    let ink = ui.visuals().weak_text_color();
+    let font = egui::FontId::proportional(10.0);
+    let y_of = |hz: f64| plot.bottom() - ((hz - m.freq0_hz) / m.freq_step_hz + 0.5) as f32 * ch;
+    // Where a CID sits: +220 Hz from the host's centre (−220 Hz if the
+    // modulator inverts its spectrum).
+    for hz in [-220.0, 220.0] {
+        let y = y_of(hz);
+        if plot.y_range().contains(y) {
+            painter.line_segment(
+                [egui::pos2(plot.left(), y), egui::pos2(plot.left() + 4.0, y)],
+                (1.5, ink),
+            );
+        }
+    }
+    let span = rows as f64 * m.freq_step_hz;
+    let tick = [250.0, 500.0, 1000.0]
+        .into_iter()
+        .find(|t| span / t <= 8.0)
+        .unwrap_or(2000.0);
+    let mut hz = (m.freq0_hz / tick).ceil() * tick;
+    while hz <= m.freq0_hz + (rows - 1) as f64 * m.freq_step_hz {
+        painter.text(
+            egui::pos2(plot.left() - 4.0, y_of(hz)),
+            egui::Align2::RIGHT_CENTER,
+            format!("{hz:+.0} Hz"),
+            font.clone(),
+            ink,
+        );
+        hz += tick;
+    }
+    // Ticks every 10 chips from the middle (the peak), clear of the edges.
+    let mid = cols / 2;
+    for c in (mid % 10..cols)
+        .step_by(10)
+        .filter(|&c| c >= 2 && c + 3 <= cols)
+    {
+        let phase = (m.phase0 + c as i64).rem_euclid(cid_chips() as i64);
+        painter.text(
+            egui::pos2(plot.left() + (c as f32 + 0.5) * cw, plot.bottom() + 2.0),
+            egui::Align2::CENTER_TOP,
+            phase.to_string(),
+            font.clone(),
+            ink,
+        );
+    }
+    if let Some(p) = resp.hover_pos()
+        && plot.contains(p)
+    {
+        let c = ((p.x - plot.left()) / cw) as usize;
+        let r = ((plot.bottom() - p.y) / ch) as usize;
+        if let Some(v) = m.surface.get(r).and_then(|row| row.get(c)) {
+            resp.on_hover_text(format!(
+                "{:+.0} Hz · code phase {} · {v:.1} dB over the mean",
+                m.freq0_hz + r as f64 * m.freq_step_hz,
+                (m.phase0 + c as i64).rem_euclid(cid_chips() as i64)
+            ));
+        }
+    }
+}
+
+/// Chips a CID bit (the code's length), as a plot coordinate.
+fn cid_chips() -> f64 {
+    decdvb_engine::cid::CHIPS as f64
 }
 
 /// A K = 7 convolutional-code VFO: the carrier, the rate found, and what the

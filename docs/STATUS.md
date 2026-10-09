@@ -942,3 +942,18 @@ named stations went silent. An announcement now describes a stream only for
 the payload type the packets carry (`SdpInfo::for_pt`): otherwise it names
 the stream and the codec comes from the bytes, and the external-player relay
 serves the ADTS over HTTP rather than handing over the misleading SDP.
+
+## DVB-CID: the code search on screen (2026-10-09)
+
+`CidRx` keeps a map of every acquisition search (`CidStats::search`, an
+`Arc<CidSearch>` so the stats copy cheaply): the correlation over all 4096
+code phases at the strongest frequency (512 points, the largest of each 8
+chips), and code phase ± 24 chips × the whole ±1.7 kHz searched (pooled to
+at most 64 rows), all in dB over the mean of every cell, with the peak and
+the lock threshold (4.8 dB). The Carrier ID card draws both under "Code
+search": while searching it shows how close the best cell came; once locked,
+the search that found the code (a single spike, and one bright cell near
++220 Hz). Checked on a simulated 1.008 MBd QPSK host with a CID 27.5 dB
+under it: peak 6.6 dB, found at code phase 1299. The frequency reads from
+Identify's estimate of the host's centre, here 310 Hz high, so the CID shows
+at −80 Hz rather than +220.
