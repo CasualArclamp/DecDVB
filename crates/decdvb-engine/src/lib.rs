@@ -16,7 +16,7 @@ pub mod spectrum;
 pub mod vfo;
 
 pub use carriers::{Carrier, detect_carriers};
-pub use decdvb_modem::text::TextView;
+pub use decdvb_modem::text::{ByteTextView, TextView};
 pub use demod::{Demod, LockState, PlFrame};
 pub use estimate::{BandEstimate, estimate_band};
 pub use fec::{BbFrame, FecDecoder, FecOutput, FecStats, GseView, TsView};

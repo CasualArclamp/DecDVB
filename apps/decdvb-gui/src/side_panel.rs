@@ -264,6 +264,17 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                 ui.end_row();
             }
 
+            if s.decoder == DecoderKind::Identify {
+                ui.label("Text");
+                ui.checkbox(&mut s.find_text, "look for text in the bits")
+                    .on_hover_text(
+                        "While the carrier is demodulated live, search the decided bits \
+                         for readable strings under every phase rotation, mirror image, \
+                         bit order, byte alignment and differential decoding",
+                    );
+                ui.end_row();
+            }
+
             if s.decoder == DecoderKind::Tpc2964 {
                 ui.label("Modulation");
                 let txt = match s.psk_modulation {
@@ -485,6 +496,11 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
             st.carrier.as_ref(),
         );
     }
+    if v.settings.decoder == DecoderKind::Identify
+        && let Some(t) = &st.text
+    {
+        text_card(ui, t);
+    }
 
     if matches!(
         v.settings.decoder,
@@ -522,6 +538,7 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
             if let Some(t) = &f.ts {
                 ts_card(ui, t, v.id, &mut actions);
             }
+            data_text(ui, f, v.settings.decoder);
         }
     }
 
@@ -572,6 +589,7 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
             if let Some(t) = &f.ts {
                 ts_card(ui, t, v.id, &mut actions);
             }
+            data_text(ui, f, v.settings.decoder);
         }
     }
 
@@ -586,6 +604,7 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
             if let Some(t) = &f.ts {
                 ts_card(ui, t, v.id, &mut actions);
             }
+            data_text(ui, f, v.settings.decoder);
         }
     }
 
@@ -654,6 +673,68 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
     }
 
     actions
+}
+
+/// Text in a decoder's output: the transport stream's payloads for the TS
+/// decoders (MPE's IP included), the IP payloads for the IP one; a TPC
+/// carrier's whichever it carries, or every reading of its bits while the
+/// format is unknown.
+fn data_text(ui: &mut Ui, f: &FecStats, decoder: DecoderKind) {
+    let ts = f.ts.as_ref().map(|t| &t.text);
+    let ip = f.gse.as_ref().map(|g| &g.text);
+    if decoder != DecoderKind::Dvbs2Ip
+        && let Some(t) = ts
+    {
+        byte_text_card(ui, t, "Text in the transport stream", "ts");
+    }
+    if let Some(t) = ip {
+        byte_text_card(ui, t, "Text in the IP packets", "ip");
+    }
+    if ts.is_none()
+        && ip.is_none()
+        && let Some(t) = &f.text
+    {
+        text_card(ui, t);
+    }
+}
+
+/// Text found in decoded bytes: what recurs, and the latest long strings.
+fn byte_text_card(ui: &mut Ui, t: &decdvb_engine::ByteTextView, title: &str, salt: &str) {
+    ui.add_space(6.0);
+    ui.label(RichText::new(title).strong());
+    if t.repeated.is_empty() && t.recent.is_empty() {
+        ui.label(RichText::new(format!("none yet in {}", format::bytes(t.bytes))).weak());
+        return;
+    }
+    if !t.repeated.is_empty() {
+        ui.label(RichText::new("recurring").small());
+        egui::ScrollArea::vertical()
+            .id_salt(("text_repeated", salt))
+            .max_height(160.0)
+            .show(ui, |ui| {
+                egui::Grid::new(("text_repeated_grid", salt))
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        for (s, n) in &t.repeated {
+                            ui.label(RichText::new(format!("×{n}")).small().weak());
+                            ui.label(RichText::new(s).monospace());
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+    if !t.recent.is_empty() {
+        ui.label(RichText::new("latest long strings").small());
+        egui::ScrollArea::vertical()
+            .id_salt(("text_recent", salt))
+            .max_height(140.0)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for s in &t.recent {
+                    ui.label(RichText::new(s).monospace());
+                }
+            });
+    }
 }
 
 /// Text found in a generic carrier's bits, live.

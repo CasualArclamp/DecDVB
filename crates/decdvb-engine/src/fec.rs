@@ -335,6 +335,9 @@ pub struct FecStats {
     /// The raw data file (TPC 2964, while recording) and its bytes.
     pub raw_file: Option<(PathBuf, u64)>,
     pub raw_active: bool,
+    /// Text in a modem's data while what they carry is not known (TPC
+    /// 2964), every reading of the bits at once.
+    pub text: Option<decdvb_modem::text::TextView>,
 }
 
 /// The transport stream and its outputs, for display.
@@ -361,6 +364,8 @@ pub struct TsView {
     pub tcp: Option<(SocketAddr, Vec<SocketAddr>)>,
     /// The last output error (a file that will not open, a port in use…).
     pub error: Option<String>,
+    /// Text in the packets' payloads.
+    pub text: decdvb_modem::text::ByteTextView,
 }
 
 /// IP out of GSE, for display.
@@ -407,6 +412,8 @@ pub struct GseView {
     pub audio_record_error: Option<String>,
     /// Packets passed to the player so far.
     pub audio_forwarded: u64,
+    /// Text in the packets' payloads (UDP/TCP data).
+    pub text: decdvb_modem::text::ByteTextView,
 }
 
 /// Where and whether a VFO's FEC writes its output.
@@ -542,6 +549,8 @@ struct IpStage {
     mpe: Option<MpeStats>,
     /// IP from HDLC frames: the frames and their FCS, for display.
     hdlc: Option<(u64, decdvb_modem::payload::Fcs)>,
+    /// Text in the payloads.
+    text: decdvb_modem::text::ByteText,
 }
 
 impl IpStage {
@@ -560,6 +569,7 @@ impl IpStage {
             audio_want: None,
             mpe: None,
             hdlc: None,
+            text: decdvb_modem::text::ByteText::new(),
             gse: GseIp::new(),
             stats: IpStats::default(),
             packets: Vec::new(),
@@ -687,6 +697,7 @@ impl IpStage {
 
     /// One IP packet, wherever it came from.
     fn ip(&mut self, data: &[u8], info: &IpInfo) {
+        self.text.push_unit(ip_payload(data, info));
         self.stats.add(info);
         self.win.0 += data.len() as f64;
         self.mcast.packet(data, info);
@@ -739,6 +750,7 @@ impl IpStage {
         }
         // Few flows, cheap to list: always current.
         self.audio = self.mcast.streams();
+
         GseView {
             source: self.gse.source(),
             variants: self.gse.reports(),
@@ -786,6 +798,7 @@ impl IpStage {
                 .record_error
                 .clone()
                 .or_else(|| self.recorder.as_ref().and_then(|r| r.error.clone())),
+            text: self.text.view(),
         }
     }
 
@@ -838,6 +851,8 @@ struct TsStage {
     datagrams: Vec<(Vec<u8>, IpInfo)>,
     /// Packets that came whole (DVB-S) rather than through the deframer.
     direct: u64,
+    /// Text in the payloads.
+    text: decdvb_modem::text::ByteText,
 }
 
 impl TsStage {
@@ -861,6 +876,7 @@ impl TsStage {
             mpe: MpeExtractor::new(),
             datagrams: Vec::new(),
             direct: 0,
+            text: decdvb_modem::text::ByteText::new(),
         }
     }
 
@@ -935,6 +951,13 @@ impl TsStage {
         for p in &self.packets {
             self.analyser.packet(p);
             self.mpe.packet(p, &mut self.datagrams);
+            // Text per PID, so a table's strings carry across packets.
+            let pid = u16::from_be_bytes([p[1] & 0x1F, p[2]]);
+            if pid != 0x1FFF
+                && let Some(payload) = ts_payload(p)
+            {
+                self.text.push_keyed(pid as u32, payload);
+            }
         }
         self.win.0 += (self.packets.len() * TS_LEN) as f64;
         if let Some(f) = &mut self.file
@@ -991,8 +1014,40 @@ impl TsStage {
             udp: self.udp.as_ref().map(|u| (u.target, u.datagrams)),
             tcp: self.tcp.as_ref().map(|t| (t.addr, t.clients())),
             error: self.error.clone(),
+            text: self.text.view(),
         }
     }
+}
+
+/// A TS packet's payload: after the 4-byte header and any adaptation field
+/// (ISO/IEC 13818-1 §2.4.3.2–3); none if the packet carries none.
+fn ts_payload(p: &[u8; TS_LEN]) -> Option<&[u8]> {
+    if p[3] & 0x10 == 0 {
+        return None;
+    }
+    let start = if p[3] & 0x20 != 0 {
+        5 + p[4] as usize
+    } else {
+        4
+    };
+    p.get(start..)
+}
+
+/// An IP packet's payload: the UDP or TCP data, else what follows the IP
+/// header.
+fn ip_payload<'a>(data: &'a [u8], info: &IpInfo) -> &'a [u8] {
+    let ip = match data.first().map(|b| b >> 4) {
+        Some(4) => (data[0] & 0x0F) as usize * 4,
+        Some(6) => 40,
+        _ => 0,
+    };
+    let l4 = match info.protocol {
+        17 => 8,
+        6 => data.get(ip + 12).map_or(0, |b| (b >> 4) as usize * 4),
+        _ => 0,
+    };
+    let end = info.len.min(data.len());
+    data.get((ip + l4).min(end)..end).unwrap_or(&[])
 }
 
 impl Drop for TsStage {
@@ -1112,6 +1167,7 @@ fn run(
     let mut payload: Option<decdvb_modem::payload::PayloadRx> = None;
     let mut payload_out = decdvb_modem::payload::PayloadOut::default();
     let mut raw = RawFile::default();
+    let mut tpc_text: Option<decdvb_modem::text::TextFinder> = None;
     while let Ok(input) = rx.recv() {
         let t0 = Instant::now();
         let f = match input {
@@ -1132,6 +1188,15 @@ fn run(
                     payload_out.clear();
                     pay.push(data, &mut payload_out);
                     raw.write(&payload_out.raw);
+                    // Unknown format: look for text in every reading of
+                    // the bits (once known, the TS or IP stage looks).
+                    if pay.format().is_none() {
+                        tpc_text
+                            .get_or_insert_with(|| {
+                                decdvb_modem::text::TextFinder::new(vec!["data".into()])
+                            })
+                            .push(0, data);
+                    }
                     if !payload_out.ts.is_empty() {
                         let stage = ts.get_or_insert_with(TsStage::new);
                         stage.follow(&o);
@@ -1174,6 +1239,7 @@ fn run(
                 }
                 s.tpc = Some(rx.stats.clone());
                 s.payload = Some(pay.stats.clone());
+                s.text = tpc_text.as_ref().map(|t| t.view());
                 s.raw_file = raw.path.clone().map(|p| (p, raw.bytes));
                 s.raw_active = raw.file.is_some();
                 if let Some(stage) = &mut ts {

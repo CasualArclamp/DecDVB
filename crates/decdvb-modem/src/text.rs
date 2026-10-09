@@ -7,7 +7,7 @@
 //! runs of printable characters, and the one with far more text than the
 //! others is shown (with the longest strings from anywhere as candidates).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 /// Characters a run must hold to count as text (random bytes make a run
 /// this long ~1 time in 400).
@@ -218,6 +218,153 @@ impl TextFinder {
     }
 }
 
+/// Text in data already decoded to bytes (IP packets, transport stream
+/// payloads): where bytes start is known, so only runs of printable
+/// characters are collected. Compressed, encrypted or video payload makes
+/// short runs by chance all the time, so strings are ranked by how often
+/// they recur — a service name, a URL, a beacon repeats; chance does not —
+/// and long ones are kept as they come.
+pub struct ByteText {
+    /// The string being read in each stream (see [`ByteText::push_keyed`]).
+    runs: HashMap<u32, Vec<u8>>,
+    counts: HashMap<String, u64>,
+    /// The strings seen more than once, with their counts: few, so ranking
+    /// them is cheap enough to do on every look.
+    repeated: HashMap<String, u64>,
+    /// Strings in the order first seen, for forgetting the oldest.
+    order: VecDeque<String>,
+    recent: VecDeque<String>,
+    bytes: u64,
+}
+
+/// Shortest string counted.
+const BYTE_MIN: usize = 6;
+/// Strings this long are listed as they come (chance makes one ~1 time in
+/// 10⁷ bytes).
+const RECENT_LEN: usize = 16;
+/// Distinct strings remembered; past this, ones seen only once are dropped,
+/// oldest first.
+const MAX_DISTINCT: usize = 65_536;
+/// Strings shown in each list.
+const SHOW: usize = 16;
+
+/// What [`ByteText`] has found, for display.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ByteTextView {
+    /// Strings seen more than once, most frequent first, with their counts.
+    pub repeated: Vec<(String, u64)>,
+    /// The latest long strings, oldest first.
+    pub recent: Vec<String>,
+    /// Bytes looked at.
+    pub bytes: u64,
+}
+
+impl Default for ByteText {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The key of the unkeyed stream.
+const STREAM: u32 = u32::MAX;
+
+impl ByteText {
+    pub fn new() -> Self {
+        ByteText {
+            runs: HashMap::new(),
+            counts: HashMap::new(),
+            repeated: HashMap::new(),
+            order: VecDeque::new(),
+            recent: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    /// Bytes of a continuous stream: a string may carry on into the next
+    /// call.
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.push_keyed(STREAM, bytes);
+    }
+
+    /// Bytes of one of several interleaved streams (a transport stream's
+    /// PIDs): a string carries on into that stream's next bytes, so text
+    /// split across packets comes out whole.
+    pub fn push_keyed(&mut self, key: u32, bytes: &[u8]) {
+        self.bytes += bytes.len() as u64;
+        // Taken out of the map while `end` borrows `self`, then put back.
+        let mut run = self.runs.remove(&key).unwrap_or_default();
+        for &b in bytes {
+            if printable(b) && run.len() < MAX_RUN {
+                run.push(b);
+            } else {
+                self.end(&mut run);
+                if printable(b) {
+                    run.push(b);
+                }
+            }
+        }
+        self.runs.insert(key, run);
+    }
+
+    /// One packet's bytes: strings end with it.
+    pub fn push_unit(&mut self, bytes: &[u8]) {
+        self.push(bytes);
+        let mut run = self.runs.remove(&STREAM).unwrap_or_default();
+        self.end(&mut run);
+    }
+
+    fn end(&mut self, run: &mut Vec<u8>) {
+        if run.len() < BYTE_MIN {
+            run.clear();
+            return;
+        }
+        let s = String::from_utf8_lossy(run).into_owned();
+        run.clear();
+        if s.len() >= RECENT_LEN && !self.recent.contains(&s) {
+            if self.recent.len() == SHOW {
+                self.recent.pop_front();
+            }
+            self.recent.push_back(s.clone());
+        }
+        // `entry` finds the key's slot or makes one: one hash lookup.
+        let n = self.counts.entry(s.clone()).or_insert(0);
+        *n += 1;
+        if *n > 1 {
+            let n = *n;
+            self.repeated.insert(s, n);
+        } else {
+            self.order.push_back(s);
+            while self.counts.len() > MAX_DISTINCT {
+                let Some(old) = self.order.pop_front() else {
+                    break;
+                };
+                if self.counts.get(&old).is_some_and(|&c| c > 1) {
+                    // Seen again: keep it, behind the newer ones.
+                    self.order.push_back(old);
+                    if self.order.len() <= SHOW {
+                        break;
+                    }
+                } else {
+                    self.counts.remove(&old);
+                }
+            }
+        }
+    }
+
+    pub fn view(&self) -> ByteTextView {
+        let mut repeated: Vec<(String, u64)> =
+            self.repeated.iter().map(|(s, &c)| (s.clone(), c)).collect();
+        // Most frequent first; equal counts longest first.
+        repeated.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.len().cmp(&a.0.len())));
+        repeated.truncate(SHOW);
+        ByteTextView {
+            repeated,
+            recent: self.recent.iter().cloned().collect(),
+            bytes: self.bytes,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +433,35 @@ mod tests {
         f.push(0, &sent);
         let best = f.view().best.expect("no text found");
         assert!(best.contains("differential"), "{best}");
+    }
+
+    #[test]
+    fn byte_text_ranks_what_recurs() {
+        let mut r = rng(9);
+        let mut t = ByteText::new();
+        for k in 0..2000 {
+            let mut pkt: Vec<u8> = (0..180).map(|_| r() as u8).collect();
+            if k % 10 == 0 {
+                pkt[20..33].copy_from_slice(b"\x00DecDVB News\x00");
+            }
+            if k == 500 {
+                pkt[60..97].copy_from_slice(b"\x00http://example.org/live/stream.m3u8\x00");
+            }
+            t.push_unit(&pkt);
+        }
+        let v = t.view();
+        assert_eq!(v.repeated[0], ("DecDVB News".into(), 200), "{v:?}");
+        assert!(
+            v.recent
+                .iter()
+                .any(|s| s.contains("http://example.org/live")),
+            "{v:?}"
+        );
+        // Chance strings do not recur.
+        assert!(
+            v.repeated.iter().all(|(_, c)| *c == 200 || *c <= 3),
+            "{v:?}"
+        );
     }
 
     #[test]

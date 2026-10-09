@@ -666,3 +666,25 @@ blocks. None publishes a sync word.
   bounded by the median over the middle half of the occupied band.
 - Not possible without captures: naming FastLink/VersaFEC; confirming the NS3/NS4
   header layout. HackRF tops out at 20 MS/s, below most NS4 hypermuxes.
+
+## Text in every decoder (2026-10-09)
+
+Rory: "add the strings decoding to all decoders". **v0.3.0 released** before
+it (live text in the generic decoder, the proprietary-waveform cues).
+
+- `decdvb-modem::text::ByteText`: runs of ≥ 6 printable bytes, counted; the
+  strings seen more than once are kept in their own small table, so ranking
+  costs nothing and the view is built on every frame (a cached view went
+  stale as soon as data stopped — the test saw 140 of 17 000 bytes); up to
+  65 536 distinct strings remembered, single sightings dropped oldest first;
+  strings ≥ 16 kept as they come. `push_keyed` carries a run on per stream.
+- TS stage: payloads after the header and adaptation field, per PID (a
+  table's strings span packets). IP stage: UDP/TCP payload (IP header and
+  L4 header skipped). TPC 2964 with an unknown payload: `TextFinder` over the
+  data bits (32 readings). Identify's live view: `TextSearch` as the generic
+  decoder (its "look for text" setting now shows for Identify too).
+- GUI: "Text in the transport stream" / "Text in the IP packets" (recurring
+  with counts, latest long strings); the bit-level card for TPC-unknown and
+  Identify.
+- Tests: the DVB-S VFO finds "DecDVB test signal" recurring in its TS; the
+  MPE carrier shows the SAP announcement's SDP lines in its IP text.

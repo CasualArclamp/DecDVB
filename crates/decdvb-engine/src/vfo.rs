@@ -599,6 +599,16 @@ impl Worker {
                 // demodulator, so the constellation keeps moving.
                 if let Some(l) = live {
                     l.process(&self.bb, &mut self.syms);
+                    // Text in the decided bits, as the generic decoder looks.
+                    match (self.settings.find_text, l.text.as_mut()) {
+                        (true, Some(t)) => t.push(&self.syms),
+                        (true, None) => {
+                            let mut t = Box::new(crate::psk::TextSearch::new(l.modulation));
+                            t.push(&self.syms);
+                            l.text = Some(t);
+                        }
+                        (false, _) => l.text = None,
+                    }
                 }
                 // After a confident result, rest before checking again: a
                 // carrier rarely changes, and re-analysing millions of samples
@@ -882,6 +892,10 @@ impl Worker {
                 // Live carrier-locked symbols once the live view has some;
                 // before that the last identification's; raw baseband only
                 // until there is one.
+                st.text = live
+                    .as_ref()
+                    .and_then(|l| l.text.as_ref())
+                    .map(|t| t.view());
                 let live = live.as_ref().filter(|l| l.demod.symbols() >= 500);
                 if let Some(l) = live {
                     st.scatter = l.demod.recent();
@@ -1165,6 +1179,8 @@ struct LiveView {
     phase: f64,
     step: f64,
     mixed: Vec<Iq>,
+    /// Text in the decided bits, while asked for.
+    text: Option<Box<crate::psk::TextSearch>>,
 }
 
 impl LiveView {
@@ -1185,6 +1201,7 @@ impl LiveView {
             phase: 0.0,
             step: -std::f64::consts::TAU * id.center_offset_hz / rate,
             mixed: Vec::new(),
+            text: None,
         })
     }
 
@@ -1885,7 +1902,12 @@ mod tests {
             let f = status.lock().unwrap().fec.clone();
             if let Some(f) = f.filter(|f| {
                 f.ts.as_ref().is_some_and(|t| {
-                    t.packets > 200 && t.report.programmes.iter().any(|p| p.name.is_some())
+                    t.packets > 200
+                        && t.report.programmes.iter().any(|p| p.name.is_some())
+                        && t.text
+                            .repeated
+                            .iter()
+                            .any(|r| r.0.contains("DecDVB test signal"))
                 })
             }) {
                 break f;
@@ -1994,11 +2016,24 @@ mod tests {
         use decdvb_mod::PlFramer;
         let settings = VfoSettings::new("TS", 40_000.0, 190_000.0, DecoderKind::Dvbs2Ts);
         let f = s2_vfo(PlFramer::new(0, 8), settings, |f| {
-            f.gse
-                .as_ref()
-                .is_some_and(|g| g.audio.iter().any(|a| a.sdp.is_some()))
+            f.gse.as_ref().is_some_and(|g| {
+                g.audio.iter().any(|a| a.sdp.is_some())
+                    && g.text
+                        .recent
+                        .iter()
+                        .any(|r| r.contains("DecDVB test radio"))
+            })
         });
         let g = f.gse.expect("no IP from MPE");
+        // The announcement's SDP, line by line, in the IP payloads.
+        assert!(
+            g.text
+                .recent
+                .iter()
+                .any(|r| r == "s=DecDVB test radio (MPE)"),
+            "{:?}",
+            g.text
+        );
         let mpe = g.mpe.as_ref().expect("no MPE");
         assert!(
             mpe.pids.contains_key(&decdvb_mod::fec::TEST_MPE_PID),

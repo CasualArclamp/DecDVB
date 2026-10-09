@@ -207,6 +207,24 @@ the strings arrive (telemetry, beacons, NMEA, idle messages), with the
 longest strings from any reading as candidates. Untick *look for text* to
 save the CPU (about a quarter of a core at 1 MBd).
 
+### Text in every decoder
+
+Every decoder shows the text in what it decodes:
+
+- **DVB-S2/S2X and DVB-S → MPEG-TS**: the transport stream's payloads, read
+  per PID so a table's strings come out whole — service and provider names,
+  EPG text, URLs, anything carried in the clear — and, when the stream
+  carries IP (MPE), the IP payloads too.
+- **DVB-S2/S2X → GSE/IP** and **TPC 2964 over HDLC**: the UDP/TCP payloads —
+  SAP/SDP announcements, HTTP headers, plain-text protocols.
+- **TPC 2964** whose payload is not recognised yet, **Identify** while it
+  demodulates live, and the **generic PSK** decoder: every reading of the
+  bits, as above.
+
+Decoded data may be compressed, encrypted or video, which throws up short
+printable runs by chance, so the byte decoders rank strings by how often
+they recur (chance runs do not recur) and list long strings as they come.
+
 ### What Identify reports
 
 It splits what it *knows* from what it *guesses*. **DVB-S2** is reported as a
