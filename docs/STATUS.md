@@ -1202,3 +1202,15 @@ adds the timing loop's measurement. Checked: the CID test capture decoded
 as if 15 ppm out (rate given 15 ppm high) — uncorrected, neither mode reads
 a frame (8–16 searches); with --clock-ppm 15 both lock at once, 9.9 dB a
 bit, identifier read.
+
+## DVB-CID on the spectrum (2026-10-09)
+
+Once a Carrier ID VFO has the code, the band view marks the spread signal
+under its host: a faint column over its occupied band (1.35 × the chip
+rate, RRC α 0.35) at host centre + the CID's offset, and the raised-cosine
+shape at its level — the despread SNR a bit less the 36.1 dB processing
+gain, against the spectrum's power there (host and noise). Below the
+display's floor it is drawn as a small dashed hump on the floor instead,
+the label still giving the level ("DSSS · 302 kHz · 29 dB under"). On the
+test capture (CID at −27.5 dB re the host's density, host at Es/N0 10 dB)
+it reads 29 dB under.

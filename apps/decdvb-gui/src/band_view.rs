@@ -528,6 +528,129 @@ impl BandView {
             close_boxes.push((v.id, xr));
         }
 
+        // ---- DVB-CIDs locked: where each spread signal sits under its carrier,
+        // and how far under — its despread SNR a bit, less the 36 dB of
+        // processing gain (4096 chips), is its spectral density against what
+        // lies on it (the host and the noise, read off the spectrum there).
+        if have_signal {
+            let s = &inp.front.spectrum_db;
+            let n = s.len();
+            let bin = |hz: f64| {
+                ((hz / self.span + 0.5) * n as f64)
+                    .floor()
+                    .clamp(0.0, (n - 1) as f64) as usize
+            };
+            for v in inp.vfos {
+                let Some(c) = inp.statuses.get(&v.id).and_then(|st| st.cid.as_ref()) else {
+                    continue;
+                };
+                if !c.stats.acquired || c.chip_rate <= 0.0 {
+                    continue;
+                }
+                let rc = c.chip_rate;
+                // RRC, α 0.35 (TS 103 129 §5.6).
+                let alpha = 0.35;
+                let f = v.settings.offset_hz + c.center_hz + c.stats.offset_hz;
+                let edge = 0.5 * (1.0 + alpha) * rc;
+                let (x0, x1) = (x_of(f - edge), x_of(f + edge));
+                if x1 < rect.left() || x0 > rect.right() {
+                    continue;
+                }
+                // What lies on it: the spectrum's mean power over its flat part.
+                let (b0, b1) = (bin(f - 0.3 * rc), bin(f + 0.3 * rc).max(bin(f - 0.3 * rc)));
+                let lin = s[b0..=b1]
+                    .iter()
+                    .map(|&d| 10f64.powf(f64::from(d) / 10.0))
+                    .sum::<f64>()
+                    / (b1 - b0 + 1) as f64;
+                let snr = (10f64.powf(f64::from(c.stats.snr_db) / 10.0) - 1.0).max(1e-3);
+                let under = 10.0 * (decdvb_engine::cid::CHIPS as f64).log10() - 10.0 * snr.log10();
+                let top = (10.0 * lin.log10() - under) as f32;
+                let colour = Color32::from_rgb(255, 170, 60);
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        pos2(x0.max(rect.left()), spec.top()),
+                        pos2(x1.min(rect.right()), spec.bottom()),
+                    ),
+                    CornerRadius::ZERO,
+                    Color32::from_rgba_unmultiplied(255, 170, 60, 16),
+                );
+                // The raised-cosine power shape at that level — or, below the
+                // display's floor, a small dashed hump on it, so where it is
+                // and its shape still show (the label gives the level).
+                let floor = y_of(top) >= spec.bottom() - 1.0;
+                let shape: Vec<Pos2> = (0..=96)
+                    .map(|i| {
+                        let hz = f - edge + 2.0 * edge * f64::from(i) / 96.0;
+                        let u = (hz - f).abs() / rc;
+                        let flat = 0.5 * (1.0 - alpha);
+                        let h = if u <= flat {
+                            1.0
+                        } else {
+                            0.5 * (1.0 + (std::f64::consts::PI / alpha * (u - flat)).cos())
+                        };
+                        let y = if floor {
+                            spec.bottom() - 16.0 * h as f32
+                        } else {
+                            y_of(top + (10.0 * h.max(1e-4).log10()) as f32)
+                        };
+                        pos2(x_of(hz), y)
+                    })
+                    .collect();
+                let fill =
+                    Color32::from_rgba_unmultiplied(255, 170, 60, if floor { 30 } else { 60 });
+                let mut mesh = Mesh::default();
+                for p in &shape {
+                    let i = mesh.vertices.len() as u32;
+                    mesh.colored_vertex(*p, fill);
+                    mesh.colored_vertex(pos2(p.x, spec.bottom()), fill);
+                    if i >= 2 {
+                        mesh.add_triangle(i - 2, i - 1, i);
+                        mesh.add_triangle(i - 1, i + 1, i);
+                    }
+                }
+                painter.add(egui::Shape::mesh(mesh));
+                if floor {
+                    painter.extend(egui::Shape::dashed_line(
+                        &shape,
+                        Stroke::new(1.5, colour),
+                        5.0,
+                        3.0,
+                    ));
+                } else {
+                    painter.add(egui::Shape::line(shape, Stroke::new(1.5, colour)));
+                }
+                let xc = x_of(f);
+                let y_top = if floor {
+                    spec.bottom() - 16.0
+                } else {
+                    y_of(top)
+                };
+                painter.line_segment(
+                    [
+                        pos2(xc, (y_top - 6.0).max(spec.top() + 44.0)),
+                        pos2(xc, spec.bottom()),
+                    ],
+                    Stroke::new(1.0, colour.gamma_multiply(0.8)),
+                );
+                painter.text(
+                    pos2(
+                        xc,
+                        (y_top - 8.0).clamp(spec.top() + 44.0, spec.bottom() - 4.0),
+                    ),
+                    Align2::CENTER_BOTTOM,
+                    format!(
+                        "DSSS · {:.0} kHz · {:.0} dB under{}",
+                        2.0 * edge / 1e3,
+                        under,
+                        if floor { " (below the floor)" } else { "" }
+                    ),
+                    FontId::proportional(11.0),
+                    colour,
+                );
+            }
+        }
+
         // ---- detected carriers: brackets near the top of the spectrum
         let carrier_y = spec.top() + 34.0;
         let covered = |hz: f64| {
