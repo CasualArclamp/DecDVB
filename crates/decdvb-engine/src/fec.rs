@@ -362,8 +362,11 @@ pub struct E1View {
 /// through the multicast-audio player and recorder as RTP A-law (PCMA,
 /// 8 kHz) — G.711 is what both already take.
 struct E1Stage {
+    /// Power per timeslot over the current 10 ms chunk, and the chunks'
+    /// powers over the current half second.
     acc: [f64; decdvb_modem::e1::TIMESLOTS],
     n: u32,
+    chunks: Vec<[f64; decdvb_modem::e1::TIMESLOTS]>,
     levels_db: Vec<f32>,
     play_want: Option<u8>,
     player: Option<AudioPlayer>,
@@ -377,8 +380,13 @@ struct E1Stage {
     error: Option<String>,
 }
 
-/// Frames in a level reading: half a second.
-const E1_LEVEL_FRAMES: u32 = 4000;
+/// Frames in a level chunk (10 ms), and chunks in a reading (half a
+/// second). A timeslot's level is the 80th percentile of its chunks' power:
+/// a few garbled frames while the alignment is lost and found again (an
+/// average would read them as speech on an idle channel) are left out, yet a
+/// channel speaking for a fifth of the time shows.
+const E1_CHUNK_FRAMES: u32 = 80;
+const E1_LEVEL_CHUNKS: usize = 50;
 /// A-law bytes per RTP packet: 20 ms.
 const E1_CHUNK: usize = 160;
 
@@ -402,6 +410,7 @@ impl E1Stage {
         E1Stage {
             acc: [0.0; decdvb_modem::e1::TIMESLOTS],
             n: 0,
+            chunks: Vec::new(),
             levels_db: Vec::new(),
             play_want: None,
             player: None,
@@ -461,14 +470,26 @@ impl E1Stage {
                 *a += v * v;
             }
             self.n += 1;
-            if self.n >= E1_LEVEL_FRAMES {
-                self.levels_db = self
-                    .acc
-                    .iter()
-                    .map(|&a| (10.0 * (a / self.n as f64).max(1e-12).log10()) as f32)
-                    .collect();
+            if self.n >= E1_CHUNK_FRAMES {
+                let n = self.n as f64;
+                let mut c = self.acc;
+                for v in &mut c {
+                    *v /= n;
+                }
+                self.chunks.push(c);
                 self.acc = [0.0; decdvb_modem::e1::TIMESLOTS];
                 self.n = 0;
+            }
+            if self.chunks.len() >= E1_LEVEL_CHUNKS {
+                self.levels_db = (0..decdvb_modem::e1::TIMESLOTS)
+                    .map(|k| {
+                        let mut p: Vec<f64> = self.chunks.iter().map(|c| c[k]).collect();
+                        p.sort_unstable_by(f64::total_cmp);
+                        let v = p[p.len() * 4 / 5];
+                        (10.0 * v.max(1e-12).log10()) as f32
+                    })
+                    .collect();
+                self.chunks.clear();
             }
             // One RTP packet per 20 ms of the chosen timeslot.
             if let (Some(t), Some(p)) = (self.play_want, &mut self.player) {

@@ -4,6 +4,7 @@
 //! file and report level/spectrum occupancy). `decode` and `modulate` arrive
 //! with the later milestones.
 
+mod decode;
 mod scene;
 
 use std::path::PathBuf;
@@ -95,6 +96,37 @@ enum Command {
         #[arg(long, default_value_t = 30.0)]
         timeout: f64,
     },
+    /// Run one decoder over a capture and report what it finds.
+    Decode {
+        file: PathBuf,
+        #[arg(long, value_parser = parse_format)]
+        format: Option<SampleFormat>,
+        /// Sample rate; taken from the file name (…_320000Sps…) when omitted.
+        #[arg(long)]
+        rate: Option<f64>,
+        /// Decoder: id, ip, ts, dvbs, tpc, psk.
+        #[arg(long, default_value = "id")]
+        decoder: String,
+        /// VFO centre relative to the capture's centre, Hz.
+        #[arg(long, default_value_t = 0.0)]
+        offset: f64,
+        /// VFO width, Hz (default 90 % of the sample rate).
+        #[arg(long)]
+        bandwidth: Option<f64>,
+        /// Symbol rate, if known (found blind otherwise).
+        #[arg(long)]
+        symbol_rate: Option<f64>,
+        /// Modulation for tpc/psk (bpsk, qpsk, 8psk, 16qam…).
+        #[arg(long)]
+        modulation: Option<String>,
+        /// Write the decoder's outputs (PCAP, TS, data, E1 audio) here.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// As fast as possible rather than in real time (may drop blocks
+        /// if a decoder cannot keep up).
+        #[arg(long)]
+        fast: bool,
+    },
 }
 
 fn parse_format(s: &str) -> std::result::Result<SampleFormat, String> {
@@ -149,11 +181,34 @@ fn main() -> Result<()> {
             rate,
             timeout,
         } => scan(file, format, rate, timeout),
+        Command::Decode {
+            file,
+            format,
+            rate,
+            decoder,
+            offset,
+            bandwidth,
+            symbol_rate,
+            modulation,
+            out,
+            fast,
+        } => decode::decode(decode::DecodeArgs {
+            file,
+            format,
+            rate,
+            decoder,
+            offset,
+            bandwidth,
+            symbol_rate,
+            modulation,
+            out,
+            fast,
+        }),
     }
 }
 
 /// Sample rate from a name like `…_8Msps…`, `…_500ksps…` or `…_2000000sps…`.
-fn rate_from_name(path: &std::path::Path) -> Option<f64> {
+pub(crate) fn rate_from_name(path: &std::path::Path) -> Option<f64> {
     let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
     stem.split(['_', '-', ' ']).find_map(|t| {
         let n = t.strip_suffix("sps")?;
