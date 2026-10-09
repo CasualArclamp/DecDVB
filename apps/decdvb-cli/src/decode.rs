@@ -27,6 +27,8 @@ pub struct DecodeArgs {
     pub labels: String,
     /// cid: low-SNR mode.
     pub low_snr: bool,
+    /// cid: the clock correction, ppm.
+    pub clock_ppm: f64,
 }
 
 fn decoder_by_name(name: &str) -> Result<DecoderKind> {
@@ -97,6 +99,7 @@ pub fn decode(a: DecodeArgs) -> Result<()> {
         };
     }
     s.cid_low_snr = a.low_snr;
+    s.clock_ppm = a.clock_ppm;
     if let Some(dir) = &a.out {
         s.record = true;
         s.record_dir = dir.clone();

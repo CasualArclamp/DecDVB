@@ -280,6 +280,47 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
             }
 
             if s.decoder == DecoderKind::CarrierId {
+                // The receiver's clock correction: one value for every VFO,
+                // kept between sessions.
+                ui.label("Clock correction");
+                ui.horizontal(|ui| {
+                    let mut ppm = crate::prefs::clock_ppm();
+                    let r = ui
+                        .add(
+                            egui::DragValue::new(&mut ppm)
+                                .range(-100.0..=100.0)
+                                .speed(0.1)
+                                .max_decimals(1)
+                                .suffix(" ppm"),
+                        )
+                        .on_hover_text(
+                            "How much faster transmitters' clocks run against the SDR's — \
+                             mostly the SDR's own error (positive: the SDR runs slow). The \
+                             CID decoder resamples to the corrected chip rate, so its long \
+                             searches see no drift (low-SNR mode copes with about ±8 ppm \
+                             uncorrected). Applies to every VFO and is remembered.",
+                        );
+                    if r.changed() {
+                        crate::prefs::set_clock_ppm(ppm);
+                    }
+                    let measured = st
+                        .cid
+                        .as_ref()
+                        .filter(|c| c.stats.acquired)
+                        .and_then(|c| c.stats.clock_ppm);
+                    if let Some(m) = measured
+                        && ui
+                            .button(format!("Use measured ({:+.1})", ppm + m))
+                            .on_hover_text(
+                                "Add what the CID's timing loop measures to the correction",
+                            )
+                            .clicked()
+                    {
+                        crate::prefs::set_clock_ppm(((ppm + m) * 10.0).round() / 10.0);
+                    }
+                });
+                ui.end_row();
+
                 ui.label("Sensitivity");
                 let b = egui::Button::new(if s.cid_low_snr {
                     "Low-SNR mode: on"

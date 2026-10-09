@@ -296,6 +296,24 @@ impl App {
         )
     }
 
+    /// Every VFO on the current clock correction (it is one per receiver).
+    fn sync_clock_ppm(&mut self) {
+        let ppm = prefs::clock_ppm();
+        let stale: Vec<(VfoId, decdvb_engine::VfoSettings)> = self
+            .vfos
+            .iter()
+            .filter(|v| v.settings.clock_ppm != ppm)
+            .map(|v| {
+                let mut s = v.settings.clone();
+                s.clock_ppm = ppm;
+                (v.id, s)
+            })
+            .collect();
+        for (id, s) in stale {
+            self.apply(Action::Update(id, s));
+        }
+    }
+
     fn apply(&mut self, a: Action) {
         match a {
             Action::Select(id) => self.selected = id,
@@ -307,7 +325,8 @@ impl App {
                     e.update_vfo(id, s);
                 }
             }
-            Action::Create(s) => {
+            Action::Create(mut s) => {
+                s.clock_ppm = prefs::clock_ppm();
                 if let Some(e) = &mut self.engine {
                     if s.decoder == DecoderKind::IqRecord {
                         let _ = std::fs::create_dir_all(&s.record_dir);
@@ -718,6 +737,7 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.sync_clock_ppm();
         // Files dropped on the window.
         // egui 0.36: a dropped file is a trait object; on native it has a path.
         let dropped = ctx.input(|i| {

@@ -1189,3 +1189,16 @@ Now: both modes read frames with 0.3–1 rad of phase noise, and with 5 ppm
 plus 0.6 rad together (test); normal mode copes with ±12 ppm, low-SNR mode
 ±8 (its 96–384-bit searches smear the code peak beyond that; a clock
 correction would extend it).
+
+## Clock correction (2026-10-09)
+
+One value per receiver (`VfoSettings::clock_ppm`, the GUI keeps every VFO
+on the one in prefs.txt, `clock_ppm=`; CLI `--clock-ppm`): how much faster
+transmitters' clocks run against the SDR's, in the same terms the CID card
+measures. The CID thread resamples to the chip rate as our clock sees it
+(SPS × rate × (1 + ppm·10⁻⁶), retuned live), so even 384-bit searches see
+no drift. The Carrier ID VFO's settings show it with "Use measured", which
+adds the timing loop's measurement. Checked: the CID test capture decoded
+as if 15 ppm out (rate given 15 ppm high) — uncorrected, neither mode reads
+a frame (8–16 searches); with --clock-ppm 15 both lock at once, 9.9 dB a
+bit, identifier read.

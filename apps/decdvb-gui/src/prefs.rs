@@ -8,6 +8,8 @@ use std::sync::Mutex;
 
 /// The output folder in use: recordings, symbol files, PCAP and TS files.
 static OUTPUT_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// The receiver's clock correction, ppm (see `VfoSettings::clock_ppm`).
+static CLOCK_PPM: Mutex<f64> = Mutex::new(0.0);
 
 fn prefs_path() -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA")
@@ -68,6 +70,20 @@ pub fn load() {
         decdvb_audio::set_volume(v);
     }
     decdvb_audio::set_muted(get("muted") == Some("1"));
+    if let Some(v) = get("clock_ppm").and_then(|v| v.parse::<f64>().ok()) {
+        *CLOCK_PPM.lock().unwrap() = v;
+    }
+}
+
+/// The clock correction, ppm.
+pub fn clock_ppm() -> f64 {
+    *CLOCK_PPM.lock().unwrap()
+}
+
+/// Use (and remember) a clock correction of `ppm`.
+pub fn set_clock_ppm(ppm: f64) {
+    *CLOCK_PPM.lock().unwrap() = ppm;
+    let _ = write_key("clock_ppm", &format!("{ppm:.2}"));
 }
 
 /// Remember the audio volume and mute as they are now.

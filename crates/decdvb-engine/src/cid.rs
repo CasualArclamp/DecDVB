@@ -33,6 +33,8 @@ pub struct CidView {
     pub stats: CidStats,
     /// Low-SNR mode is on (deep searches to 384 bits, looser threshold).
     pub low_snr: bool,
+    /// The clock correction in use, ppm.
+    pub clock_ppm: f64,
     /// Blocks dropped because the thread was behind.
     pub dropped: u64,
 }
@@ -58,6 +60,8 @@ pub(crate) struct CidWorker {
     /// Low-SNR mode, read by the thread before each block (`Arc`: owned by
     /// both this handle and the thread).
     low_snr: Arc<AtomicBool>,
+    /// The clock correction, ppm, as an f64's bits (atomics hold integers).
+    clock_ppm: Arc<AtomicU64>,
 }
 
 impl CidWorker {
@@ -83,6 +87,8 @@ impl CidWorker {
         let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE);
         let low_snr = Arc::new(AtomicBool::new(false));
         let low = Arc::clone(&low_snr);
+        let clock_ppm = Arc::new(AtomicU64::new(0f64.to_bits()));
+        let clock = Arc::clone(&clock_ppm);
         let v = view.clone();
         let join = std::thread::Builder::new()
             .name("decdvb-cid".into())
@@ -91,10 +97,14 @@ impl CidWorker {
                 // than the VFO passes.
                 let bw = (1.5 * rc).min(0.95 * in_rate);
                 let mut ddc = Ddc::new(in_rate, center_hz, bw);
-                let mut rs = Resampler::new(ddc.out_rate(), SPS as f64 * rc);
+                // Chips at SPS a sample — at the chip rate as our clock sees
+                // it, the correction applied.
+                let rate_for = |ppm: f64| SPS as f64 * rc * (1.0 + ppm * 1e-6);
+                let mut ppm_now = 0.0;
+                let mut rs = Resampler::new(ddc.out_rate(), rate_for(ppm_now));
                 let mut cid = CidRx::new(rc).with_span(span_hz);
                 let (mut mixed, mut at4, mut frames) = (Vec::new(), Vec::new(), Vec::new());
-                let to_chips = SPS as f64 * rc / in_rate;
+                let mut to_chips = rate_for(ppm_now) / in_rate;
                 while let Ok(msg) = rx.recv() {
                     let block = match msg {
                         Msg::Block(b) => b,
@@ -104,6 +114,12 @@ impl CidWorker {
                             continue;
                         }
                     };
+                    let ppm = f64::from_bits(clock.load(Ordering::Relaxed));
+                    if ppm != ppm_now {
+                        ppm_now = ppm;
+                        rs.retune(ddc.out_rate(), rate_for(ppm));
+                        to_chips = rate_for(ppm) / in_rate;
+                    }
                     mixed.clear();
                     ddc.process(&block, &mut mixed);
                     at4.clear();
@@ -114,6 +130,7 @@ impl CidWorker {
                     let mut view = v.lock().unwrap();
                     view.stats = cid.stats.clone();
                     view.low_snr = cid.low_snr();
+                    view.clock_ppm = ppm_now;
                 }
             })
             .expect("spawn CID thread");
@@ -124,7 +141,13 @@ impl CidWorker {
             lossless,
             gap: AtomicU64::new(0),
             low_snr,
+            clock_ppm,
         }
+    }
+
+    /// The clock correction, ppm (taken up with the next block).
+    pub fn set_clock_ppm(&self, ppm: f64) {
+        self.clock_ppm.store(ppm.to_bits(), Ordering::Relaxed);
     }
 
     /// Low-SNR mode on or off (taken up with the next block).
@@ -188,6 +211,11 @@ impl Resampler {
             pos: 1.0,
             buf: Vec::new(),
         }
+    }
+
+    /// A new output rate, carrying on from where it is.
+    fn retune(&mut self, in_rate: f64, out_rate: f64) {
+        self.step = in_rate / out_rate;
     }
 
     fn process(&mut self, input: &[Iq], out: &mut Vec<Iq>) {

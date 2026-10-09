@@ -164,6 +164,11 @@ pub struct VfoSettings {
     /// DVB-CID: low-SNR mode (searches 96–384 bits deep, a looser
     /// threshold, gentle tracking throughout) for a CID far under spec.
     pub cid_low_snr: bool,
+    /// The receiver's clock correction, ppm: how much faster a transmitter's
+    /// clock runs against the SDR's (an SDR clock running slow shows as
+    /// positive). The CID decoder resamples to the corrected chip rate, so
+    /// its long searches see no drift. It is what the CID card measures.
+    pub clock_ppm: f64,
     /// Write the decoder's output to a file: symbols (generic PSK) or IP
     /// packets as PCAP (DVB-S2 → GSE/IP). Off by default — the decoder shows
     /// what it finds until recording is asked for.
@@ -209,6 +214,7 @@ impl VfoSettings {
             symbol_labels: crate::psk::SymbolLabels::Standard,
             record_on_activity: false,
             cid_low_snr: false,
+            clock_ppm: 0.0,
             record: false,
             gse_variant: None,
             // Local only: a player on this machine. Point them elsewhere on
@@ -877,6 +883,7 @@ impl Worker {
             Decoder::Cid { buf, worker } => match worker {
                 Some(w) => {
                     w.set_low_snr(self.settings.cid_low_snr);
+                    w.set_clock_ppm(self.settings.clock_ppm);
                     w.offer(self.bb.clone());
                 }
                 None => {

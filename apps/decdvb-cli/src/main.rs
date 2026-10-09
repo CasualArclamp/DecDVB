@@ -146,6 +146,9 @@ enum Command {
         /// cid: low-SNR mode (searches 96–384 bits deep, looser threshold).
         #[arg(long)]
         low_snr: bool,
+        /// cid: the receiver's clock correction, ppm (as the CID measures it).
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        clock_ppm: f64,
     },
 }
 
@@ -234,6 +237,7 @@ fn main() -> Result<()> {
             e1_record,
             labels,
             low_snr,
+            clock_ppm,
         } => decode::decode(decode::DecodeArgs {
             file,
             format,
@@ -248,6 +252,7 @@ fn main() -> Result<()> {
             e1_record,
             labels,
             low_snr,
+            clock_ppm,
         }),
     }
 }
