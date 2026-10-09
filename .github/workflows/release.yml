@@ -2,8 +2,9 @@
 # workflow with an existing tag) builds decdvb-gui.exe and decdvb.exe with the static
 # C runtime and the HackRF front end (pure Rust over USB: no DLLs), checks that their
 # versions match the tag and that they need no C runtime DLL, smoke-tests the command
-# line on a synthetic capture, and uploads them with their SHA-256 to a draft release
-# of the tag. Then write the release notes and publish it:
+# line on a synthetic capture, writes the test signals (`decdvb test-signals`) and
+# checks the DVB-CID one decodes, and uploads the exes and the test signals with their
+# SHA-256 to a draft release of the tag. Then write the release notes and publish it:
 #
 #   gh release edit vX.Y.Z --notes-file notes.md --draft=false --latest
 #
@@ -72,6 +73,11 @@ jobs:
           "$bin/decdvb" scene "$scene" --seconds 2
           "$bin/decdvb" scan "$scene" --timeout 120 | tee "$RUNNER_TEMP/scan.txt"
           grep -q -i "DVB-S2" "$RUNNER_TEMP/scan.txt"
+          # The test signals for the release, and the CID one read back.
+          "$bin/decdvb" test-signals test-signals
+          "$bin/decdvb" decode test-signals/decdvb-cid_3360000sps.cs8 --decoder cid \
+            --offset 700000 --bandwidth 1500000 --fast | tee "$RUNNER_TEMP/cid.txt"
+          grep -q "75:00:06:B0:FF:FF:01:AC:07" "$RUNNER_TEMP/cid.txt"
       - name: Draft release
         if: github.event_name == 'push' || inputs.upload
         shell: bash
@@ -81,13 +87,19 @@ jobs:
           set -euo pipefail
           bin=target/x86_64-pc-windows-msvc/release
           cp "$bin/decdvb-gui.exe" "$bin/decdvb.exe" .
+          mv test-signals/decdvb-scene_8Msps.cs8 test-signals/decdvb-cid_3360000sps.cs8 .
+          files=(decdvb-gui.exe decdvb.exe decdvb-scene_8Msps.cs8 decdvb-cid_3360000sps.cs8)
           cat > notes.md <<'EOF'
           Portable Windows executables for 64-bit Windows 10/11, nothing to install (static C runtime).
 
           | File | What |
           |---|---|
-          | `decdvb-gui.exe` | Desktop app: wideband waterfall with VFOs (DVB-S2/S2X → GSE/IP or MPEG-TS, DVB-S, generic PSK/QAM, IQ record), IQ files or a HackRF One |
-          | `decdvb.exe` | Command line: `decdvb scan`, `decdvb analyse`, `decdvb scene`, `decdvb modcods` |
+          | `decdvb-gui.exe` | Desktop app: wideband waterfall with VFOs (DVB-S2/S2X → GSE/IP or MPEG-TS, DVB-S, satellite modems, DVB-CID, generic PSK/QAM, IQ record), IQ files or a HackRF One |
+          | `decdvb.exe` | Command line: `decdvb scan`, `decdvb decode`, `decdvb analyse`, `decdvb scene`, `decdvb cid`, `decdvb test-signals`, `decdvb modcods` |
+          | `decdvb-scene_8Msps.cs8` | Test signal, 8 MS/s, 4 s: DVB-S2 (IP over GSE, and an S2X ACM carrier with MPEG-TS), DVB-S, a TPC 2964 modem carrier and a CW tone |
+          | `decdvb-cid_3360000sps.cs8` | Test signal, 3.36 MS/s, 30 s: DVB-S2 QPSK 1/2 at +700 kHz with a DVB-CID under it (identifier and position decode) |
+
+          Open a test signal in the GUI (Open IQ…; the sample rate is in the file name) and click a carrier, or run `decdvb test-signals` to make them yourself ([tests/README.md](https://github.com/CasualArclamp/DecDVB/blob/main/tests/README.md)).
 
           A HackRF One works receive-only with no DLLs; on Windows it must use the WinUSB driver (Zadig, or the one the official HackRF tools install). IQ files need nothing.
           Windows SmartScreen may warn on first start because the files are unsigned ("More info" → "Run anyway").
@@ -99,7 +111,7 @@ jobs:
             echo "SHA-256:"
             echo '```'
             # (Git Bash's sha256sum marks binary mode with a star: "hash *file".)
-            sha256sum decdvb-gui.exe decdvb.exe | sed 's/ \*/  /'
+            sha256sum "${files[@]}" | sed 's/ \*/  /'
             echo '```'
           } >> notes.md
           if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2> /dev/null); then
@@ -107,10 +119,10 @@ jobs:
               echo "release $TAG is already published: not replacing its files" >&2
               exit 1
             fi
-            gh release upload "$TAG" decdvb-gui.exe decdvb.exe --clobber
+            gh release upload "$TAG" "${files[@]}" --clobber
             gh release edit "$TAG" --notes-file notes.md
           else
             gh release create "$TAG" --draft --verify-tag --title "DecDVB ${TAG#v} (Windows portable)" \
-              --notes-file notes.md decdvb-gui.exe decdvb.exe
+              --notes-file notes.md "${files[@]}"
           fi
           cat notes.md >> "$GITHUB_STEP_SUMMARY"
