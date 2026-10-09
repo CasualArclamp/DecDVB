@@ -287,6 +287,9 @@ pub(crate) struct VfoHandle {
     pub status: Arc<Mutex<VfoStatus>>,
     pub settings: VfoSettings,
     dropped: Arc<AtomicU64>,
+    /// Input samples in the blocks dropped (decoders that keep time, the
+    /// CID's, stand zeros in for them).
+    lost: Arc<AtomicU64>,
     /// Latest settings not yet taken by the worker.
     mailbox: Arc<Mutex<Option<VfoSettings>>>,
     stop: Arc<AtomicBool>,
@@ -306,6 +309,7 @@ impl VfoHandle {
             self.tx.try_send(VfoMsg::Block(Arc::clone(block)))
         {
             self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.lost.fetch_add(block.len() as u64, Ordering::Relaxed);
         }
     }
 
@@ -338,11 +342,13 @@ pub(crate) fn spawn(in_rate: f64, settings: VfoSettings, lossless: bool) -> VfoH
     let (tx, rx) = mpsc::sync_channel(QUEUE_DEPTH);
     let status = Arc::new(Mutex::new(VfoStatus::default()));
     let dropped = Arc::new(AtomicU64::new(0));
+    let lost = Arc::new(AtomicU64::new(0));
     let mailbox = Arc::new(Mutex::new(None));
     let stop = Arc::new(AtomicBool::new(false));
     let join = {
         let status = Arc::clone(&status);
         let dropped = Arc::clone(&dropped);
+        let lost = Arc::clone(&lost);
         let mailbox = Arc::clone(&mailbox);
         let stop = Arc::clone(&stop);
         let settings = settings.clone();
@@ -351,6 +357,7 @@ pub(crate) fn spawn(in_rate: f64, settings: VfoSettings, lossless: bool) -> VfoH
             .spawn(move || {
                 let mut w = Worker::new(in_rate, settings, status, dropped);
                 w.lossless = lossless;
+                w.lost = lost;
                 w.run(rx, mailbox, stop)
             })
             .expect("spawning a VFO thread")
@@ -361,6 +368,7 @@ pub(crate) fn spawn(in_rate: f64, settings: VfoSettings, lossless: bool) -> VfoH
         status,
         settings,
         dropped,
+        lost,
         mailbox,
         stop,
         join: Some(join),
@@ -460,6 +468,10 @@ struct Worker {
     identification: Option<Identification>,
     /// Wait for the FEC thread rather than dropping its input.
     lossless: bool,
+    /// Input samples dropped before reaching this thread, and how many of
+    /// them have been passed on.
+    lost: Arc<AtomicU64>,
+    lost_seen: u64,
 }
 
 impl Worker {
@@ -483,6 +495,8 @@ impl Worker {
             settings,
             status,
             dropped,
+            lost: Arc::new(AtomicU64::new(0)),
+            lost_seen: 0,
             load: 0.0,
             bb: Vec::new(),
             frames: Vec::new(),
@@ -623,6 +637,19 @@ impl Worker {
             match msg {
                 VfoMsg::Wake => {}
                 VfoMsg::Block(block) => {
+                    // Blocks dropped since the last one: tell the CID
+                    // decoder how much baseband never came.
+                    let lost = self.lost.load(Ordering::Relaxed);
+                    if lost > self.lost_seen {
+                        let n = lost - self.lost_seen;
+                        self.lost_seen = lost;
+                        if let Decoder::Cid {
+                            worker: Some(w), ..
+                        } = &self.decoder
+                        {
+                            w.lost((n as f64 * self.ddc.out_rate() / self.in_rate) as u64);
+                        }
+                    }
                     let t0 = Instant::now();
                     self.bb.clear();
                     self.ddc.process(&block, &mut self.bb);

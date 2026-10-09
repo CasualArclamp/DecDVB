@@ -973,3 +973,30 @@ starts. 30 s holds one whole frame (identifier, position); all six take
 (identifier, MAC, position), Identify calls the host DVB-S2 QPSK 1/2 with
 pilots, and its TS decodes. The CID's offset reads +523 Hz: Identify's
 centre for the host is ~300 Hz low, as on the GUI test (−80 Hz there).
+
+## DVB-CID live view; three receiver fixes (2026-10-09)
+
+`CidStats::live` (`CidLive`) records the tracking a bit at a time: the
+prompt correlations turned onto the real axis (the bits' squares averaged
+give the phase) at unit power, the differential products, SNR and
+frequency over 256 bits, early/prompt/late magnitudes averaged over ~10 bits,
+the last 244 soft bits, and the frame sync (copies of the UW in a row, time
+to the frame being whole). The Carrier ID card draws them as instrument
+panels (painted, not egui_plot): two constellations with MER, the E·P·L
+stems on the ideal correlation triangle with (E−L)/(E+L), two strip charts,
+a soft-bit bar code and four "copy" boxes filling.
+
+Building it showed the GUI's CID at 0.9 dB a bit where the CLI had 8.4 on
+the same file. Fixed:
+- Lost lock was "64 bits in a row with |P|² < 2·noise"; off the code one
+  bit's power exceeds that one time in seven, so a slipped tracker followed
+  noise for good. Now the smoothed SNR under 3 dB for 64 bits.
+- Dropped samples (the VFO's queue, or the CID thread's own) are reported as
+  gaps (`VfoHandle` counts the samples, `CidWorker::lost`, a `Gap` message)
+  and `CidRx::gap` stands zeros in, so timing and phase carry on and only
+  the bits in the gap are hurt.
+- The frame search waited for a frame + 22 bits, so a frame ending near the
+  end of a recording never decoded.
+Tests: a reported 60 000-sample gap rides through (one search, the frame
+decodes); unreported, the receiver searches again and relocks. In the GUI
+the 30 s test capture now locks at 9.3 dB a bit and decodes its frame.

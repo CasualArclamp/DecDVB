@@ -617,6 +617,46 @@ pub struct CidStats {
     /// stats out for display many times a second copies a pointer, not the
     /// map.
     pub search: Option<Arc<CidSearch>>,
+    /// The tracking, bit by bit, for live display.
+    pub live: CidLive,
+}
+
+/// Bits of history the live display keeps.
+pub const LIVE_BITS: usize = 256;
+
+/// What the tracking did lately, for live display (oldest first).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CidLive {
+    /// Despread bits (the prompt correlations), turned so the data lie on
+    /// the real axis and scaled to unit power — a BPSK constellation.
+    pub bits: Vec<Iq>,
+    /// Each bit times the previous one's conjugate: what differential
+    /// detection decides on (the carrier's phase gone).
+    pub diffs: Vec<Iq>,
+    /// Per bit: the despread SNR, dB, and the CID's frequency, Hz.
+    pub snr_db: Vec<f32>,
+    pub freq_hz: Vec<f32>,
+    /// The latest early, prompt and late correlation magnitudes, a quarter
+    /// chip apart, over the prompt's.
+    pub epl: [f32; 3],
+    /// The latest soft bits (sign: the bit), one frame's worth.
+    pub soft: Vec<f32>,
+    /// Frame sync: copies of the unique word seen in a row (0 while none,
+    /// 1–4), whether frames are aligned (one decoded and the next due), and
+    /// the seconds until the current frame's four copies are all in.
+    pub uw_copies: u8,
+    pub aligned: bool,
+    pub frame_in_s: Option<f32>,
+}
+
+impl CidLive {
+    /// Append to a history kept `cap` long.
+    fn keep<T>(v: &mut Vec<T>, x: T, cap: usize) {
+        if v.len() == cap {
+            v.remove(0);
+        }
+        v.push(x);
+    }
 }
 
 /// One code search, for display: correlation power over code phase and
@@ -659,7 +699,10 @@ const PROFILE_POINTS: usize = 512;
 const ACQ_BITS: usize = 24;
 const ACQ_SPAN_HZ: f64 = 1500.0;
 const ACQ_THRESHOLD: f32 = 3.0;
-/// Bits of low correlation in a row before searching again.
+/// Bits in a row with the smoothed despread SNR under 3 dB before searching
+/// again. (Not the single bit's: off the code, one bit's power is an
+/// exponential variable, over twice the noise one time in seven, so a run
+/// of 64 low ones almost never came and a slipped tracker followed noise.)
 const LOST_BITS: u32 = 64;
 
 /// DVB-CID receiver: samples at four per chip, centred on the host
@@ -682,6 +725,11 @@ pub struct CidRx {
     soft: Vec<f32>,
     /// Bits already taken by a decoded frame (an index into `soft`).
     next_frame: Option<usize>,
+    /// The display's phase reference: the bits' squares averaged (the
+    /// square removes the data), half its angle.
+    disp: Iq,
+    /// Early, prompt and late magnitudes, averaged for display.
+    epl_avg: [f32; 3],
     pub stats: CidStats,
 }
 
@@ -709,7 +757,23 @@ impl CidRx {
             noise: 0.0,
             soft: Vec::new(),
             next_frame: None,
+            disp: Iq::new(0.0, 0.0),
+            epl_avg: [0.0; 3],
             stats: CidStats::default(),
+        }
+    }
+
+    /// Samples that never came (dropped upstream): stand zeros in for them,
+    /// so the code's timing and the carrier's phase run on across the gap
+    /// and only the bits it covers are lost.
+    pub fn gap(&mut self, samples: usize, out: &mut Vec<CidFrame>) {
+        // In pieces, so a long gap does not take one big allocation.
+        let zeros = vec![Iq::new(0.0, 0.0); samples.min(1 << 16)];
+        let mut left = samples;
+        while left > 0 {
+            let n = left.min(zeros.len());
+            self.push(&zeros[..n], out);
+            left -= n;
         }
     }
 
@@ -724,6 +788,7 @@ impl CidRx {
             }
         }
         self.frames(out);
+        self.frame_sync();
         // Drop what is behind the next bit.
         if let Some((t, ..)) = &mut self.track
             && *t > CHIPS * SPS
@@ -801,6 +866,9 @@ impl CidRx {
         self.weak = 0;
         self.power = 0.0;
         self.noise = 0.0;
+        self.disp = Iq::new(0.0, 0.0);
+        self.epl_avg = [0.0; 3];
+        self.stats.live = CidLive::default();
         true
     }
 
@@ -856,7 +924,7 @@ impl CidRx {
             0.95 * self.noise + 0.05 * nn
         };
         self.stats.snr_db = 10.0 * (self.power / self.noise.max(1e-30)).log10();
-        self.weak = if pp < 2.0 * self.noise {
+        self.weak = if self.power < 2.0 * self.noise {
             self.weak + 1
         } else {
             0
@@ -869,11 +937,30 @@ impl CidRx {
             self.soft.clear();
             return false;
         }
+        // For display: the bit turned onto the real axis, at unit power.
+        let scale = 1.0 / self.power.sqrt().max(1e-30);
+        let unit = p * (1.0 / p.norm().max(1e-30));
+        self.disp = self.disp * 0.9 + unit * unit * 0.1;
+        let turn = Iq::from_polar(1.0, -self.disp.arg() / 2.0);
+        let live = &mut self.stats.live;
+        CidLive::keep(&mut live.bits, p * turn * scale, LIVE_BITS);
+        CidLive::keep(&mut live.snr_db, self.stats.snr_db, LIVE_BITS);
+        CidLive::keep(&mut live.freq_hz, freq as f32, LIVE_BITS);
+        // The correlators' magnitudes averaged over some ten bits (one
+        // bit's are as noisy as the bit), shown over the prompt's.
+        for (a, m) in self.epl_avg.iter_mut().zip([e.norm(), p.norm(), l.norm()]) {
+            *a = if *a == 0.0 { m } else { 0.9 * *a + 0.1 * m };
+        }
+        let pn = self.epl_avg[1].max(1e-30);
+        live.epl = self.epl_avg.map(|a| a / pn);
         // Differential detection: the phase step from the last bit.
         let mut freq = freq;
         if prev.norm_sqr() > 0.0 {
             let d = p * prev.conj();
-            self.soft.push(d.re / self.power.max(1e-30));
+            let soft = d.re / self.power.max(1e-30);
+            self.soft.push(soft);
+            CidLive::keep(&mut live.diffs, d * scale * scale, LIVE_BITS);
+            CidLive::keep(&mut live.soft, soft, FRAME_BITS);
             self.stats.bits += 1;
             // Frequency: the step squared loses the data.
             let err = (d * d).arg() as f64 / 2.0;
@@ -896,6 +983,61 @@ impl CidRx {
         true
     }
 
+    /// For display: where the frame sync stands. Aligned (a frame decoded,
+    /// the next due), how far through the next one; otherwise the latest
+    /// unique word in the last frame's span of bits, and how many copies
+    /// of it (same polarity, 244 bits apart) run up to it.
+    fn frame_sync(&mut self) {
+        let span = REPEAT * FRAME_BITS;
+        let bit_s = (CHIPS * SPS) as f64 / self.fs;
+        let n = self.soft.len();
+        let live = &mut self.stats.live;
+        if let Some(p) = self.next_frame {
+            let got = n.saturating_sub(p).min(span);
+            live.aligned = true;
+            live.uw_copies = (got / FRAME_BITS + 1).min(REPEAT) as u8;
+            live.frame_in_s = Some(((span - got) as f64 * bit_s) as f32);
+            return;
+        }
+        live.aligned = false;
+        // A UW (either polarity, ≤ 3 bits wrong) at `p`: Some(complemented).
+        let uw = |p: usize| {
+            let v = self.soft[p..p + UW_BITS]
+                .iter()
+                .fold(0u32, |a, &s| (a << 1) | u32::from(s < 0.0));
+            match ((v ^ UW).count_ones(), (v ^ !UW & UW_MASK).count_ones()) {
+                (a, _) if a <= 3 => Some(false),
+                (_, b) if b <= 3 => Some(true),
+                _ => None,
+            }
+        };
+        let latest = (n >= UW_BITS).then(|| {
+            let last = n - UW_BITS;
+            (last.saturating_sub(FRAME_BITS - 1)..=last)
+                .rev()
+                .find_map(|p| uw(p).map(|c| (p, c)))
+        });
+        match latest.flatten() {
+            Some((p, pol)) => {
+                let mut copies = 1;
+                while copies < REPEAT
+                    && p >= copies * FRAME_BITS
+                    && uw(p - copies * FRAME_BITS) == Some(pol)
+                {
+                    copies += 1;
+                }
+                live.uw_copies = copies as u8;
+                // Taking the first copy seen as the frame's first.
+                let done = (copies - 1) * FRAME_BITS + (n - p);
+                live.frame_in_s = Some((span.saturating_sub(done) as f64 * bit_s) as f32);
+            }
+            None => {
+                live.uw_copies = 0;
+                live.frame_in_s = None;
+            }
+        }
+    }
+
     /// Find frames in the bits: the unique word four times, 244 bits apart.
     fn frames(&mut self, out: &mut Vec<CidFrame>) {
         let span = REPEAT * FRAME_BITS;
@@ -904,7 +1046,9 @@ impl CidRx {
             let start = match self.next_frame {
                 Some(p) => p,
                 None => {
-                    if self.soft.len() < span + UW_BITS {
+                    // A whole frame's bits (its last UW is 732 bits in, so
+                    // any start up to `len − span` can be checked).
+                    if self.soft.len() < span {
                         return;
                     }
                     let uw_at = |p: usize| {
@@ -1116,6 +1260,101 @@ mod tests {
         }
     }
 
+    /// A CID through noise as in `receives_a_spread_frame_through_noise`,
+    /// with `cut` samples missing after sample `at` (from the start of the
+    /// stream) — reported to the receiver as a gap, or not.
+    fn receive_with_cut(at: usize, cut: usize, report: bool) -> (CidRx, Vec<CidFrame>) {
+        let guid = 0x0011_22FF_FF33_4455;
+        let frame = |second, a| {
+            build_frame(
+                guid,
+                [
+                    Field {
+                        content_id: a,
+                        info: 0x00_0001,
+                    },
+                    Field {
+                        content_id: 1,
+                        info: 0x12_3456,
+                    },
+                ],
+                second,
+            )
+        };
+        let mut chips = Vec::new();
+        let mut diff = 0;
+        spread(&[frame(false, 0), frame(true, 2)], &mut diff, &mut chips);
+        let chip_rate = 112e3;
+        let fs = SPS as f64 * chip_rate;
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut gauss = move || {
+            let mut a = 0.0f32;
+            for _ in 0..4 {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                a += (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+            }
+            a * 1.732
+        };
+        let amp = 10f32.powf(-24.0 / 20.0);
+        let skip = 700 * CHIPS * SPS + 777;
+        let mut rx = CidRx::new(chip_rate);
+        let mut out = Vec::new();
+        let mut block = Vec::with_capacity(50_000);
+        // Two bit periods of noise after the end: the last bit needs a sample
+        // past it (the late correlator).
+        for n in skip..(chips.len() + 2 * CHIPS) * SPS {
+            let k = n - skip;
+            if (at..at + cut).contains(&k) {
+                if k == at {
+                    rx.push(&block, &mut out);
+                    block.clear();
+                    if report {
+                        rx.gap(cut, &mut out);
+                    }
+                }
+                continue;
+            }
+            let c = match chips.get(n / SPS) {
+                Some(1) => -amp,
+                Some(_) => amp,
+                None => 0.0,
+            };
+            let ph = std::f64::consts::TAU * 300.0 * n as f64 / fs;
+            block.push(
+                Iq::new(c * ph.cos() as f32, c * ph.sin() as f32)
+                    + Iq::new(gauss(), gauss()) * std::f32::consts::FRAC_1_SQRT_2,
+            );
+            if block.len() == 50_000 {
+                rx.push(&block, &mut out);
+                block.clear();
+            }
+        }
+        rx.push(&block, &mut out);
+        (rx, out)
+    }
+
+    #[test]
+    fn rides_through_a_reported_gap() {
+        // 3.7 bits' worth of samples dropped after the code is found:
+        // zeros stand in, the tracking holds, the frame still decodes.
+        let (rx, out) = receive_with_cut(60 * CHIPS * SPS, 60_000, true);
+        assert_eq!(rx.stats.searches, 1, "{:?}", rx.stats.live.snr_db.last());
+        assert!(!out.is_empty(), "no frame: {:?}", rx.stats.live);
+    }
+
+    #[test]
+    fn notices_an_unreported_slip_and_searches_again() {
+        // The same samples missing unannounced: the code's timing slips by
+        // thousands of chips, the smoothed SNR falls, and the receiver
+        // searches again rather than following noise.
+        let (rx, _) = receive_with_cut(60 * CHIPS * SPS, 60_000, false);
+        assert!(rx.stats.searches >= 2, "searches {}", rx.stats.searches);
+        assert!(rx.stats.acquired);
+        assert!(rx.stats.snr_db > 3.0, "{} dB", rx.stats.snr_db);
+    }
+
     #[test]
     fn receives_a_spread_frame_through_noise() {
         // From late in one frame through the next, 4 per chip, a frequency
@@ -1211,5 +1450,16 @@ mod tests {
         let row_hz = m.freq0_hz + r as f64 * m.freq_step_hz;
         assert!((row_hz - f0).abs() <= m.freq_step_hz, "{row_hz} Hz");
         assert!(m.surface.len() <= MAP_ROWS);
+
+        // The live view: the despread bits a BPSK pair on the real axis,
+        // the early and late correlations below the prompt, frames aligned.
+        let lv = &rx.stats.live;
+        assert_eq!(lv.bits.len(), LIVE_BITS);
+        let mean = |f: fn(&Iq) -> f32| lv.bits.iter().map(f).sum::<f32>() / lv.bits.len() as f32;
+        let (re, im) = (mean(|z| z.re.abs()), mean(|z| z.im.abs()));
+        assert!(re > 3.0 * im, "re {re} im {im}");
+        assert!(lv.epl[0] < 1.0 && lv.epl[2] < 1.0, "{:?}", lv.epl);
+        assert!(lv.aligned && lv.frame_in_s.is_some(), "{lv:?}");
+        assert_eq!(lv.soft.len(), FRAME_BITS);
     }
 }

@@ -220,9 +220,13 @@ operator entered them, its position, a telephone number and a short text.
 Put a **Carrier ID (DVB-CID)** VFO on a carrier (at least 1.35 × the chip
 rate wide: 151 kHz below 512 kBd, 302 kHz above): it measures the carrier,
 searches for the spreading code (a fraction of a second), then reads frames —
-one every 36 s (18 s on carriers of 512 kBd and up). Under **Code search** the
-card shows the acquisition itself: correlation over the 4096 code phases, and
-code phase × frequency around the peak. Offline:
+one every 36 s (18 s on carriers of 512 kBd and up). Its card shows the
+tracking live — the despread bits and their differential products as
+constellations (with MER), the early/prompt/late correlators on the code's
+correlation peak, SNR and frequency over the last few seconds, the soft bits
+and the frame sync filling copy by copy — and, under **Code search**, the
+acquisition itself: correlation over the 4096 code phases, and code phase ×
+frequency around the peak. Offline:
 
 ```bash
 decdvb decode capture_1000000Sps.cf32 --decoder cid --fast

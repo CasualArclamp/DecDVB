@@ -3,6 +3,7 @@
 //! the CID's band kept, then the signal is resampled to four samples per
 //! chip for `decdvb_modem::cid::CidRx`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -12,7 +13,8 @@ use decdvb_dsp::Ddc;
 use decdvb_modem::cid::{CidRx, SPS, chip_rate};
 // What a CID VFO's view holds, and how to show it, for the apps.
 pub use decdvb_modem::cid::{
-    CHIPS, CidReport, CidSearch, CidStats, ScramblerOrder, guid_mac, guid_text,
+    CHIPS, CidLive, CidReport, CidSearch, CidStats, FRAME_BITS, LIVE_BITS, REPEAT, ScramblerOrder,
+    guid_mac, guid_text,
 };
 
 /// A CID VFO's state, for display.
@@ -36,11 +38,21 @@ pub struct CidView {
 /// Blocks queued before dropping.
 const QUEUE: usize = 64;
 
+/// What the CID thread is sent: baseband, or how many samples went missing
+/// before the next block (dropped here or upstream).
+enum Msg {
+    Block(Vec<Iq>),
+    Gap(u64),
+}
+
 pub(crate) struct CidWorker {
-    tx: Option<SyncSender<Vec<Iq>>>,
+    tx: Option<SyncSender<Msg>>,
     view: Arc<Mutex<CidView>>,
     join: Option<JoinHandle<()>>,
     lossless: bool,
+    /// Samples lost and not yet reported to the thread. `AtomicU64`: a
+    /// counter changed through a shared reference (`offer` takes `&self`).
+    gap: AtomicU64,
 }
 
 impl CidWorker {
@@ -61,7 +73,7 @@ impl CidWorker {
             wide_enough: vfo_bandwidth >= 1.35 * rc,
             ..Default::default()
         }));
-        let (tx, rx) = mpsc::sync_channel::<Vec<Iq>>(QUEUE);
+        let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE);
         let v = view.clone();
         let join = std::thread::Builder::new()
             .name("decdvb-cid".into())
@@ -73,7 +85,16 @@ impl CidWorker {
                 let mut rs = Resampler::new(ddc.out_rate(), SPS as f64 * rc);
                 let mut cid = CidRx::new(rc);
                 let (mut mixed, mut at4, mut frames) = (Vec::new(), Vec::new(), Vec::new());
-                while let Ok(block) = rx.recv() {
+                let to_chips = SPS as f64 * rc / in_rate;
+                while let Ok(msg) = rx.recv() {
+                    let block = match msg {
+                        Msg::Block(b) => b,
+                        Msg::Gap(n) => {
+                            frames.clear();
+                            cid.gap((n as f64 * to_chips).round() as usize, &mut frames);
+                            continue;
+                        }
+                    };
                     mixed.clear();
                     ddc.process(&block, &mut mixed);
                     at4.clear();
@@ -89,18 +110,35 @@ impl CidWorker {
             view,
             join: Some(join),
             lossless,
+            gap: AtomicU64::new(0),
         }
     }
 
-    /// Queue a block of the VFO's baseband; drop it (counted) if the thread
-    /// is behind, unless lossless.
+    /// Queue a block of the VFO's baseband; drop it (counted, and its
+    /// length reported as a gap) if the thread is behind, unless lossless.
     pub fn offer(&self, block: Vec<Iq>) {
         let Some(tx) = &self.tx else { return };
         if self.lossless {
-            let _ = tx.send(block);
-        } else if let Err(TrySendError::Full(_)) = tx.try_send(block) {
+            let _ = tx.send(Msg::Block(block));
+            return;
+        }
+        let pending = self.gap.swap(0, Ordering::Relaxed);
+        if pending > 0 && tx.try_send(Msg::Gap(pending)).is_err() {
+            self.gap
+                .fetch_add(pending + block.len() as u64, Ordering::Relaxed);
+            self.view.lock().unwrap().dropped += 1;
+            return;
+        }
+        let n = block.len() as u64;
+        if let Err(TrySendError::Full(_)) = tx.try_send(Msg::Block(block)) {
+            self.gap.fetch_add(n, Ordering::Relaxed);
             self.view.lock().unwrap().dropped += 1;
         }
+    }
+
+    /// Samples of the VFO's baseband lost before they got here.
+    pub fn lost(&self, samples: u64) {
+        self.gap.fetch_add(samples, Ordering::Relaxed);
     }
 
     pub fn view(&self) -> CidView {

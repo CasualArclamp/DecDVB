@@ -659,8 +659,12 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
     // ---- plots
     ui.add_space(6.0);
     let side = ui.available_width().min(260.0);
-    ui.label(RichText::new("Constellation").strong());
-    constellation(ui, &st.scatter, side);
+    // (Decoders with no symbols to show, the CID's, leave it out: its card
+    // has its own.)
+    if !st.scatter.is_empty() {
+        ui.label(RichText::new("Constellation").strong());
+        constellation(ui, &st.scatter, side);
+    }
     if !st.spectrum_db.is_empty() {
         ui.label(RichText::new("VFO spectrum").strong());
         vfo_spectrum(ui, &st.spectrum_db, st.out_rate);
@@ -1172,13 +1176,369 @@ fn cid_card(ui: &mut Ui, c: &decdvb_engine::CidView) {
             ui.end_row();
         }
     });
+    if !s.live.bits.is_empty() {
+        egui::CollapsingHeader::new("Live")
+            .id_salt("cid_live")
+            .default_open(true)
+            .show(ui, |ui| cid_live(ui, &s.live, c.chip_rate));
+    }
     // `as_deref` turns the `Option<Arc<CidSearch>>` into an
     // `Option<&CidSearch>`, borrowing through the pointer.
     if let Some(m) = s.search.as_deref() {
         egui::CollapsingHeader::new("Code search")
             .id_salt("cid_search")
-            .default_open(true)
+            .default_open(!s.acquired)
             .show(ui, |ui| cid_search(ui, m, s.acquired));
+    }
+}
+
+/// The CID's tracking as it runs, as instrument panels: the despread bits
+/// and their differential products as constellations, the early, prompt
+/// and late correlators on the code's correlation peak, SNR and frequency
+/// over the last 256 bits, the last frame's worth of soft bits, and where
+/// the frame sync stands.
+fn cid_live(ui: &mut Ui, lv: &decdvb_engine::cid::CidLive, chip_rate: f64) {
+    use decdvb_engine::cid::{CHIPS, FRAME_BITS, LIVE_BITS, REPEAT};
+    let gap = ui.spacing().item_spacing.x;
+    let side = ((ui.available_width() - 2.0 * gap) / 3.0).clamp(90.0, 170.0);
+    ui.horizontal(|ui| {
+        scope_constellation(ui, "Despread bits", &lv.bits, side, scope::TRACE);
+        scope_constellation(ui, "Bit × previous", &lv.diffs, side, scope::LOCK);
+        scope_epl(ui, lv.epl, side);
+    });
+    let bit_s = CHIPS as f64 / chip_rate;
+    let span = format!("last {:.1} s", LIVE_BITS as f64 * bit_s);
+    if let (Some(&snr), Some(&f)) = (lv.snr_db.last(), lv.freq_hz.last()) {
+        scope_strip(
+            ui,
+            &format!("Despread SNR · {span}"),
+            &format!("{snr:.1} dB"),
+            &lv.snr_db,
+            LIVE_BITS,
+            scope::LOCK,
+            4.0,
+        );
+        scope_strip(
+            ui,
+            &format!("CID frequency · {span}"),
+            &format!("{f:+.1} Hz"),
+            &lv.freq_hz,
+            LIVE_BITS,
+            scope::TRACE,
+            4.0,
+        );
+    }
+    scope_bits(ui, &lv.soft, FRAME_BITS);
+    let frame_s = (REPEAT * FRAME_BITS) as f64 * bit_s;
+    scope_frame_sync(ui, lv, frame_s as f32, REPEAT);
+}
+
+/// The instrument panels' colours: one hue a quantity, kept muted.
+mod scope {
+    use eframe::egui::Color32;
+    /// Data.
+    pub const TRACE: Color32 = Color32::from_rgb(86, 182, 236);
+    /// In lock; the prompt correlator.
+    pub const LOCK: Color32 = Color32::from_rgb(98, 200, 140);
+    /// Early and late correlators; waiting.
+    pub const MARK: Color32 = Color32::from_rgb(232, 176, 72);
+    pub const GRID: Color32 = Color32::from_gray(48);
+    pub const AXIS: Color32 = Color32::from_gray(76);
+    pub const REF: Color32 = Color32::from_gray(128);
+}
+
+/// An instrument panel `size` big: a dark face, a hairline frame, the title
+/// at the top left and a reading at the top right. Returns the painter and
+/// the area left for the plot.
+fn scope_panel(
+    ui: &mut Ui,
+    size: egui::Vec2,
+    title: &str,
+    reading: &str,
+) -> (egui::Painter, egui::Rect) {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let painter = ui.painter_at(rect);
+    let v = ui.visuals();
+    painter.rect_filled(rect, 3.0, v.extreme_bg_color);
+    painter.rect_stroke(
+        rect,
+        3.0,
+        (1.0, v.widgets.noninteractive.bg_stroke.color),
+        egui::StrokeKind::Inside,
+    );
+    let font = egui::FontId::proportional(10.5);
+    painter.text(
+        rect.left_top() + vec2(7.0, 5.0),
+        egui::Align2::LEFT_TOP,
+        title,
+        font.clone(),
+        v.weak_text_color(),
+    );
+    painter.text(
+        rect.right_top() + vec2(-7.0, 5.0),
+        egui::Align2::RIGHT_TOP,
+        reading,
+        font,
+        v.strong_text_color(),
+    );
+    let area = egui::Rect::from_min_max(rect.min + vec2(7.0, 21.0), rect.max - vec2(7.0, 7.0));
+    (painter, area)
+}
+
+/// A BPSK constellation: axes, the unit circle and the two ideal points
+/// as a graticule, the points fading with age (the newest marked), and the
+/// MER against the nearer ideal point as the reading.
+fn scope_constellation(ui: &mut Ui, title: &str, pts: &[decdvb_core::Iq], side: f32, c: Color32) {
+    const FULL: f32 = 1.8;
+    let err: f32 = pts
+        .iter()
+        .map(|z| (z.re - z.re.signum()).powi(2) + z.im.powi(2))
+        .sum();
+    let reading = if pts.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "MER {:.1} dB",
+            10.0 * (pts.len() as f32 / err.max(1e-9)).log10()
+        )
+    };
+    let (painter, area) = scope_panel(ui, vec2(side, side + 14.0), title, &reading);
+    let r = area.width().min(area.height()) / 2.0;
+    let o = area.center();
+    let k = r / FULL;
+    let at = |re: f32, im: f32| {
+        egui::pos2(
+            o.x + re.clamp(-FULL, FULL) * k,
+            o.y - im.clamp(-FULL, FULL) * k,
+        )
+    };
+    painter.line_segment([at(-FULL, 0.0), at(FULL, 0.0)], (1.0, scope::AXIS));
+    painter.line_segment([at(0.0, -FULL), at(0.0, FULL)], (1.0, scope::AXIS));
+    painter.circle_stroke(o, k, (1.0, scope::GRID));
+    for x in [-1.0, 1.0] {
+        let p = at(x, 0.0);
+        let s = 4.0;
+        painter.line_segment([p - vec2(s, s), p + vec2(s, s)], (1.0, scope::REF));
+        painter.line_segment([p - vec2(s, -s), p + vec2(s, -s)], (1.0, scope::REF));
+    }
+    let n = pts.len();
+    for (i, z) in pts.iter().enumerate() {
+        let age = (i + 1) as f32 / n as f32;
+        let newest = i + 1 == n;
+        painter.circle_filled(
+            at(z.re, z.im),
+            if newest { 2.8 } else { 1.6 },
+            if newest {
+                Color32::WHITE
+            } else {
+                c.gamma_multiply(0.12 + 0.88 * age * age)
+            },
+        );
+    }
+}
+
+/// The early, prompt and late correlators (a quarter chip apart) as stems on
+/// the code's ideal correlation triangle; the reading is the timing
+/// discriminator (E − L)/(E + L), zero when centred.
+fn scope_epl(ui: &mut Ui, epl: [f32; 3], side: f32) {
+    const SPAN: f32 = 1.25;
+    let disc = (epl[0] - epl[2]) / (epl[0] + epl[2]).max(1e-6);
+    let (painter, area) = scope_panel(
+        ui,
+        vec2(side, side + 14.0),
+        "Code tracking",
+        &format!("E−L {disc:+.2}"),
+    );
+    let weak = ui.visuals().weak_text_color();
+    let font = egui::FontId::proportional(10.0);
+    let plot = egui::Rect::from_min_max(area.min, area.max - vec2(0.0, 14.0));
+    let x_of = |tau: f32| plot.center().x + tau / SPAN * plot.width() / 2.0;
+    let y_of = |v: f32| plot.bottom() - v.clamp(0.0, 1.2) / 1.2 * plot.height();
+    for v in [0.5, 1.0] {
+        painter.line_segment(
+            [
+                egui::pos2(plot.left(), y_of(v)),
+                egui::pos2(plot.right(), y_of(v)),
+            ],
+            (1.0, scope::GRID),
+        );
+    }
+    painter.line_segment(
+        [
+            egui::pos2(plot.left(), y_of(0.0)),
+            egui::pos2(plot.right(), y_of(0.0)),
+        ],
+        (1.0, scope::AXIS),
+    );
+    let tri: Vec<egui::Pos2> = [-SPAN, -1.0, 0.0, 1.0, SPAN]
+        .iter()
+        .map(|&t| egui::pos2(x_of(t), y_of((1.0 - t.abs()).max(0.0))))
+        .collect();
+    painter.add(egui::Shape::line(tri, (1.0, scope::REF)));
+    for (tau, label) in [(-1.0, "−1"), (1.0, "+1 chip")] {
+        painter.text(
+            egui::pos2(x_of(tau), plot.bottom() + 2.0),
+            egui::Align2::CENTER_TOP,
+            label,
+            font.clone(),
+            weak,
+        );
+    }
+    for (tau, v, c, label) in [
+        (-0.25, epl[0], scope::MARK, "E"),
+        (0.0, epl[1], scope::LOCK, "P"),
+        (0.25, epl[2], scope::MARK, "L"),
+    ] {
+        let (x, top) = (x_of(tau), y_of(v));
+        painter.line_segment([egui::pos2(x, y_of(0.0)), egui::pos2(x, top)], (2.0, c));
+        painter.circle_filled(egui::pos2(x, top), 3.0, c);
+        painter.text(
+            egui::pos2(x, top - 4.0),
+            egui::Align2::CENTER_BOTTOM,
+            label,
+            font.clone(),
+            c,
+        );
+    }
+}
+
+/// A strip chart, one value a bit, the newest at the right edge: three
+/// labelled grid lines over the range shown (at least `min_span` tall).
+fn scope_strip(
+    ui: &mut Ui,
+    title: &str,
+    reading: &str,
+    v: &[f32],
+    cap: usize,
+    c: Color32,
+    min_span: f32,
+) {
+    let w = ui.available_width();
+    let (painter, area) = scope_panel(ui, vec2(w, 78.0), title, reading);
+    if v.is_empty() {
+        return;
+    }
+    let weak = ui.visuals().weak_text_color();
+    let font = egui::FontId::proportional(10.0);
+    let (lo, hi) = v
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+    let mid = 0.5 * (lo + hi);
+    let half = (0.5 * (hi - lo) * 1.2).max(0.5 * min_span);
+    let (lo, hi) = (mid - half, mid + half);
+    let plot = egui::Rect::from_min_max(area.min, area.max - vec2(40.0, 0.0));
+    let y_of = |x: f32| plot.bottom() - (x - lo) / (hi - lo) * plot.height();
+    let digits = if hi - lo < 3.0 { 1 } else { 0 };
+    for k in 0..3 {
+        let val = lo + (hi - lo) * (0.1 + 0.4 * k as f32);
+        let y = y_of(val);
+        painter.line_segment(
+            [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
+            (1.0, scope::GRID),
+        );
+        painter.text(
+            egui::pos2(plot.right() + 5.0, y),
+            egui::Align2::LEFT_CENTER,
+            format!("{val:.digits$}"),
+            font.clone(),
+            weak,
+        );
+    }
+    let n = v.len();
+    let dx = plot.width() / (cap.max(2) - 1) as f32;
+    let line: Vec<egui::Pos2> = v
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| egui::pos2(plot.right() - (n - 1 - i) as f32 * dx, y_of(x)))
+        .collect();
+    let last = *line.last().expect("not empty");
+    painter.add(egui::Shape::line(line, (1.5, c)));
+    painter.circle_filled(last, 2.5, c);
+}
+
+/// The last frame's worth of soft bits as a bar code about a centre line:
+/// up a 1, down a 0, the bar's height the bit's confidence.
+fn scope_bits(ui: &mut Ui, soft: &[f32], cap: usize) {
+    let w = ui.available_width();
+    let ones = soft.iter().filter(|&&s| s < 0.0).count();
+    let (painter, area) = scope_panel(
+        ui,
+        vec2(w, 58.0),
+        &format!("Soft bits · last {cap}"),
+        &format!("{ones} ones"),
+    );
+    let mid = area.center().y;
+    let half = area.height() / 2.0;
+    painter.line_segment(
+        [egui::pos2(area.left(), mid), egui::pos2(area.right(), mid)],
+        (1.0, scope::AXIS),
+    );
+    let bw = area.width() / cap as f32;
+    let x0 = area.right() - soft.len() as f32 * bw;
+    for (i, &s) in soft.iter().enumerate() {
+        // The differential product over the bit power: about ±1; a
+        // negative one is a 1 (the bit turned the phase over).
+        let h = (s.abs() / 1.5).min(1.0) * half;
+        let x = x0 + i as f32 * bw;
+        let (y0, y1) = if s < 0.0 {
+            (mid - h, mid)
+        } else {
+            (mid, mid + h)
+        };
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x + 0.15 * bw, y0),
+                egui::pos2(x + (0.85 * bw).max(0.15 * bw + 1.0), y1),
+            ),
+            0.0,
+            scope::TRACE.gamma_multiply(0.35 + 0.65 * h / half),
+        );
+    }
+}
+
+/// Frame sync: the four copies of the current frame as boxes filling as
+/// its bits come in, green once frames are aligned.
+fn scope_frame_sync(ui: &mut Ui, lv: &decdvb_engine::cid::CidLive, frame_s: f32, copies: usize) {
+    let w = ui.available_width();
+    let (frac, reading) = match (lv.aligned, lv.uw_copies, lv.frame_in_s) {
+        (true, _, Some(t)) => (
+            1.0 - t / frame_s,
+            format!("aligned · next frame in {t:.0} s"),
+        ),
+        (false, k, Some(t)) if k >= 2 => (
+            1.0 - t / frame_s,
+            format!("unique word {k}× · frame whole in ~{t:.0} s"),
+        ),
+        (false, 1, _) => (0.0, "unique word seen".to_string()),
+        _ => (0.0, "listening for the unique word".to_string()),
+    };
+    let (painter, area) = scope_panel(ui, vec2(w, 50.0), "Frame sync", &reading);
+    let colour = if lv.aligned { scope::LOCK } else { scope::MARK };
+    let font = egui::FontId::proportional(10.0);
+    let gap = 4.0;
+    let bw = (area.width() - gap * (copies - 1) as f32) / copies as f32;
+    let filled = frac.clamp(0.0, 1.0) * copies as f32;
+    for k in 0..copies {
+        let r = egui::Rect::from_min_size(
+            egui::pos2(area.left() + k as f32 * (bw + gap), area.top()),
+            vec2(bw, area.height()),
+        );
+        let part = (filled - k as f32).clamp(0.0, 1.0);
+        if part > 0.0 {
+            painter.rect_filled(
+                egui::Rect::from_min_size(r.min, vec2(r.width() * part, r.height())),
+                2.0,
+                colour.gamma_multiply(0.55),
+            );
+        }
+        painter.rect_stroke(r, 2.0, (1.0, scope::AXIS), egui::StrokeKind::Inside);
+        painter.text(
+            r.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("copy {}", k + 1),
+            font.clone(),
+            ui.visuals().text_color(),
+        );
     }
 }
 
