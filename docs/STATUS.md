@@ -839,6 +839,27 @@ The FastLink data rate, 134 925 bit/s, is exactly 21/20 of Rory's
   timeslot's octet is not settled: neither a byte nor a bit split gives the
   CDM-600L timeslot's 1 ms idle cycle (this mux idles on a 4 ms cycle).
 
+## The Q-Flex's 128 kbit/s: sixteen 8 kbit/s sub-channels (2026-10-09)
+
+Inside the Paradise framing the 128.5 kbit/s are 2 ms frames of 257 bits
+(one side-channel bit, then 256), and the 256 are sixteen 16-bit words at
+8 kHz. Read bit by bit position, each word is sixteen 8 kbit/s sub-channels
+(I.460-style), not two octets:
+
+- Bits 0, 1, 2 and 15 repeat a 160-bit (20 ms) frame in silence — codec
+  channels, as on the CDM-600L timeslot (whose 8 kbit/s codec channels idled
+  on 80 bits, one with a 0 every 5th bit and a 1 every 160).
+- Bits 3–11 and 14 cycle on 4 ms idle patterns; 12 and 13 are always 0.
+- Over the 7 minutes no codec channel ever goes active (no speech: squelch
+  shut). The only traffic is a burst every 5 s (activity autocorrelation
+  peaks at 10 × 0.5 s on bits 3–14), mostly in bits 8–13: no HDLC in it,
+  in any grouping or polarity — the voice multiplexer's own status or
+  keep-alive, presumably.
+- So nothing to hear in this capture, and the codec (8 kbit/s channels,
+  20 ms frames) is still unknown: not G.729 in its ITU bit order (tested on
+  the CDM-600L's active channels). A capture during a transmission, and the
+  multiplexer's make, would be the way on.
+
 ## Narrow SCPC carriers: PLL bandwidth, Viterbi decoder (2026-10-09)
 
 Rory's screenshots of five ~10 kBd carriers near 12.3337 GHz showed a ring
