@@ -1215,6 +1215,16 @@ fn cid_card(ui: &mut Ui, c: &decdvb_engine::CidView) {
             ));
             ui.end_row();
         }
+        if let Some(ppm) = s.clock_ppm.filter(|_| s.acquired) {
+            ui.label("Chip clock");
+            ui.label(format!("{ppm:+.1} ppm against ours"))
+                .on_hover_text(
+                    "The CID's chip rate against the receiver's clock, from the timing \
+                     loop: mostly the SDR's own clock error. Normal mode copes with about \
+                     ±12 ppm, low-SNR mode about ±8.",
+                );
+            ui.end_row();
+        }
         let r = &s.report;
         if let Some(g) = r.guid {
             ui.label("Identifier");

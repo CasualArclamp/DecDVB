@@ -615,6 +615,10 @@ pub struct CidStats {
     pub bad_frames: u64,
     pub report: CidReport,
     pub scrambler: Option<ScramblerOrder>,
+    /// The CID's chip clock against ours, ppm (positive: its chips come
+    /// faster), from the timing loop's integrator once settled — mostly the
+    /// receiver's own clock error.
+    pub clock_ppm: Option<f64>,
     /// The latest code search (the one that found the code, while it is
     /// tracked). `Arc`: a shared, reference-counted pointer, so copying the
     /// stats out for display many times a second copies a pointer, not the
@@ -778,6 +782,16 @@ pub struct CidRx {
     coh_ref: Iq,
     /// Bits since the code was found.
     since_lock: u32,
+    /// The timing loop's integrator: the chip clock's drift against ours,
+    /// samples a bit (a receiver clock a few ppm out moves the chips by a
+    /// sample every few bits — a first-order loop, slow as a weak CID needs
+    /// it, lagged until it lost the code).
+    drift: f64,
+    /// The Costas loop's lock, cos 2φ averaged, and whether it was given up
+    /// (phase noise faster than it can follow: the frequency loop and
+    /// differential detection carry on).
+    pll_lock: f64,
+    pll_failed: bool,
     /// Bits already taken by a decoded frame (an index into `soft`).
     next_frame: Option<usize>,
     /// The display's phase reference: the bits' squares averaged (the
@@ -824,6 +838,9 @@ impl CidRx {
             coh: Vec::new(),
             coh_ref: Iq::new(0.0, 0.0),
             since_lock: 0,
+            drift: 0.0,
+            pll_lock: 0.0,
+            pll_failed: false,
             next_frame: None,
             disp: Iq::new(0.0, 0.0),
             epl_avg: [0.0; 3],
@@ -1041,6 +1058,10 @@ impl CidRx {
         let start = ((SPS / 2 * lag) as isize + nudge).max(0) as usize;
         self.track = Some((start, 0.0, freq, 0.0, Iq::new(0.0, 0.0)));
         self.since_lock = 0;
+        self.drift = 0.0;
+        self.stats.clock_ppm = None;
+        self.pll_lock = 0.0;
+        self.pll_failed = false;
         self.stats.acquired = true;
         self.stats.offset_hz = freq;
         self.weak = 0;
@@ -1152,7 +1173,7 @@ impl CidRx {
         // a bit is its real part. Before that, the phase of the bits'
         // squares averaged (squares remove the data; the 180° left is the
         // differential decoding's to take care of).
-        let pll = deep && self.since_lock >= PLL_AFTER;
+        let pll = deep && self.since_lock >= PLL_AFTER && !self.pll_failed;
         self.coh_ref = self.coh_ref * 0.9 + p * p * 0.1;
         let coherent = if pll {
             p.re * scale
@@ -1189,6 +1210,10 @@ impl CidRx {
             // (data gone), corrections k₁ to the phase, k₂ to the
             // frequency (ωₙT ≈ 0.05 at 55 bit/s, ζ = 0.7).
             let err = f64::from((p * p).arg()) / 2.0;
+            self.pll_lock = 0.95 * self.pll_lock + 0.05 * (2.0 * err).cos();
+            if self.since_lock > PLL_AFTER + PLL_WIDE + 200 && self.pll_lock < 0.3 {
+                self.pll_failed = true;
+            }
             let (k1, k2) = if self.since_lock < PLL_AFTER + PLL_WIDE {
                 (PLL_K1_WIDE, PLL_K2_WIDE)
             } else {
@@ -1212,14 +1237,32 @@ impl CidRx {
         // Deep: quicker for the first 200 bits (pulling in), then slow (a
         // CID's chip timing barely moves; the discriminator is noisy).
         self.since_lock += 1;
-        let dll = match (deep, self.since_lock < 200) {
-            (false, _) => 0.2,
-            (true, true) => 0.05,
-            (true, false) => 0.01,
+        // The discriminator in samples (late positive): for rectangular
+        // chips, early and late a quarter chip out, (E − L)/(E + L) is
+        // 4x/(3·SPS) for a timing error of x samples.
+        let x = f64::from((ea - la) / (ea + la).max(1e-30)) * 3.0 * SPS as f64 / 4.0;
+        // Second order: the integrator follows a chip clock drift.
+        let (kp, ki) = match (deep, self.since_lock < 200) {
+            (false, _) => (0.07, 0.004),
+            (true, true) => (0.05, 0.002),
+            (true, false) => (0.01, 0.0001),
         };
-        // (Steps are a sample, 1/SPS chip: the gain scaled to move as fast
-        // in chips as at four per chip.)
-        let mut terr = terr + dll * (SPS / 4) as f64 * f64::from((ea - la) / (ea + la).max(1e-30));
+        // Deep, the gains follow the SNR: a strong CID can follow a clock
+        // drift fast; at −3 dB a bit the discriminator is too noisy for it
+        // (a CID that weak and that drifted is beyond this receiver).
+        let (kp, ki) = if deep {
+            let snr = (f64::from(self.power / self.noise.max(1e-30)) - 1.0).clamp(0.1, 4.0);
+            let k = (snr / 2.0).min(1.0);
+            (kp * k, ki * k * k)
+        } else {
+            (kp, ki)
+        };
+        self.drift += ki * x;
+        // Drift in samples a bit is the clock offset: a positive drift is
+        // the timing loop stepping earlier, the chips arriving faster.
+        self.stats.clock_ppm =
+            (self.since_lock > 300).then(|| self.drift / (CHIPS * SPS) as f64 * 1e6);
+        let mut terr = terr + kp * x + self.drift;
         let mut next = t + l4;
         if terr > 0.5 {
             next -= 1;
@@ -1342,16 +1385,15 @@ impl CidRx {
                     };
                     let last = self.soft.len() - span;
                     let low = self.low_snr;
+                    // Low-SNR mode: the coherent combination too (phase noise
+                    // can defeat it, so either may find the word).
                     let found = (0..=last).find(|&p| {
-                        if low {
-                            p >= 1 && {
+                        uw_at(p)
+                            || (low && p >= 1 && {
                                 let bits = self.coherent_bits(p, UW_BITS);
                                 let v = bits.iter().fold(0u32, |a, &b| (a << 1) | u32::from(b));
                                 (v ^ UW).count_ones().min((v ^ !UW & UW_MASK).count_ones()) <= 3
-                            }
-                        } else {
-                            uw_at(p)
-                        }
+                            })
                     });
                     match found {
                         Some(p) => p,
@@ -1667,6 +1709,17 @@ mod tests {
     /// A CID at `snr_db` a bit after despreading (bit energy over the noise
     /// density), the receiver in low-SNR mode or not: (receiver, frames).
     fn weak_cid(snr_db: f32, low_snr: bool) -> (CidRx, Vec<CidFrame>) {
+        weak_cid_with(snr_db, low_snr, 0.0, 0.0)
+    }
+
+    /// The same with the transmitter's chip clock `ppm` fast against the
+    /// receiver's, and a random-walk phase noise of `noise_rad` (rms) a bit.
+    fn weak_cid_with(
+        snr_db: f32,
+        low_snr: bool,
+        ppm: f64,
+        noise_rad: f64,
+    ) -> (CidRx, Vec<CidFrame>) {
         // About 1.1 dB a bit after despreading: the 24-bit search cannot
         // see it, a deeper one can;
         // tracking holds at that level and the frame decodes from its four
@@ -1721,13 +1774,17 @@ mod tests {
         rx.set_low_snr(low_snr);
         let mut out = Vec::new();
         let mut block = Vec::with_capacity(100_000);
+        let clock = 1.0 + ppm * 1e-6;
+        let step = noise_rad / ((CHIPS * SPS) as f64).sqrt();
+        let mut walk = 0.0f64;
         for n in skip..(chips.len() + 4 * CHIPS) * SPS {
-            let c = match chips.get(n / SPS) {
+            walk += step * f64::from(gauss());
+            let c = match chips.get(((n as f64 * clock) as usize) / SPS) {
                 Some(1) => -amp,
                 Some(_) => amp,
                 None => 0.0,
             };
-            let ph = std::f64::consts::TAU * f0 * n as f64 / fs;
+            let ph = std::f64::consts::TAU * f0 * n as f64 / fs + walk;
             block.push(
                 Iq::new(c * ph.cos() as f32, c * ph.sin() as f32)
                     + Iq::new(gauss(), gauss()) * std::f32::consts::FRAC_1_SQRT_2,
@@ -1794,6 +1851,23 @@ mod tests {
             "{} Hz",
             low.stats.offset_hz
         );
+    }
+
+    /// Heavy: run with `--ignored --release`.
+    #[test]
+    #[ignore]
+    fn survives_clock_error_and_phase_noise() {
+        // A receiver clock 5 ppm out (the chips drift a sample every few
+        // bits) and 0.6 rad of phase noise a bit, at 8 dB a bit: both modes
+        // read the frames (low-SNR mode once needed the unique word
+        // coherently and never found it; the timing loop had no
+        // integrator), and the clock error is measured.
+        for low in [false, true] {
+            let (rx, out) = weak_cid_with(8.0, low, 5.0, 0.6);
+            assert_eq!(out.len(), 3, "low-SNR {low}: {} frames", out.len());
+            let ppm = rx.stats.clock_ppm.expect("clock measured");
+            assert!((ppm - 5.0).abs() < 1.5, "{ppm} ppm");
+        }
     }
 
     #[test]

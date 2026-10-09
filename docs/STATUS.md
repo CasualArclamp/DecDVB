@@ -1168,3 +1168,24 @@ frequency bins follow: a first try took them from fs/2 and doubled every
 acquisition frequency). Weak-signal tests now set the level as SNR a bit.
 Measured: tracking ~0.6 dB short of ideal (was 1.3–1.6); frames decode to
 −0.5 dB a bit in low-SNR mode, 0 dB in normal (was about +0.1).
+
+## DVB-CID on a live carrier: phase noise and clock error (2026-10-09)
+
+Rory's 3.58 MBd 8PSK host: the CID found at 9.2 dB, tracked at 8.4 dB a
+bit, but the despread bits a ring and no unique word, in low-SNR mode.
+Simulated with real-world impairments (8 dB a bit):
+- Phase noise (random walk, 0.6 rad a bit): low-SNR mode looked for the
+  unique word on the coherent combination only, which phase noise defeats.
+  Now either the coherent or the summed-differential combination may find
+  it, and either decoding is tried; the Costas loop has a lock detector
+  (cos 2φ averaged) and is given up below 0.3, leaving the frequency loop.
+- Clock error (the receiver's chip clock a few ppm out — a HackRF is
+  ±20 ppm): the timing loop was first order and lagged; at 5 ppm neither
+  mode decoded. It is now second order (an integrator for the drift, the
+  discriminator in samples: 4x/(3·SPS)), the deep gains scaled with the
+  SNR. The integrator gives the clock error (`CidStats::clock_ppm`, shown
+  in the card).
+Now: both modes read frames with 0.3–1 rad of phase noise, and with 5 ppm
+plus 0.6 rad together (test); normal mode copes with ±12 ppm, low-SNR mode
+±8 (its 96–384-bit searches smear the code peak beyond that; a clock
+correction would extend it).
