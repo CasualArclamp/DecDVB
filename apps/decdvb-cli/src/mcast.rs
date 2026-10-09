@@ -36,6 +36,9 @@ pub struct McastArgs {
     /// Record every stream found, as broadcast, into this folder.
     #[arg(long)]
     pub record: Option<PathBuf>,
+    /// Decode every stream found to a 16-bit stereo WAV in this folder.
+    #[arg(long)]
+    pub wav: Option<PathBuf>,
 }
 
 /// Every TS packet in `path`, found by its sync byte (a file cut mid-packet
@@ -137,6 +140,32 @@ fn each_datagram(path: &Path, dt: f64, mut f: impl FnMut(&[u8], &IpInfo, f64)) -
     Ok(mpe.stats.datagrams)
 }
 
+/// A 16-bit stereo WAV of interleaved `pcm`.
+fn write_wav(path: &Path, rate: u32, pcm: &[i16]) -> Result<()> {
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let data = (pcm.len() * 2) as u32;
+    let mut b = Vec::with_capacity(44 + data as usize);
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&16u32.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    b.extend_from_slice(&2u16.to_le_bytes()); // stereo
+    b.extend_from_slice(&rate.to_le_bytes());
+    b.extend_from_slice(&(rate * 4).to_le_bytes());
+    b.extend_from_slice(&4u16.to_le_bytes());
+    b.extend_from_slice(&16u16.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data.to_le_bytes());
+    for v in pcm {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(path, b)?;
+    Ok(())
+}
+
 /// Stands in for "no packet, just time passing" in `each_datagram`.
 const NO_PACKET: IpInfo = IpInfo {
     src: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
@@ -155,6 +184,8 @@ struct Run {
     block: Block,
     seconds: f64,
     recorder: Option<Result<AudioRecorder, String>>,
+    /// Decoded audio for `--wav`: rate and interleaved stereo samples.
+    pcm: Option<(u32, Vec<i16>)>,
 }
 
 pub fn run(a: &McastArgs) -> Result<()> {
@@ -194,7 +225,7 @@ pub fn run(a: &McastArgs) -> Result<()> {
         .iter()
         .map(|s| Run {
             stream: s.clone(),
-            depay: a.decode.then(|| Depacketizer::new(s)),
+            depay: (a.decode || a.wav.is_some()).then(|| Depacketizer::new(s)),
             decoder: Decoder::new(),
             units: Vec::new(),
             block: Block::default(),
@@ -203,9 +234,10 @@ pub fn run(a: &McastArgs) -> Result<()> {
                 let stem = format!("decdvb-{}_{}", s.group, s.port).replace([':', '.'], "_");
                 AudioRecorder::start(s, dir, &stem)
             }),
+            pcm: a.wav.as_ref().map(|_| (0, Vec::new())),
         })
         .collect();
-    if a.decode || a.record.is_some() {
+    if a.decode || a.record.is_some() || a.wav.is_some() {
         each_datagram(&a.file, 0.0, |d, info, _| {
             let Some((payload, _, dport)) = udp_payload(d, info) else {
                 return;
@@ -222,6 +254,15 @@ pub fn run(a: &McastArgs) -> Result<()> {
                     for u in r.units.drain(..) {
                         if r.decoder.decode(&u, &mut r.block) && r.block.rate > 0 {
                             r.seconds += r.block.samples.len() as f64 / 2.0 / r.block.rate as f64;
+                            if let Some((rate, pcm)) = &mut r.pcm {
+                                *rate = r.block.rate;
+                                pcm.extend(
+                                    r.block
+                                        .samples
+                                        .iter()
+                                        .map(|&v| (v.clamp(-1.0, 1.0) * 32767.0).round() as i16),
+                                );
+                            }
                         }
                     }
                 }
@@ -287,6 +328,16 @@ pub fn run(a: &McastArgs) -> Result<()> {
                     .unwrap_or_default()
             ),
             None => {}
+        }
+        if let (Some(dir), Some((rate, pcm))) = (&a.wav, &r.pcm)
+            && *rate > 0
+        {
+            let stem = format!("decdvb-{}_{}", s.group, s.port).replace([':', '.'], "_");
+            let path = dir.join(format!("{stem}.wav"));
+            match write_wav(&path, *rate, pcm) {
+                Ok(()) => println!("    wrote {} ({:.1} s)", path.display(), r.seconds),
+                Err(e) => println!("    wav: {e}"),
+            }
         }
         match &r.recorder {
             Some(Ok(rec)) => println!(

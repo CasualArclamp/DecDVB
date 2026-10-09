@@ -1,0 +1,16 @@
+[package]
+name = "decdvb-xaac-sys"
+description = "Build and raw FFI bindings for the vendored libxaac AAC decoder (AAC-LC, HE-AAC v1/v2, xHE-AAC)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# The C sources live in the workspace-level `third_party/libxaac` submodule (Apache-2.0).
+links = "xaacdec"
+build = "build.rs"
+
+[dependencies]
+
+[build-dependencies]
+cc = { version = "1.2", features = ["parallel"] }

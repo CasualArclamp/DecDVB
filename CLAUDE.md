@@ -14,7 +14,10 @@ cargo run --release -p decdvb-cli -- modcods
 ```
 
 libopus (Opus radio) is the `third_party/opus` submodule (tag v1.6.1), built
-by `decdvb-opus-sys` with CMake, as in DecDRM: `git submodule update --init`.
+by `decdvb-opus-sys` with CMake, as in DecDRM; libxaac (AAC with SBR/PS,
+Apache-2.0) is `third_party/libxaac` (v0.1.13), its decoder built by
+`decdvb-xaac-sys` with `cc`. Not FDK-AAC: its licence does not mix with the
+GPL. `git submodule update --init` fetches both.
 
 The live HackRF front end is behind `--features hackrf` (on `decdvb-io`, re-exported
 by both apps), so a plain build never needs the HackRF SDK and CI stays green.

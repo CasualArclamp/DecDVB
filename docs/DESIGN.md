@@ -152,11 +152,13 @@ crates/
   decdvb-ip       IPv4/IPv6 parse, PCAP writer, stream classification + stats,
                   blind IP-header-checksum fallback search
   decdvb-audio    multicast radio in the app: RTP/RFC 2250/3016/3640/7587
-                  and raw ES depacketising, MPEG audio + AAC-LC decode
-                  (Symphonia), Opus (libopus), resampling, sound output
+                  and raw ES depacketising, MPEG audio (Symphonia), AAC
+                  with SBR/PS (libxaac), Opus (libopus), resampling, sound output
                   (cpal), recording as broadcast
   decdvb-opus-sys libopus (BSD), the third_party/opus submodule (v1.6.1),
                   built with CMake; FFI bindings (from DecDRM)
+  decdvb-xaac-sys libxaac's AAC decoder (Apache-2.0), the third_party/libxaac
+                  submodule (v0.1.13), built with cc; FFI bindings
   decdvb-modem    other satellite modem formats: DVB-S (Viterbi K = 7 with
                   puncturing, RS(204,188), Forney interleaving, energy dispersal),
                   generic RS over GF(256); turbo product codes and IESS-315
@@ -197,7 +199,7 @@ After BBFRAMEs exist, GS-mode payload is GSE. Implement:
 ## 8. Platform, build, release
 
 - Windows 11 primary, Linux x86_64 too. egui/eframe with the **glow** (OpenGL) renderer (as DecDRM — keeps the Rust-version floor sane). `rustfft` for DSP.
-- Rust throughout, with one C library: **libopus** (2026-10-10), there being no mature Rust Opus decoder. It is a git submodule (`third_party/opus`, upstream xiph/opus, tag v1.6.1) built statically by CMake in `decdvb-opus-sys`, the same arrangement as DecDRM; a build needs CMake and a C compiler, and CI checks out submodules.
+- Rust throughout, with two C libraries (2026-10-10), there being no mature Rust decoders for them: **libopus** (BSD; `third_party/opus`, xiph/opus v1.6.1, built by CMake in `decdvb-opus-sys`, as DecDRM) and **libxaac**'s decoder (Apache-2.0, GPL-3-compatible; `third_party/libxaac`, ittiam-systems v0.1.13, built by `cc` from its own CMake source lists in `decdvb-xaac-sys`) for AAC with SBR and PS. FDK-AAC, which DecDRM decodes with, is not used: its licence is not GPL-compatible. A build needs CMake and a C compiler; CI checks out submodules.
 - Portable static-CRT exes in `exe/` + attached to GitHub releases; CI on GitHub Actions (Linux+Windows tests, clippy, smoke); release.yml drafts portable exes from a pushed tag. See memory [[feedback-release-and-ci]].
 - Repo: planned public `CasualArclamp/DecDVB`, **GPL-3.0-or-later**. Commit identity `Arclamp <45412977+CasualArclamp@users.noreply.github.com>`.
 

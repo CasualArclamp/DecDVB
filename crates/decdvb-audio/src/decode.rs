@@ -1,8 +1,9 @@
 //! Decoding [`Unit`]s to stereo PCM.
 //!
-//! MPEG audio layers I–III and AAC-LC are decoded by Symphonia (pure Rust,
-//! MPL-2.0), Opus by libopus (C, BSD, vendored: `decdvb-opus-sys`); PCM
-//! arrives already decoded. Everything comes out as
+//! MPEG audio layers I–III are decoded by Symphonia (pure Rust, MPL-2.0); AAC
+//! — LC, and HE-AAC v1/v2 with SBR and PS — by libxaac (C, Apache-2.0,
+//! vendored: `decdvb-xaac-sys`, see [`crate::xaac`]); Opus by libopus (C,
+//! BSD, vendored: `decdvb-opus-sys`); PCM arrives already decoded. Everything comes out as
 //! interleaved stereo f32 — mono is copied to both sides, and of more than
 //! two channels the first two are kept — so the rest of the player has one
 //! shape to deal with.
@@ -12,10 +13,7 @@ use std::ptr::NonNull;
 
 use decdvb_opus_sys as opus;
 use symphonia_bundle_mp3::MpaDecoder;
-use symphonia_codec_aac::AacDecoder;
-use symphonia_core::codecs::audio::well_known::{
-    CODEC_ID_AAC, CODEC_ID_MP1, CODEC_ID_MP2, CODEC_ID_MP3,
-};
+use symphonia_core::codecs::audio::well_known::{CODEC_ID_MP1, CODEC_ID_MP2, CODEC_ID_MP3};
 use symphonia_core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
 use symphonia_core::packet::PacketRef;
 use symphonia_core::units::{Duration, Timestamp};
@@ -23,6 +21,7 @@ use symphonia_core::units::{Duration, Timestamp};
 use crate::aac::{AacConfig, fmt_khz};
 use crate::depay::Unit;
 use crate::es::MpaHeader;
+use crate::xaac::XaacDecoder;
 
 /// Stereo audio at one sample rate.
 #[derive(Debug, Default, Clone)]
@@ -36,9 +35,11 @@ pub struct Block {
 #[derive(Default)]
 pub struct Decoder {
     mpa: Option<(MpaHeader, MpaDecoder)>,
-    aac: Option<(AacConfig, AacDecoder)>,
+    aac: Option<(AacConfig, XaacDecoder)>,
     opus: Option<OpusDecoder>,
     scratch: Vec<f32>,
+    pcm: Vec<i16>,
+    frame: Vec<u8>,
     /// Units decoded, and those that failed.
     pub decoded: u64,
     pub errors: u64,
@@ -140,29 +141,45 @@ impl Decoder {
         if !cfg.playable() {
             return Err(format!("{} cannot be decoded here", cfg.describe()));
         }
+        // A new decoder when the core changes (SBR and PS are found in the
+        // frames, whatever the configuration says of them).
         if self
             .aac
             .as_ref()
             .is_none_or(|(c, _)| c.core_asc() != cfg.core_asc())
         {
-            let mut p = AudioCodecParameters::new();
-            p.for_codec(CODEC_ID_AAC)
-                .with_extra_data(cfg.core_asc().into_boxed_slice());
-            let d = AacDecoder::try_new(&p, &options()).map_err(|e| e.to_string())?;
-            self.aac = Some((*cfg, d));
+            self.aac = Some((*cfg, XaacDecoder::new(cfg.short_frames)?));
         }
         let (_, d) = self.aac.as_mut().unwrap();
-        let pkt = PacketRef::new(0, Timestamp::new(0), Duration::new(0), au);
-        let buf = d.decode_ref(&pkt).map_err(|e| e.to_string())?;
-        let ch = buf.spec().channels().count();
-        out.rate = buf.spec().rate();
-        buf.copy_to_vec_interleaved(&mut self.scratch);
-        to_stereo(&self.scratch, ch, &mut out.samples);
-        let mut d = cfg.describe();
-        if cfg.sbr_rate.is_some() {
-            d.push_str(" (playing the AAC-LC core)");
+        self.frame.clear();
+        self.frame.extend_from_slice(&cfg.adts_header(au.len()));
+        self.frame.extend_from_slice(au);
+        if let Err(e) = d.decode(&self.frame, &mut self.pcm) {
+            // A fatal error leaves the decoder unusable: start afresh.
+            self.aac = None;
+            return Err(e);
         }
-        self.description = Some(d);
+        let info = d.info;
+        if self.pcm.is_empty() || info.channels == 0 {
+            return Ok(()); // the header, read before the first frame decodes
+        }
+        out.rate = info.rate;
+        self.scratch.clear();
+        self.scratch
+            .extend(self.pcm.iter().map(|&v| f32::from(v) / 32768.0));
+        to_stereo(&self.scratch, info.channels as usize, &mut out.samples);
+        let name = match info.sbr {
+            0 => "AAC-LC",
+            1 => "HE-AAC (SBR)",
+            _ => "HE-AAC v2 (SBR + PS)",
+        };
+        let ch = match (info.channels, cfg.channel_config) {
+            (2, 1) => "stereo (PS)".to_string(),
+            (1, _) => "mono".to_string(),
+            (2, _) => "stereo".to_string(),
+            (n, _) => format!("{n} channels"),
+        };
+        self.description = Some(format!("{name} · {} kHz · {ch}", fmt_khz(info.rate)));
         Ok(())
     }
 }
@@ -296,37 +313,72 @@ pub(crate) mod tests {
         );
     }
 
+    /// Decode `n` copies of `unit`; the blocks that came out.
+    fn run(d: &mut Decoder, unit: &Unit, n: usize) -> Vec<Block> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let mut b = Block::default();
+            if d.decode(unit, &mut b) {
+                out.push(b);
+            }
+            assert!(d.last_error.is_none(), "{:?}", d.last_error);
+        }
+        out
+    }
+
     #[test]
     fn decodes_silent_aac_mono_and_stereo() {
         for (asc, ch) in [([0x11u8, 0x88], 1u8), ([0x11, 0x90], 2)] {
             let cfg = AacConfig::from_bytes(&asc).unwrap();
             assert_eq!(cfg.channel_config, ch);
             let mut d = Decoder::new();
-            let mut b = Block::default();
-            assert!(
-                d.decode(&Unit::Aac(cfg, silent_aac_au(ch)), &mut b),
-                "{ch} ch: {:?}",
-                d.last_error
-            );
-            assert_eq!(b.rate, 48_000);
-            assert_eq!(b.samples.len(), 2 * 1024);
-            assert!(b.samples.iter().all(|v| v.abs() < 1e-6));
+            // libxaac reads the stream's header from the first frame, and
+            // trims its start-up delay from the first block out.
+            let blocks = run(&mut d, &Unit::Aac(cfg, silent_aac_au(ch)), 8);
+            assert!(blocks.len() >= 6, "{ch} ch: {} blocks", blocks.len());
+            for b in &blocks {
+                assert_eq!(b.rate, 48_000);
+                assert!(b.samples.len() <= 2 * 1024);
+            }
+            for b in &blocks[1..] {
+                assert_eq!(b.samples.len(), 2 * 1024);
+                assert!(b.samples.iter().all(|v| v.abs() < 1e-3));
+            }
+            let desc = d.description.unwrap();
+            assert!(desc.starts_with("AAC-LC · 48 kHz"), "{desc}");
+            assert!(desc.ends_with(if ch == 1 { "mono" } else { "stereo" }));
         }
     }
 
     #[test]
-    fn he_aac_plays_its_core() {
-        // HE-AAC, 24 kHz core, stereo, 48 kHz with SBR.
+    fn an_he_aac_configuration_without_sbr_data_still_plays() {
+        // HE-AAC signalled (24 kHz core, 48 kHz with SBR), but the frames
+        // carry no SBR data: libxaac plays what is there.
         let cfg = AacConfig::from_bytes(&[0x2B, 0x11, 0x88, 0x00]).unwrap();
         let mut d = Decoder::new();
+        let blocks = run(&mut d, &Unit::Aac(cfg, silent_aac_au(2)), 4);
+        assert!(!blocks.is_empty());
+        let b = &blocks[blocks.len() - 1];
+        assert!(matches!(b.rate, 24_000 | 48_000), "{}", b.rate);
+        assert_eq!(b.samples.len() as u32 * 24_000, 2 * 1024 * b.rate);
+    }
+
+    #[test]
+    fn damaged_aac_is_an_error_and_recovers() {
+        let cfg = AacConfig::from_bytes(&[0x11, 0x90]).unwrap();
+        let mut d = Decoder::new();
+        run(&mut d, &Unit::Aac(cfg, silent_aac_au(2)), 3);
         let mut b = Block::default();
-        assert!(
-            d.decode(&Unit::Aac(cfg, silent_aac_au(2)), &mut b),
-            "{:?}",
-            d.last_error
-        );
-        assert_eq!(b.rate, 24_000);
-        assert!(d.description.as_deref().unwrap().contains("core"));
+        for k in 0..20u8 {
+            let junk: Vec<u8> = (0..200u32)
+                .map(|i| (i as u8).wrapping_mul(37) ^ k)
+                .collect();
+            d.decode(&Unit::Aac(cfg, junk), &mut b);
+        }
+        // Good frames play again afterwards.
+        d.last_error = None;
+        let blocks = run(&mut d, &Unit::Aac(cfg, silent_aac_au(2)), 4);
+        assert!(!blocks.is_empty());
     }
 
     /// `n` 20 ms Opus packets of a 1 kHz tone at −6 dBFS, `channels` 1 or 2,

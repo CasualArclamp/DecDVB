@@ -1271,3 +1271,22 @@ Tests: a libopus-encoded 1 kHz tone, mono and stereo, decodes at its level
 (RMS within 0.05 of 0.354); garbage is an error; 50 RTP packets play through
 the player to the null output. On the recording, 225.0.0.20:6012 decodes
 24.7 s with 0 errors (stereo, fullband).
+
+## HE-AAC with SBR and PS: libxaac (2026-10-10)
+
+HE-AAC played its AAC-LC core (Symphonia has no SBR): 11 kHz of audio at
+half the rate. AAC now goes through libxaac's decoder (Ittiam, Apache-2.0 —
+GPL-3-compatible, unlike FDK-AAC), the `third_party/libxaac` submodule
+(v0.1.13, as in DecDRM) built by `decdvb-xaac-sys` with `cc` from libxaac's
+own CMake source lists (common, decoder, DRC, generic kernels). Each access
+unit goes in as an ADTS frame of the core's configuration; libxaac finds
+SBR and PS in the frames (implicit signalling), so ADTS, LOAS, LATM and
+RFC 3640 streams all get them. It reads the header from the first frame and
+trims its start-up delay from the first block out. A fatal error starts a
+fresh decoder. Symphonia keeps MPEG audio; `symphonia-codec-aac` is gone.
+
+`decdvb mcast … --wav dir` decodes every stream to WAV. On the recording,
+against ffmpeg decoding the same frames: AAC-LC 225.0.0.2:6002 and HE-AAC
+225.0.0.20:6020 both agree to about 78 dB SNR after the first second, the
+HE-AAC over the full band (11–16 kHz at −30.6 dB of the total against
+ffmpeg's −30.2 dB). All five HE-AAC streams report SBR at 44.1 kHz.

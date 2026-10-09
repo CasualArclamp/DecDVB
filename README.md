@@ -143,11 +143,11 @@ IPv4 fragments are put back together first — a multiplex packing several
 AUs into a 2.3 kB RTP packet sends each as two. `<nowplaying>` messages
 (title, artist, station) are listed under **Now playing**.
 
-- **▶ Play** decodes it in DecDVB: MPEG audio layers I–III, AAC-LC (from
-  ADTS, LATM/LOAS or RFC 3640), Opus (libopus) and PCM/G.711, with **⏸ Pause** (resumes
-  live), **⏹ Stop**, a level meter, and the volume slider and 🔊 mute at the
-  top of the list (app-wide, remembered). HE-AAC plays its AAC-LC core —
-  band-limited; open it in VLC for the full sound.
+- **▶ Play** decodes it in DecDVB: MPEG audio layers I–III, AAC-LC and
+  HE-AAC v1/v2 with SBR and PS (libxaac; from ADTS, LATM/LOAS or RFC 3640),
+  Opus (libopus) and PCM/G.711, with **⏸ Pause** (resumes live), **⏹ Stop**,
+  a level meter, and the volume slider and 🔊 mute at the top of the list
+  (app-wide, remembered).
 - **⏺ Record** saves the stream to the output folder as broadcast, with no
   re-encoding: `.mp2`/`.mp3`, `.aac` (ADTS, any AAC carriage, HE-AAC intact),
   `.wav` for PCM, `.ts` for TS in UDP, `.opus` (Ogg) for Opus.
@@ -327,15 +327,15 @@ decdvb modcods                    # the DVB-S2 MODCOD table
 
 ## Build
 
-Rust 1.95 or newer, a C compiler and CMake (libopus, for Opus radio, is
-built from the `third_party/opus` submodule):
+Rust 1.95 or newer, a C compiler and CMake: libopus (Opus radio) and
+libxaac (AAC with SBR and PS) are built from the `third_party/` submodules.
 
 ```bash
 git clone --recurse-submodules https://github.com/CasualArclamp/DecDVB
 cargo build --release
 ```
 
-In an existing clone, `git submodule update --init` fetches libopus.
+In an existing clone, `git submodule update --init` fetches them.
 
 ### HackRF One
 

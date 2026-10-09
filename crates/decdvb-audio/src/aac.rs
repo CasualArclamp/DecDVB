@@ -6,10 +6,10 @@
 //!   (raw UDP, sync 0x2B7) or in RTP as MP4A-LATM (RFC 3016 / RFC 6416).
 //! - **RFC 3640** mpeg4-generic: AU headers, then the access units.
 //!
-//! The decoder (Symphonia) does AAC-LC only, so HE-AAC plays as its AAC-LC
-//! core: band-limited, at the core sample rate, PS stereo as mono. A file
-//! recording keeps everything ([`AacConfig::adts_header`]); a player reading
-//! the recording restores SBR and PS.
+//! The decoder (libxaac, [`crate::xaac`]) is given each access unit in an
+//! ADTS frame ([`AacConfig::adts_header`]) — the core's configuration — and
+//! finds SBR and PS in the frames themselves, as players do with ADTS; a
+//! recording is the same frames, so it keeps everything too.
 
 use crate::bits::{BitReader, BitWriter};
 
@@ -138,8 +138,8 @@ impl AacConfig {
         Self::parse(&mut BitReader::new(b), true)
     }
 
-    /// An AAC-LC AudioSpecificConfig for the core alone — what the decoder
-    /// is given (it refuses SBR signalling).
+    /// An AAC-LC AudioSpecificConfig for the core alone: what identifies
+    /// the stream to the decoder (a new one is started when it changes).
     pub fn core_asc(&self) -> Vec<u8> {
         let mut w = BitWriter::new();
         w.put(5, 2);
@@ -154,7 +154,8 @@ impl AacConfig {
         w.finish()
     }
 
-    /// The decoder can play this (as AAC-LC).
+    /// The decoder can play this: an AAC-LC core (with or without SBR and
+    /// PS), mono or stereo, 1024-sample frames, a standard rate.
     pub fn playable(&self) -> bool {
         self.core_type == 2
             && !self.short_frames
