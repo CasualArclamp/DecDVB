@@ -170,6 +170,19 @@ impl Hypothesis {
         v
     }
 
+    /// "turned 90°, mirrored" and the like, for display.
+    fn orientation(&self) -> String {
+        format!(
+            "{}{}",
+            if self.rotated {
+                "turned 90°"
+            } else {
+                "not turned"
+            },
+            if self.inverted { ", mirrored" } else { "" }
+        )
+    }
+
     /// Re-encoding mismatch of a block decoded under this hypothesis: ~0
     /// to the raw bit error rate when right, ~0.3–0.5 when not.
     fn score(&self, symbols: &[Iq]) -> f32 {
@@ -488,10 +501,22 @@ pub struct ViterbiStats {
     /// Searches tried, and locks lost (a later check no longer fitting).
     pub searches: u64,
     pub losses: u64,
+    /// Times the constellation turned (90°, mirrored) and was followed.
+    pub turns: u64,
 }
 
 /// Data bits per block a [`ViterbiRx`] hands on.
 pub const VITERBI_BLOCK: usize = 4096;
+/// Symbols between quick checks of the orientation, and the fits that call
+/// it lost and a new one right. (A live 10 kBd IESS-308 carrier turned by
+/// 90° for 0.4 s at a time, three times in six seconds; the slow check
+/// below missed every one and a restart would slip the framing after.)
+// (Every 256 symbols over the last 384: a turn is followed within ~600
+// symbols; the other orientation must fit at least twice as well.)
+const QUICK: usize = 256;
+const QUICK_WINDOW: usize = 384;
+const QUICK_BAD: f32 = 0.12;
+const QUICK_GOOD: f32 = 0.08;
 /// Blocks between checks that the locked hypothesis still fits.
 const RECHECK: usize = 8;
 
@@ -511,6 +536,7 @@ pub struct ViterbiRx {
     /// Recent symbols for the periodic check, and blocks since it.
     recent: VecDeque<Iq>,
     since_check: usize,
+    since_quick: usize,
     pub stats: ViterbiStats,
 }
 
@@ -532,6 +558,7 @@ impl ViterbiRx {
             block: Vec::new(),
             recent: VecDeque::with_capacity(SEARCH),
             since_check: 0,
+            since_quick: 0,
             stats: ViterbiStats::default(),
         }
     }
@@ -588,17 +615,10 @@ impl ViterbiRx {
                 let hyp = best.0;
                 self.stats.rate = Some(hyp.rate);
                 self.stats.channel_ber = best.1;
-                self.stats.orientation = Some(format!(
-                    "{}{}",
-                    if hyp.rotated {
-                        "turned 90°"
-                    } else {
-                        "not turned"
-                    },
-                    if hyp.inverted { ", mirrored" } else { "" }
-                ));
+                self.stats.orientation = Some(hyp.orientation());
                 self.stage = Stage::Locked { hyp };
                 self.since_check = 0;
+                self.since_quick = 0;
                 let held = std::mem::take(&mut self.held);
                 hyp.soft(&held, &mut self.soft);
                 self.soft.drain(..hyp.offset);
@@ -606,8 +626,49 @@ impl ViterbiRx {
             }
             Stage::Locked { hyp } => {
                 hyp.soft(symbols, &mut self.soft);
+                self.since_quick += symbols.len();
                 self.decode(out);
+                self.quick_check();
             }
+        }
+    }
+
+    /// Has the constellation turned? The newest symbols scored under this
+    /// hypothesis; if they no longer fit, under its other orientations (the
+    /// same rate and puncturing phase), and the one that fits is followed
+    /// on without a restart — the trellis re-converges in a few constraint
+    /// lengths and no bit is lost or added, so framing downstream holds.
+    fn quick_check(&mut self) {
+        let Stage::Locked { hyp } = self.stage else {
+            return;
+        };
+        if self.since_quick < QUICK || self.recent.len() < QUICK_WINDOW {
+            return;
+        }
+        self.since_quick = 0;
+        let window: Vec<Iq> = self
+            .recent
+            .iter()
+            .skip(self.recent.len() - QUICK_WINDOW)
+            .copied()
+            .collect();
+        let now = hyp.score(&window);
+        if now <= QUICK_BAD {
+            return;
+        }
+        let best = Hypothesis::all()
+            .into_iter()
+            .filter(|h| h.rate == hyp.rate && h.offset == hyp.offset && *h != hyp)
+            .map(|h| (h, h.score(&window)))
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((h, fit)) = best
+            && fit < QUICK_GOOD
+            && 2.0 * fit < now
+        {
+            self.stage = Stage::Locked { hyp: h };
+            self.stats.turns += 1;
+            self.stats.orientation = Some(h.orientation());
+            self.stats.channel_ber = fit;
         }
     }
 
@@ -742,6 +803,74 @@ mod tests {
             .count();
         assert!(wrong < 10, "{wrong} wrong of {}", got.len());
         assert_eq!(rx.stats.losses, 0);
+    }
+
+    #[test]
+    fn follows_a_turned_constellation_without_slipping() {
+        // Rate 1/2 QPSK, Es/N0 8 dB, turned by 90° for 4000 symbols in the
+        // middle (as a live IESS-308 carrier did): the decoder follows both
+        // turns, the bits keep their count (no slip), and only those near
+        // the turns are wrong.
+        let mut r = noise(21);
+        let data: Vec<u8> = (0..30_000).map(|_| u8::from(r() > 0.0)).collect();
+        let mut enc = Encoder::new(Rate::R1_2);
+        let mut coded = Vec::new();
+        for &b in &data {
+            enc.push(b, &mut coded);
+        }
+        let sigma = (10f32.powf(-8.0 / 10.0) / 2.0).sqrt();
+        let mut n = noise(4);
+        let a = std::f32::consts::FRAC_1_SQRT_2;
+        let syms: Vec<Iq> = coded
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .enumerate()
+            .map(|(k, p)| {
+                let s = Iq::new(
+                    if p[0] == 1 { -a } else { a },
+                    if p[1] == 1 { -a } else { a },
+                );
+                let turn = if (12_000..16_000).contains(&k) {
+                    Iq::new(0.0, 1.0)
+                } else {
+                    Iq::new(1.0, 0.0)
+                };
+                s * turn + Iq::new(n() * sigma, n() * sigma)
+            })
+            .collect();
+        let mut rx = ViterbiRx::new();
+        let mut out = Vec::new();
+        for c in syms.chunks(500) {
+            rx.push(c, &mut out);
+        }
+        assert_eq!(rx.stats.turns, 2, "{:?}", rx.stats);
+        assert_eq!(rx.stats.losses, 0);
+        let got: Vec<u8> = out.concat();
+        // Aligned once at the start, the bits stay aligned to the end.
+        let probe = &got[200..264];
+        let (at, inv) = (0..2000)
+            .flat_map(|k| [(k, 0u8), (k, 1u8)])
+            .find(|&(k, inv)| {
+                data[k..k + 64]
+                    .iter()
+                    .zip(probe)
+                    .all(|(&d, &g)| d ^ inv == g)
+            })
+            .expect("decoded bits not found in the data");
+        let start = at - 200;
+        let tail = &got[got.len() - 2000..];
+        let tail_at = start + got.len() - 2000;
+        let wrong_tail = tail
+            .iter()
+            .zip(&data[tail_at..])
+            .filter(|&(&g, &d)| g != d ^ inv)
+            .count();
+        // (The 180° within a turn comes out as inverted bits: either sense.)
+        assert!(
+            !(10..=1990).contains(&wrong_tail),
+            "{wrong_tail} of the last 2000 bits wrong: slipped?"
+        );
     }
 
     #[test]

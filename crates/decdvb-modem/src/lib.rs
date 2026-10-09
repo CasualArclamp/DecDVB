@@ -18,6 +18,7 @@ pub mod dandi;
 pub mod dvbs;
 pub mod e1;
 pub mod fastlink;
+pub mod ibs;
 pub mod interleave;
 pub mod paradise;
 pub mod payload;

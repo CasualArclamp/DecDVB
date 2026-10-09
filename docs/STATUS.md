@@ -1041,3 +1041,35 @@ channels, the FastLink card draws them as bars (speech should stand up near
 half). On the 7-minute capture: aligned, 214 030 frames, 5 word-bit errors,
 1 loss (at the FastLink slip). Next: a capture while someone talks, and the
 multiplexer's make — then the codec.
+
+## IESS-308/309 narrow carrier: differential decoding, IBS framing, 90° turns (2026-10-09)
+
+Rory's chain for the 10.24 kBd carrier: PSK ← K=7 rate 1/2 ← differential
+encoding ← IESS-308 scrambling (taps 3, 20) ← data + IBS/SMS framing. The
+"0x55 fill in 16-byte blocks" found before was the missing differential
+decoding: with it the data are an idle line's all ones, and the 0x55/0xAA
+blocks (whole frames inverted four at a time) go away. Differential decoding
+and a self-synchronising descrambler commute.
+- IBS (`decdvb-modem::ibs`): 128-bit frames, one overhead octet then 120
+  data bits (16/15), the overhead in a four-frame cycle — on this carrier
+  00 20 00 E4, with 10h of the second toggling (a service bit). IESS-309
+  was not to hand, so the overhead is learned, not decoded: the receiver
+  takes the octet window whose bits each keep a four-frame cycle (all but
+  two), changing most across the cycle, then most zeros (idle all-ones data
+  repeat too); loses it at 10 of 16 frames misaligned. Scored on data bits
+  only, so an E1 (whose alignment octets also make a 4-frame cycle at
+  128-bit spacing) still wins as E1.
+- The payload search tries every descrambler with and without differential
+  decoding (plain wins ties); `PayloadStats::ibs`; CLI and GUI show the
+  overhead cycle and service bits.
+- The "data bursts" were not data: the carrier turns 90° for ~0.4 s, three
+  times in 6 s; decoded under the turned orientation the bursts are the same
+  idle IBS frames. `ViterbiRx` now checks the fit every 256 symbols (over
+  the last 384) and, when it fails, follows the orientation that fits at
+  least twice as well — rotation and mirroring only, the trellis not reset,
+  so no bit is lost or added (`ViterbiStats::turns`). Test: a 90° turn for
+  4000 symbols, followed twice, the bits still aligned at the end.
+- On the 6 s capture: "IBS/SMS framing (IESS-309, 16/15), differential
+  decoding, self-synchronising descrambler, taps 3, 20"; 3 turns followed,
+  channel BER 0; IBS aligned, 381 frames, 1 loss (before the first turn was
+  followed). The data are idle throughout.

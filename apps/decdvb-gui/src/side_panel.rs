@@ -1055,6 +1055,28 @@ fn payload_rows(ui: &mut Ui, f: Option<&FecStats>) {
             );
             ui.end_row();
         }
+        if let Some(e) = &p.ibs {
+            let hex = |v: &[u8; 4]| {
+                v.iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            ui.label("Framing");
+            ui.label(format!(
+                "IBS {} · {} frames · overhead {} · service bits {}",
+                if e.locked { "aligned" } else { "searching" },
+                e.frames,
+                hex(&e.cycle),
+                hex(&e.varying)
+            ))
+            .on_hover_text(
+                "IESS-309 IBS/SMS: one overhead octet in every 16 (128-bit frames, \
+                 120 data bits), the overhead in a four-frame cycle; the service bits \
+                 are those seen to change (ESC, alarms).",
+            );
+            ui.end_row();
+        }
         if p.hdlc_good + p.hdlc_bad > 0 {
             ui.label("HDLC");
             ui.label(format!("{} frames · {} bad FCS", p.hdlc_good, p.hdlc_bad));
@@ -1722,10 +1744,11 @@ fn viterbi_card(ui: &mut Ui, c: &CarrierState, st: &VfoStatus) {
                     r.name(),
                     v.orientation.as_deref().unwrap_or("?"),
                     v.channel_ber,
-                    if v.losses > 0 {
-                        format!(" · {} relocks", v.losses)
-                    } else {
-                        String::new()
+                    match (v.losses, v.turns) {
+                        (0, 0) => String::new(),
+                        (l, 0) => format!(" · {l} relocks"),
+                        (0, t) => format!(" · {t} turns followed"),
+                        (l, t) => format!(" · {l} relocks · {t} turns followed"),
                     }
                 ),
             ),

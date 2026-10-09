@@ -205,13 +205,14 @@ fn report(st: &VfoStatus) {
     }
     if let Some(v) = &f.viterbi {
         println!(
-            "viterbi: rate {}, {}, channel BER {:.2e}, {} bits, {} searches, {} relocks",
+            "viterbi: rate {}, {}, channel BER {:.2e}, {} bits, {} searches, {} relocks, {} turns followed",
             v.rate.map_or("not found", |r| r.name()),
             v.orientation.as_deref().unwrap_or("-"),
             v.channel_ber,
             v.bits,
             v.searches,
-            v.losses
+            v.losses,
+            v.turns
         );
     }
     if let Some(t) = &f.fastlink {
@@ -245,6 +246,18 @@ fn report(st: &VfoStatus) {
                 e.faw_errors,
                 e.losses,
                 100.0 * e.esc_busy as f64 / e.groups.max(1) as f64
+            );
+        }
+        if let Some(e) = &p.ibs {
+            let hex = |v: &[u8; 4]| v.map(|b| format!("{b:02x}")).join(" ");
+            println!(
+                "  ibs framing: {}, {} frames, {} misaligned, {} losses, overhead cycle {}, service bits {}",
+                if e.locked { "aligned" } else { "searching" },
+                e.frames,
+                e.misaligned,
+                e.losses,
+                hex(&e.cycle),
+                hex(&e.varying)
             );
         }
     }

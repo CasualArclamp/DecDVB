@@ -13,10 +13,15 @@
 //! The scramblers tried are the RCV-20x's polynomial 1 + x² + x³ + x⁹ + x¹²
 //! (as a self-synchronising descrambler, either way round, and additive per
 //! frame), and the self-synchronising ones of ITU-T V.35 (taps 3, 20,
-//! without its 32-bit run counter) and V.29/V.27 (taps 18, 23).
+//! without its 32-bit run counter) and V.29/V.27 (taps 18, 23) — each with
+//! and without differential decoding first (IESS-308/309 modems
+//! differentially encode ahead of the convolutional encoder to resolve its
+//! phase ambiguity; differential decoding and a self-synchronising
+//! descrambler commute, so the order does not matter).
 
 use crate::dandi::{DiPlusRx, DiPlusStats};
 use crate::e1::{E1Rx, TIMESLOTS};
+use crate::ibs::IbsRx;
 use crate::paradise::EscRx;
 use crate::tpc2964::additive_sequence;
 
@@ -67,10 +72,14 @@ impl Descrambler {
     }
 }
 
-/// A [`Descrambler`] with its state.
+/// A [`Descrambler`] with its state, after an optional differential
+/// decoder.
 #[derive(Clone)]
 struct Running {
     kind: Descrambler,
+    /// Differential decoding first: out = in ⊕ the previous in.
+    diff: bool,
+    last: u8,
     /// Self-synchronising: the last received bits, newest in bit 0.
     history: u32,
     /// Additive: the per-frame sequence.
@@ -78,7 +87,7 @@ struct Running {
 }
 
 impl Running {
-    fn new(kind: Descrambler, frame_len: usize) -> Self {
+    fn new(kind: Descrambler, diff: bool, frame_len: usize) -> Self {
         let seq = match kind {
             Descrambler::Additive { last, reversed } => {
                 additive_sequence(last, reversed, frame_len)
@@ -87,6 +96,8 @@ impl Running {
         };
         Running {
             kind,
+            diff,
+            last: 0,
             history: 0,
             seq,
         }
@@ -94,6 +105,13 @@ impl Running {
 
     /// Descramble one frame's bits in place.
     fn frame(&mut self, bits: &mut [u8]) {
+        if self.diff {
+            for b in bits.iter_mut() {
+                let x = *b;
+                *b ^= self.last;
+                self.last = x;
+            }
+        }
         match self.kind {
             Descrambler::None => {}
             Descrambler::SelfSync(taps) => {
@@ -351,6 +369,9 @@ pub enum Format {
     DiPlus,
     /// Paradise closed network plus ESC.
     ParadiseEsc,
+    /// Intelsat IBS/SMS framing (IESS-309): 128-bit frames, one overhead
+    /// octet and 120 data bits (see [`crate::ibs`]).
+    Ibs,
     /// No framing known, but the descrambled data are mostly an idle fill
     /// (constant, 1010… or a repeated byte): the scrambler is found even
     /// though what the data carry is not.
@@ -401,6 +422,8 @@ pub struct PayloadStats {
     pub dandi: Option<DiPlusStats>,
     /// Paradise closed network plus ESC framing, likewise.
     pub paradise: Option<crate::paradise::EscStats>,
+    /// IBS framing, likewise.
+    pub ibs: Option<crate::ibs::IbsStats>,
     /// Frames of data looked at before deciding (or so far).
     pub probed: u64,
 }
@@ -425,6 +448,7 @@ pub struct PayloadRx {
     e1: E1Rx,
     dandi: DiPlusRx,
     paradise: EscRx,
+    ibs: IbsRx,
     /// Bits not yet packed into `raw` bytes.
     raw_bits: Vec<u8>,
     pub stats: PayloadStats,
@@ -443,6 +467,7 @@ impl PayloadRx {
             e1: E1Rx::new(),
             dandi: DiPlusRx::new(),
             paradise: EscRx::new(),
+            ibs: IbsRx::new(),
             raw_bits: Vec::new(),
             stats: PayloadStats::default(),
         }
@@ -465,18 +490,24 @@ impl PayloadRx {
         }
         // Score: bits a format accounts for (HDLC: a nominal frame's worth
         // per good frame, so a few good frames win over nothing).
-        let mut best: Option<(u64, Descrambler, Format, Fcs)> = None;
+        let mut best: Option<(u64, Descrambler, bool, Format, Fcs)> = None;
         let held_bits: u64 = self.held.iter().map(|f| f.len() as u64).sum();
         // The most idle-looking descrambling, should nothing frame.
-        let mut idle: Option<(f64, Descrambler)> = None;
-        for kind in Descrambler::all() {
-            let mut d = Running::new(kind, self.frame_len);
-            let (mut hdlc, mut ts, mut e1, mut di, mut pe) = (
+        let mut idle: Option<(f64, Descrambler, bool)> = None;
+        // Plain first: with differential decoding it must do strictly
+        // better to win.
+        let readings = [false, true]
+            .into_iter()
+            .flat_map(|diff| Descrambler::all().into_iter().map(move |k| (k, diff)));
+        for (kind, diff) in readings {
+            let mut d = Running::new(kind, diff, self.frame_len);
+            let (mut hdlc, mut ts, mut e1, mut di, mut pe, mut ib) = (
                 Hdlc::default(),
                 TsAlign::default(),
                 E1Rx::new(),
                 DiPlusRx::new(),
                 EscRx::new(),
+                IbsRx::new(),
             );
             let (mut frames, mut pkts, mut e1f, mut dib, mut ped, mut pee) = (
                 Vec::new(),
@@ -497,6 +528,9 @@ impl PayloadRx {
                 e1.push(&bits, &mut e1f);
                 di.push(&bits, &mut dib);
                 pe.push(&bits, &mut ped, &mut pee);
+                ib.push(&bits, &mut ped, &mut pee);
+                ped.clear();
+                pee.clear();
                 prev.extend_from_slice(&bits);
                 let n = prev.len();
                 for (k, lag) in [1usize, 2, 8].into_iter().enumerate() {
@@ -507,8 +541,8 @@ impl PayloadRx {
                 prev.drain(..keep);
             }
             let share = same.iter().copied().max().unwrap_or(0) as f64 / held_bits.max(1) as f64;
-            if idle.is_none_or(|(s, _)| share > s) {
-                idle = Some((share, kind));
+            if idle.is_none_or(|(s, ..)| share > s) {
+                idle = Some((share, kind, diff));
             }
             let fcs = frames.first().map_or(Fcs::Crc16, |f| f.1);
             let framed = |covered: u64| (2 * covered >= held_bits).then_some(covered);
@@ -527,12 +561,18 @@ impl PayloadRx {
                     framed(pe.stats.groups * crate::paradise::GROUP as u64),
                     Format::ParadiseEsc,
                 ),
+                // Its data bits only: an E1's alignment octets (every 512
+                // bits) also make a four-frame cycle, and E1 must win that.
+                (
+                    framed(ib.stats.frames * crate::ibs::DATA as u64),
+                    Format::Ibs,
+                ),
             ];
             for (score, fmt) in candidates {
                 if let Some(n) = score
                     && best.is_none_or(|b| n > b.0)
                 {
-                    best = Some((n, kind, fmt, fcs));
+                    best = Some((n, kind, diff, fmt, fcs));
                 }
             }
         }
@@ -541,26 +581,28 @@ impl PayloadRx {
         if best.is_none()
             && self.held.len() >= 2 * PROBE_MIN
             && held_bits >= 30_000
-            && let Some((share, kind)) = idle
+            && let Some((share, kind, diff)) = idle
             && share >= IDLE_SHARE
         {
-            best = Some((0, kind, Format::Idle, Fcs::Crc16));
+            best = Some((0, kind, diff, Format::Idle, Fcs::Crc16));
         }
-        if let Some((_, kind, fmt, fcs)) = best {
+        if let Some((_, kind, diff, fmt, fcs)) = best {
             self.stats.found = Some(format!(
-                "{}, {}",
+                "{}, {}{}",
                 match (fmt, fcs) {
                     (Format::Ts, _) => "MPEG-TS",
                     (Format::E1, _) => "E1 (G.704 framing)",
                     (Format::DiPlus, _) => "E1 timeslots, Comtech D&I++ framing",
                     (Format::ParadiseEsc, _) => "Paradise closed network + ESC framing",
+                    (Format::Ibs, _) => "IBS/SMS framing (IESS-309, 16/15)",
                     (Format::Idle, _) => "idle fill between bursts (format not known)",
                     (Format::Hdlc, Fcs::Crc16) => "HDLC (FCS-16)",
                     (Format::Hdlc, Fcs::Crc32) => "HDLC (FCS-32)",
                 },
+                if diff { "differential decoding, " } else { "" },
                 kind.describe()
             ));
-            self.chosen = Some((Running::new(kind, self.frame_len), fmt));
+            self.chosen = Some((Running::new(kind, diff, self.frame_len), fmt));
             // Replay what was held so no frame or packet is lost; only the
             // newest frame's data go to `raw` again (the rest went out
             // already), descrambled this time.
@@ -598,6 +640,10 @@ impl PayloadRx {
             Format::ParadiseEsc => {
                 self.paradise.push(&bits, &mut out.inner, &mut out.esc);
                 self.stats.paradise = Some(self.paradise.stats.clone());
+            }
+            Format::Ibs => {
+                self.ibs.push(&bits, &mut out.inner, &mut out.esc);
+                self.stats.ibs = Some(self.ibs.stats.clone());
             }
             // Descrambled, for the text finder and the data file.
             Format::Idle => out.inner.extend_from_slice(&bits),
@@ -801,9 +847,7 @@ mod tests {
         let mut next = rng(5);
         let mut bits = Vec::new();
         for k in 0..4400u32 {
-            let byte = if k % 16 == 0 {
-                (k / 16) as u8
-            } else if (900..1300).contains(&k) {
+            let byte = if k % 16 == 0 || (900..1300).contains(&k) {
                 next() as u8
             } else {
                 0x55
@@ -822,6 +866,48 @@ mod tests {
         assert_eq!(rx.format(), Some(Format::Idle), "{:?}", rx.stats);
         assert!(rx.stats.found.as_ref().unwrap().contains("taps 3, 20"));
         assert!(!inner.is_empty());
+    }
+
+    #[test]
+    fn ibs_frames_under_differential_coding_and_v35() {
+        // As on a live 10.24 kBd IESS-309 carrier: IBS frames (overhead
+        // cycle 00 20 00 E4, idle data all ones with a stretch of traffic),
+        // V.35-scrambled, then differentially encoded.
+        const L: usize = 4096;
+        let mut next = rng(9);
+        let data: Vec<u8> = (0..120 * 400)
+            .map(|i| {
+                if (120 * 150..120 * 220).contains(&i) {
+                    (next() & 1) as u8
+                } else {
+                    1
+                }
+            })
+            .collect();
+        let mut framed = Vec::new();
+        crate::ibs::frame(&data, [0x00, 0x20, 0x00, 0xE4], &mut framed);
+        let mut sent = scramble(Descrambler::SelfSync(&[3, 20]), L, &framed);
+        let mut last = 0;
+        for b in sent.iter_mut() {
+            last ^= *b;
+            *b = last;
+        }
+        let mut rx = PayloadRx::new(L);
+        let mut out = PayloadOut::default();
+        let mut inner = Vec::new();
+        for f in sent.as_chunks::<L>().0 {
+            rx.push(f, &mut out);
+            inner.append(&mut out.inner);
+        }
+        assert_eq!(rx.format(), Some(Format::Ibs), "{:?}", rx.stats);
+        let found = rx.stats.found.clone().unwrap();
+        assert!(
+            found.contains("differential") && found.contains("taps 3, 20"),
+            "{found}"
+        );
+        // The traffic stretch comes through intact.
+        let t = &data[120 * 150..120 * 220];
+        assert!(inner.windows(t.len()).any(|w| w == t));
     }
 
     #[test]
