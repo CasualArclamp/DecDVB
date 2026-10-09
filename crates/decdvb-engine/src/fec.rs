@@ -659,6 +659,9 @@ pub struct GseView {
     /// Multicast audio streams found, by address.
     pub audio: Vec<AudioStream>,
     pub sap_packets: u64,
+    /// Stations announced (SAP or bare SDP): group, port and what the SDP
+    /// says — their names, whether or not their streams are seen.
+    pub stations: Vec<(std::net::IpAddr, u16, decdvb_ip::SdpInfo)>,
     /// The stream being played, and what to open in the player.
     pub audio_playing: Option<SocketAddr>,
     pub audio_target: Option<PlayTarget>,
@@ -1067,6 +1070,7 @@ impl IpStage {
             }),
             audio: self.audio.clone(),
             sap_packets: self.mcast.sap_packets,
+            stations: self.mcast.stations(),
             audio_playing: self.audio_want,
             audio_target: self.relay.as_ref().map(|r| r.target.clone()),
             audio_error: self.relay_error.clone(),

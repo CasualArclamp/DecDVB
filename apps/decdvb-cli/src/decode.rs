@@ -296,6 +296,13 @@ fn report(st: &VfoStatus) {
         for fl in g.top.iter().take(8) {
             println!("  {fl:?}");
         }
+        for (group, port, sdp) in &g.stations {
+            println!(
+                "  station \"{}\" at {group}:{port} ({})",
+                sdp.name.as_deref().unwrap_or("no name"),
+                sdp.codec().label()
+            );
+        }
         for a in &g.audio {
             println!("  audio: {} ({:?})", a.name(), a.codec);
         }

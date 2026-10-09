@@ -182,12 +182,64 @@ impl SdpInfo {
         s
     }
 
+    /// Every media section's group and port (RFC 4566 §5.7, §5.14: a
+    /// connection line in a media section overrides the session's).
+    pub fn endpoints(&self) -> Vec<(IpAddr, u16)> {
+        let mut out = Vec::new();
+        let mut session_c: Option<IpAddr> = None;
+        let mut media: Option<(Option<IpAddr>, u16)> = None;
+        let addr = |v: &str| -> Option<IpAddr> {
+            v.split_whitespace().nth(2)?.split('/').next()?.parse().ok()
+        };
+        let mut flush = |m: &mut Option<(Option<IpAddr>, u16)>, sc: Option<IpAddr>| {
+            if let Some((c, port)) = m.take()
+                && let Some(g) = c.or(sc)
+            {
+                out.push((g, port));
+            }
+        };
+        for line in self.raw.lines() {
+            let line = line.trim_end_matches('\r');
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            match k {
+                "m" => {
+                    flush(&mut media, session_c);
+                    media = v
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|p| p.split('/').next()?.parse().ok())
+                        .map(|port| (None, port));
+                }
+                "c" => match &mut media {
+                    Some((c, _)) => *c = addr(v),
+                    None => session_c = addr(v),
+                },
+                _ => {}
+            }
+        }
+        flush(&mut media, session_c);
+        out
+    }
+
     pub fn codec(&self) -> Codec {
         match &self.encoding {
             Some(e) => Codec::from_encoding(e.split('/').next().unwrap_or("")),
             None => self.pt.map_or(Codec::Unknown, Codec::from_static_pt),
         }
     }
+}
+
+/// An SDP announcement in a UDP payload: SAP-framed (RFC 2974), or bare SDP
+/// text as some encoders send to a port of their own.
+pub fn announcement(p: &[u8]) -> Option<SdpInfo> {
+    if p.starts_with(b"v=0") {
+        let text = std::str::from_utf8(p).ok()?;
+        let s = SdpInfo::parse(text);
+        return (s.media.is_some() || s.name.is_some()).then_some(s);
+    }
+    sap_sdp(p)
 }
 
 /// The SDP in a SAP packet, if it carries one (announcements, not deletes;
@@ -341,13 +393,26 @@ impl McastScanner {
         let Some((payload, _, dport)) = udp_payload(ip, info) else {
             return;
         };
-        if dport == SAP_PORT {
+        // Announcements: SAP's port, or SDP sent anywhere (bare, or in a SAP
+        // header on another port).
+        let sdp = if dport == SAP_PORT {
             self.sap_packets += 1;
-            if let Some(sdp) = sap_sdp(payload)
-                && let (Some(g), Some(p)) = (sdp.group, sdp.port)
-            {
-                self.announced.insert((g, p), sdp);
+            sap_sdp(payload)
+        } else if payload.starts_with(b"v=0") || (payload.len() > 8 && payload[0] >> 5 == 1) {
+            announcement(payload)
+        } else {
+            None
+        };
+        if let Some(sdp) = sdp {
+            if dport != SAP_PORT {
+                self.sap_packets += 1;
             }
+            for key in sdp.endpoints() {
+                self.announced.insert(key, sdp.clone());
+            }
+            return;
+        }
+        if dport == SAP_PORT {
             return;
         }
         let key = (info.dst, dport);
@@ -409,6 +474,31 @@ impl McastScanner {
         self.flows.contains_key(&(group, port))
     }
 
+    /// The announcement for a stream: its group and port, else the only one
+    /// for its group, else the only one for its port (senders behind NAT or
+    /// with a stale SDP get one of the two wrong).
+    fn announcement_for(&self, group: IpAddr, port: u16) -> Option<SdpInfo> {
+        if let Some(s) = self.announced.get(&(group, port)) {
+            return Some(s.clone());
+        }
+        let only = |f: &dyn Fn(&(IpAddr, u16)) -> bool| {
+            let mut it = self.announced.iter().filter(|(k, _)| f(k));
+            match (it.next(), it.next()) {
+                (Some((_, s)), None) => Some(s.clone()),
+                _ => None,
+            }
+        };
+        only(&|k| k.0 == group).or_else(|| only(&|k| k.1 == port))
+    }
+
+    /// Every station announced so far, by name (one per media address).
+    pub fn stations(&self) -> Vec<(IpAddr, u16, SdpInfo)> {
+        self.announced
+            .iter()
+            .map(|(&(g, p), s)| (g, p, s.clone()))
+            .collect()
+    }
+
     /// The multicast streams that carry audio (or are announced as audio),
     /// by group address and port.
     pub fn streams(&self) -> Vec<AudioStream> {
@@ -416,7 +506,7 @@ impl McastScanner {
             .flows
             .iter()
             .map(|(&(group, port), f)| {
-                let sdp = self.announced.get(&(group, port)).cloned();
+                let sdp = self.announcement_for(group, port);
                 let sniffed = f
                     .sniffed
                     .iter()
@@ -553,6 +643,32 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert!(v.iter().any(|a| a.codec == Codec::AacAdts && !a.rtp));
         assert!(v.iter().any(|a| a.codec == Codec::AacLatm));
+    }
+
+    #[test]
+    fn bare_sdp_on_any_port_names_its_streams() {
+        // Bare SDP (no SAP header) to a port of its own, two media sections,
+        // the second with its own group; the audio flows then carry names.
+        let mut s = McastScanner::new();
+        let sdp = "v=0\r\no=- 4 13 IN IP4 192.168.1.14\r\ns=Classic_Hits\r\ni=Classic_Hits\r\n\
+                   c=IN IP4 230.0.0.3/16\r\nt=0 0\r\nm=audio 10001 RTP/AVP 14\r\n\
+                   m=audio 10005 RTP/AVP 14\r\nc=IN IP4 230.0.0.5/16\r\n";
+        feed(
+            &mut s,
+            &udp_v4([10, 1, 1, 1], [230, 0, 0, 1], 5000, 5555, sdp.as_bytes()),
+        );
+        for (g, port) in [([230, 0, 0, 3], 10001u16), ([230, 0, 0, 5], 10005)] {
+            for k in 0..10u16 {
+                let mut payload = vec![0u8; 4];
+                payload.extend_from_slice(&silent_mp2_frame());
+                let rtp = rtp_packet(14, k, k as u32 * 2160, 0x1234, &payload);
+                feed(&mut s, &udp_v4([10, 1, 1, 1], g, 4000, port, &rtp));
+            }
+        }
+        let v = s.streams();
+        assert_eq!(v.len(), 2, "{v:?}");
+        assert!(v.iter().all(|a| a.name() == "Classic_Hits"), "{v:?}");
+        assert_eq!(s.stations().len(), 2);
     }
 
     #[test]

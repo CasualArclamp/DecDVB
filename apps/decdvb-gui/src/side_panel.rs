@@ -1501,10 +1501,39 @@ fn audio_card(ui: &mut Ui, g: &GseView, id: VfoId, external: bool, actions: &mut
     }
     if g.sap_packets > 0 {
         ui.label(
-            RichText::new(format!("{} SAP announcements heard", g.sap_packets))
+            RichText::new(format!("{} SAP/SDP announcements heard", g.sap_packets))
                 .small()
                 .weak(),
         );
+    }
+    if !g.stations.is_empty() {
+        egui::CollapsingHeader::new(format!("Announced stations ({})", g.stations.len()))
+            .id_salt("stations")
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new("stations_grid")
+                    .num_columns(3)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for (group, port, sdp) in &g.stations {
+                            ui.label(
+                                RichText::new(sdp.name.as_deref().unwrap_or("(no name)")).strong(),
+                            );
+                            ui.label(RichText::new(format!("{group}:{port}")).monospace().small());
+                            let mut what = sdp.codec().label().to_string();
+                            if let Some(i) = sdp
+                                .info
+                                .as_deref()
+                                .filter(|i| Some(*i) != sdp.name.as_deref())
+                            {
+                                what = format!("{what} · {i}");
+                            }
+                            ui.label(RichText::new(what).small().weak())
+                                .on_hover_text(sdp.raw.trim());
+                            ui.end_row();
+                        }
+                    });
+            });
     }
 }
 
