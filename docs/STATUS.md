@@ -1353,3 +1353,12 @@ still unknown. `decdvb payload --esc-out` writes the bits.
 
 None of Rory's 102–128 kBd QPSK symbol recordings carries the FastLink
 unique word under any label assignment.
+
+Call log: `TdmStats::calls` — a call opens when two or more proven codec
+channels are active at once (one alone may be its status octet), grows
+while any of them is, and closes after 2 s of quiet. The FastLink card
+lists the last eight (time from alignment, length, channels), `decdvb
+payload` and `decode` print them. On the recordings: qflex_3 one call at
+395.3 s for 13.7 s on channels 0, 1, 2, 15; the 19:54 one at 18.9 s for
+12.4 s on 0, 1, 2 (15 not yet proven in 37 s). So a long unattended
+session shows when anyone spoke, and auto-record keeps the data.

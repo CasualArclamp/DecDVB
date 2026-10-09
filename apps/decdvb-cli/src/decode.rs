@@ -473,6 +473,15 @@ pub(crate) fn print_tdm(t: &decdvb_modem::tdm257::TdmStats) {
             .map(|b| char::from(b'0' + b))
             .collect::<String>()
     );
+    for c in &t.calls {
+        println!(
+            "  call at {:.1} s for {:.1} s{} on channels {}",
+            c.start as f64 * 0.002,
+            c.seconds(),
+            if c.open { " (still going)" } else { "" },
+            c.channel_list()
+        );
+    }
     for (c, ch) in t.channels.iter().enumerate() {
         println!(
             "  channel {c:2} (bit {c:2} of each word): {:12} changes 20 ms {:5.1} % · 4 ms {:5.1} % · ones {:4.1} %",

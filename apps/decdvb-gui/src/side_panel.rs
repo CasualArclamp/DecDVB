@@ -2048,6 +2048,34 @@ fn tdm_card(ui: &mut Ui, t: &decdvb_engine::TdmStats, triggered: Option<u64>) {
             ui.label(RichText::new(label).small().weak());
         }
     });
+    if !t.calls.is_empty() {
+        ui.label(RichText::new(format!("Calls ({})", t.calls.len())).strong())
+            .on_hover_text(
+                "Codec channels leaving their silence frames together: speech. \
+                 Times are from when the multiplex was first aligned.",
+            );
+        egui::Grid::new("tdm_calls")
+            .num_columns(3)
+            .striped(true)
+            .show(ui, |ui| {
+                for c in t.calls.iter().rev().take(8) {
+                    let at = c.start as f64 * 0.002;
+                    ui.label(format!("{:02}:{:02}", (at / 60.0) as u64, at as u64 % 60));
+                    let len = format!("{:.1} s", c.seconds());
+                    if c.open {
+                        ui.colored_label(scope::LOCK, format!("{len} · talking"));
+                    } else {
+                        ui.label(len);
+                    }
+                    ui.label(
+                        RichText::new(format!("channels {}", c.channel_list()))
+                            .small()
+                            .weak(),
+                    );
+                    ui.end_row();
+                }
+            });
+    }
     egui::CollapsingHeader::new("Channel details")
         .id_salt("tdm_details")
         .show(ui, |ui| {

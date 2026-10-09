@@ -51,6 +51,12 @@ const CODEC_ACTIVE_CHANGE: f32 = 0.05;
 /// departures count as speech: the signalling channels pass through the
 /// idle-codec reading only now and then.
 const CODEC_PROOF: usize = 80_000;
+/// Proven codec channels active together that make a call (one alone is
+/// often its status octet changing), the frames of quiet that end it
+/// (2 s), and the calls kept.
+const CALL_CHANNELS: u32 = 2;
+const CALL_HANG: u64 = 1000;
+const CALLS_KEPT: usize = 32;
 
 /// What a channel is doing over the last half second.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -93,6 +99,33 @@ pub struct ChannelView {
     pub ones: f32,
 }
 
+/// A call: proven codec channels leaving their silence frames together.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Call {
+    /// The frame (2 ms) it began at, and its length in frames so far.
+    pub start: u64,
+    pub frames: u64,
+    /// The channels that took part, one bit each.
+    pub channels: u16,
+    /// Still going.
+    pub open: bool,
+}
+
+impl Call {
+    pub fn seconds(&self) -> f64 {
+        self.frames as f64 * 0.002
+    }
+
+    /// "0, 1, 2, 15".
+    pub fn channel_list(&self) -> String {
+        (0..CHANNELS)
+            .filter(|c| self.channels >> c & 1 == 1)
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TdmStats {
     pub locked: bool,
@@ -104,6 +137,8 @@ pub struct TdmStats {
     /// 7 a 28 ms cycle, five cycles), oldest first.
     pub side_data: Vec<u8>,
     pub channels: [ChannelView; CHANNELS],
+    /// Calls heard, oldest first (the last `CALLS_KEPT`).
+    pub calls: Vec<Call>,
 }
 
 /// A channel's recent bits and running counts.
@@ -188,6 +223,8 @@ pub struct TdmRx {
     side: Vec<u8>,
     meters: Vec<Meter>,
     bits_in: usize,
+    /// The frame the last call was last heard at.
+    last_talk: u64,
     pub stats: TdmStats,
     /// Keep every aligned frame in `frames_out` (for analysis).
     pub keep_frames: bool,
@@ -210,6 +247,7 @@ impl TdmRx {
             side: Vec::new(),
             meters: vec![Meter::new(); CHANNELS],
             bits_in: 0,
+            last_talk: 0,
             stats: TdmStats::default(),
             keep_frames: false,
             frames_out: Vec::new(),
@@ -242,8 +280,46 @@ impl TdmRx {
                 *at -= keep_from;
             }
         }
-        for (v, m) in self.stats.channels.iter_mut().zip(&mut self.meters) {
+        let mut talking = 0u16;
+        for (c, (v, m)) in self
+            .stats
+            .channels
+            .iter_mut()
+            .zip(&mut self.meters)
+            .enumerate()
+        {
             *v = m.view();
+            if v.state == ChannelState::Active && m.idle_bits >= CODEC_PROOF {
+                talking |= 1 << c;
+            }
+        }
+        self.follow_calls(talking);
+    }
+
+    /// Open a call when enough proven codec channels talk at once; extend
+    /// it while any of them does; close it after `CALL_HANG` quiet frames.
+    fn follow_calls(&mut self, talking: u16) {
+        let now = self.stats.frames;
+        let open = self.stats.calls.last().is_some_and(|c| c.open);
+        if talking != 0 && (open || talking.count_ones() >= CALL_CHANNELS) {
+            if !open {
+                if self.stats.calls.len() >= CALLS_KEPT {
+                    self.stats.calls.remove(0);
+                }
+                self.stats.calls.push(Call {
+                    start: now,
+                    open: true,
+                    ..Call::default()
+                });
+            }
+            let c = self.stats.calls.last_mut().unwrap();
+            c.channels |= talking;
+            c.frames = now - c.start;
+            self.last_talk = now;
+        } else if open && now.saturating_sub(self.last_talk) > CALL_HANG {
+            let c = self.stats.calls.last_mut().unwrap();
+            c.open = false;
+            c.frames = self.last_talk - c.start;
         }
     }
 
@@ -432,6 +508,55 @@ mod tests {
         let last = rx.stats.channels[0];
         assert_eq!(last.state, ChannelState::Active, "{last:?}");
         assert!(last.change_20ms < ACTIVE_CHANGE, "{last:?}");
+        // One channel alone is not a call (it may be its status octet).
+        assert!(rx.stats.calls.is_empty(), "{:?}", rx.stats.calls);
+    }
+
+    #[test]
+    fn two_codec_channels_talking_make_a_call() {
+        let idle = [0xFF, 0xFE, 0xF3, 0xCE, 0xBB];
+        let mut x = 0x2545_F491u32;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        };
+        // 12 s idle, 3 s talking, 4 s idle — on channels 0 and 2.
+        let talk: Vec<u8> = (0..750).map(|_| (rnd() & 0xF0) | 0x0B).collect();
+        let d = |n: usize| match n {
+            3000..3750 => talk[n - 3000],
+            _ => idle[n % 5],
+        };
+        let ch = codec_channel(4750, d, 0x03);
+        let frames = ch.len() / WORDS;
+        let mut bits = Vec::new();
+        for f in 0..frames {
+            bits.push(if f % 2 == 0 { FAW[(f / 2) % 7] } else { 0 });
+            for w in 0..WORDS {
+                for c in 0..CHANNELS {
+                    bits.push(if c == 0 || c == 2 {
+                        ch[f * WORDS + w]
+                    } else {
+                        0
+                    });
+                }
+            }
+        }
+        let mut rx = TdmRx::new();
+        for chunk in bits.chunks(257 * 50) {
+            rx.push(chunk);
+        }
+        let calls = &rx.stats.calls;
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let c = calls[0];
+        assert!(!c.open, "{c:?}");
+        assert_eq!(c.channels, 0b101);
+        assert_eq!(c.channel_list(), "0, 2");
+        // About the 3 s of talk (the meters' half-second windows blur it).
+        assert!((2.5..4.0).contains(&c.seconds()), "{c:?}");
+        let start_s = c.start as f64 * 0.002;
+        assert!((11.5..13.0).contains(&start_s), "{start_s}");
     }
 
     #[test]
