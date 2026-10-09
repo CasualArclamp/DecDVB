@@ -144,11 +144,10 @@ AUs into a 2.3 kB RTP packet sends each as two. `<nowplaying>` messages
 (title, artist, station) are listed under **Now playing**.
 
 - **▶ Play** decodes it in DecDVB: MPEG audio layers I–III, AAC-LC (from
-  ADTS, LATM/LOAS or RFC 3640) and PCM/G.711, with **⏸ Pause** (resumes
+  ADTS, LATM/LOAS or RFC 3640), Opus (libopus) and PCM/G.711, with **⏸ Pause** (resumes
   live), **⏹ Stop**, a level meter, and the volume slider and 🔊 mute at the
   top of the list (app-wide, remembered). HE-AAC plays its AAC-LC core —
-  band-limited; open it in VLC for the full sound. Opus is not decoded here
-  (record it, or open it in VLC).
+  band-limited; open it in VLC for the full sound.
 - **⏺ Record** saves the stream to the output folder as broadcast, with no
   re-encoding: `.mp2`/`.mp3`, `.aac` (ADTS, any AAC carriage, HE-AAC intact),
   `.wav` for PCM, `.ts` for TS in UDP, `.opus` (Ogg) for Opus.
@@ -328,11 +327,15 @@ decdvb modcods                    # the DVB-S2 MODCOD table
 
 ## Build
 
-Rust 1.95 or newer:
+Rust 1.95 or newer, a C compiler and CMake (libopus, for Opus radio, is
+built from the `third_party/opus` submodule):
 
 ```bash
+git clone --recurse-submodules https://github.com/CasualArclamp/DecDVB
 cargo build --release
 ```
+
+In an existing clone, `git submodule update --init` fetches libopus.
 
 ### HackRF One
 

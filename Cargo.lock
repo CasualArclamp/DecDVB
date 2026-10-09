@@ -415,6 +415,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "codespan-reporting"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -580,6 +589,7 @@ version = "0.7.0"
 dependencies = [
  "cpal",
  "decdvb-ip",
+ "decdvb-opus-sys",
  "symphonia-bundle-mp3",
  "symphonia-codec-aac",
  "symphonia-core",
@@ -727,6 +737,13 @@ version = "0.7.0"
 dependencies = [
  "decdvb-core",
  "rustfft",
+]
+
+[[package]]
+name = "decdvb-opus-sys"
+version = "0.7.0"
+dependencies = [
+ "cmake",
 ]
 
 [[package]]

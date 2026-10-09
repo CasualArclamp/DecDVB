@@ -1,11 +1,16 @@
 //! Decoding [`Unit`]s to stereo PCM.
 //!
 //! MPEG audio layers I–III and AAC-LC are decoded by Symphonia (pure Rust,
-//! MPL-2.0); PCM arrives already decoded. Everything comes out as
+//! MPL-2.0), Opus by libopus (C, BSD, vendored: `decdvb-opus-sys`); PCM
+//! arrives already decoded. Everything comes out as
 //! interleaved stereo f32 — mono is copied to both sides, and of more than
 //! two channels the first two are kept — so the rest of the player has one
 //! shape to deal with.
 
+use std::ffi::{CStr, c_int};
+use std::ptr::NonNull;
+
+use decdvb_opus_sys as opus;
 use symphonia_bundle_mp3::MpaDecoder;
 use symphonia_codec_aac::AacDecoder;
 use symphonia_core::codecs::audio::well_known::{
@@ -32,6 +37,7 @@ pub struct Block {
 pub struct Decoder {
     mpa: Option<(MpaHeader, MpaDecoder)>,
     aac: Option<(AacConfig, AacDecoder)>,
+    opus: Option<OpusDecoder>,
     scratch: Vec<f32>,
     /// Units decoded, and those that failed.
     pub decoded: u64,
@@ -77,7 +83,7 @@ impl Decoder {
                 Ok(())
             }
             Unit::Ts(_) => Err("MPEG-TS is recorded, not played".into()),
-            Unit::Opus(_) => Err("Opus is recorded, not played".into()),
+            Unit::Opus(p) => self.opus(p, out),
         };
         match r {
             Ok(()) if !out.samples.is_empty() => {
@@ -161,6 +167,99 @@ impl Decoder {
     }
 }
 
+impl Decoder {
+    fn opus(&mut self, p: &[u8], out: &mut Block) -> Result<(), String> {
+        if self.opus.is_none() {
+            self.opus = Some(OpusDecoder::new()?);
+        }
+        let d = self.opus.as_mut().unwrap();
+        d.decode(p, &mut out.samples)?;
+        out.rate = 48_000;
+        // SAFETY: `p` is non-empty (the depacketiser drops empty
+        // payloads); these read only its TOC byte.
+        let (bw, ch) = unsafe {
+            (
+                opus::opus_packet_get_bandwidth(p.as_ptr()),
+                opus::opus_packet_get_nb_channels(p.as_ptr()),
+            )
+        };
+        // Audio bandwidth by mode (RFC 6716 §2, Table 1).
+        let band = match bw {
+            opus::OPUS_BANDWIDTH_NARROWBAND => "narrowband (4 kHz)",
+            opus::OPUS_BANDWIDTH_MEDIUMBAND => "mediumband (6 kHz)",
+            opus::OPUS_BANDWIDTH_WIDEBAND => "wideband (8 kHz)",
+            opus::OPUS_BANDWIDTH_SUPERWIDEBAND => "super-wideband (12 kHz)",
+            _ => "fullband (20 kHz)",
+        };
+        self.description = Some(format!(
+            "Opus · 48 kHz · {} · {band}",
+            if ch == 1 { "mono" } else { "stereo" }
+        ));
+        Ok(())
+    }
+}
+
+/// The largest Opus packet's audio: 120 ms at 48 kHz (RFC 6716 §3.2.5).
+const OPUS_MAX_FRAME: usize = 5760;
+
+/// A libopus decoder, always 48 kHz stereo out: libopus duplicates a mono
+/// stream to both sides itself.
+struct OpusDecoder(NonNull<opus::OpusDecoder>);
+
+// SAFETY: the decoder state belongs to this value alone, and libopus keeps
+// no per-thread or shared state for it, so it may move between threads.
+unsafe impl Send for OpusDecoder {}
+
+impl OpusDecoder {
+    fn new() -> Result<OpusDecoder, String> {
+        let mut err = 0;
+        // SAFETY: a valid rate and channel count; `err` outlives the call.
+        let p = unsafe { opus::opus_decoder_create(48_000, 2, &mut err) };
+        NonNull::new(p)
+            .map(OpusDecoder)
+            .ok_or_else(|| opus_error(err))
+    }
+
+    /// One packet into interleaved stereo `out` (replacing what it held).
+    fn decode(&mut self, packet: &[u8], out: &mut Vec<f32>) -> Result<(), String> {
+        out.clear();
+        out.resize(2 * OPUS_MAX_FRAME, 0.0);
+        // SAFETY: the state is live; `packet` is valid for its length and
+        // `out` holds OPUS_MAX_FRAME stereo samples, the capacity passed.
+        let n = unsafe {
+            opus::opus_decode_float(
+                self.0.as_ptr(),
+                packet.as_ptr(),
+                packet.len() as opus::opus_int32,
+                out.as_mut_ptr(),
+                OPUS_MAX_FRAME as c_int,
+                0,
+            )
+        };
+        if n < 0 {
+            out.clear();
+            return Err(opus_error(n));
+        }
+        out.truncate(2 * n as usize);
+        Ok(())
+    }
+}
+
+impl Drop for OpusDecoder {
+    fn drop(&mut self) {
+        // SAFETY: created by `opus_decoder_create` and destroyed only here.
+        unsafe { opus::opus_decoder_destroy(self.0.as_ptr()) }
+    }
+}
+
+/// libopus's text for an error code.
+fn opus_error(code: c_int) -> String {
+    // SAFETY: `opus_strerror` returns a static NUL-terminated string for
+    // any code.
+    let s = unsafe { CStr::from_ptr(opus::opus_strerror(code)) };
+    format!("Opus: {}", s.to_string_lossy())
+}
+
 /// Interleaved `channels`-channel audio to interleaved stereo.
 fn to_stereo(x: &[f32], channels: usize, out: &mut Vec<f32>) {
     match channels {
@@ -172,7 +271,7 @@ fn to_stereo(x: &[f32], channels: usize, out: &mut Vec<f32>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::aac::silent_aac_au;
     use decdvb_ip::mcast::silent_mp2_frame;
@@ -228,6 +327,69 @@ mod tests {
         );
         assert_eq!(b.rate, 24_000);
         assert!(d.description.as_deref().unwrap().contains("core"));
+    }
+
+    /// `n` 20 ms Opus packets of a 1 kHz tone at −6 dBFS, `channels` 1 or 2,
+    /// from libopus's encoder.
+    pub(crate) fn opus_tone(n: usize, channels: usize) -> Vec<Vec<u8>> {
+        const N: usize = 960;
+        let mut err = 0;
+        let mut out = Vec::new();
+        // SAFETY: valid arguments; the encoder is destroyed at the end and
+        // every buffer outlives the calls that use it.
+        unsafe {
+            let enc = opus::opus_encoder_create(
+                48_000,
+                channels as c_int,
+                opus::OPUS_APPLICATION_AUDIO,
+                &mut err,
+            );
+            assert!(!enc.is_null(), "{err}");
+            for k in 0..n {
+                let pcm: Vec<f32> = (0..N * channels)
+                    .map(|i| {
+                        let t = (k * N + i / channels) as f32 / 48_000.0;
+                        0.5 * (std::f32::consts::TAU * 1000.0 * t).sin()
+                    })
+                    .collect();
+                let mut p = vec![0u8; 1275];
+                let len =
+                    opus::opus_encode_float(enc, pcm.as_ptr(), N as c_int, p.as_mut_ptr(), 1275);
+                assert!(len > 0, "{len}");
+                p.truncate(len as usize);
+                out.push(p);
+            }
+            opus::opus_encoder_destroy(enc);
+        }
+        out
+    }
+
+    #[test]
+    fn decodes_opus_mono_and_stereo_to_stereo() {
+        for ch in [1, 2] {
+            let mut d = Decoder::new();
+            let mut b = Block::default();
+            let mut energy = 0.0;
+            let mut samples = 0;
+            for (k, p) in opus_tone(25, ch).into_iter().enumerate() {
+                assert!(d.decode(&Unit::Opus(p), &mut b), "{:?}", d.last_error);
+                assert_eq!((b.rate, b.samples.len()), (48_000, 2 * 960));
+                if k >= 5 {
+                    energy += b.samples.iter().map(|v| v * v).sum::<f32>();
+                    samples += b.samples.len();
+                }
+            }
+            // A 0.5-amplitude sine: RMS 0.354 (−9 dBFS).
+            let rms = (energy / samples as f32).sqrt();
+            assert!((rms - 0.354).abs() < 0.05, "{ch} ch: rms {rms}");
+            let desc = d.description.clone().unwrap();
+            assert!(desc.starts_with("Opus · 48 kHz"), "{desc}");
+            assert!(desc.contains(if ch == 1 { "mono" } else { "stereo" }));
+        }
+        // Garbage is an error, not a crash.
+        let mut d = Decoder::new();
+        assert!(!d.decode(&Unit::Opus(vec![0xFF; 3]), &mut Block::default()));
+        assert!(d.last_error.unwrap().starts_with("Opus:"));
     }
 
     #[test]

@@ -3,14 +3,14 @@
 //!
 //! - [`depay`]: a stream's UDP payloads to whole frames (RTP, RFC 2250,
 //!   RFC 3016 LATM, RFC 3640, raw ADTS/LOAS/MPEG audio, PCM).
-//! - [`decode`]: frames to stereo PCM (Symphonia: MPEG audio I–III, AAC-LC).
+//! - [`decode`]: frames to stereo PCM (Symphonia: MPEG audio I–III, AAC-LC;
+//!   libopus: Opus).
 //! - [`resample`]: to the sound card's rate, drift-trimmed.
 //! - [`player`]: the thread and sound output, with volume and pause.
 //! - [`record`]: the stream to a file as broadcast.
 //!
 //! HE-AAC plays as its AAC-LC core (Symphonia has no SBR); open the stream in
-//! VLC for full bandwidth. Opus is not decoded here: it records to Ogg Opus
-//! and plays in VLC.
+//! VLC for full bandwidth.
 
 pub mod aac;
 pub mod bits;

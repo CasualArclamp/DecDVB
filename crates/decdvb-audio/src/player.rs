@@ -185,9 +185,6 @@ impl AudioPlayer {
         if depay.is_ts() {
             return Err("an MPEG-TS stream: open it in VLC".into());
         }
-        if depay.is_opus() {
-            return Err("Opus is not decoded here: open it in VLC (…), or record it".into());
-        }
         let shared = Arc::new(Shared {
             ring: Mutex::new(Ring {
                 buf: VecDeque::new(),

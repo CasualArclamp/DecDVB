@@ -20,20 +20,23 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
+      # libopus (third_party/opus) is a submodule, built by decdvb-opus-sys.
       - uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
       # eframe/glow needs the X11/Wayland and GL development headers on Linux,
-      # and cpal (in-app audio) the ALSA ones.
+      # cpal (in-app audio) the ALSA ones, and libopus CMake.
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgl1-mesa-dev libxkbcommon-dev libxcb-render0-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libasound2-dev pkg-config
+            libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libasound2-dev pkg-config cmake
 
       - name: Build
         run: cargo build --workspace --all-targets
@@ -50,6 +53,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -58,7 +63,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgl1-mesa-dev libxkbcommon-dev libxcb-render0-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libasound2-dev pkg-config
+            libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libasound2-dev pkg-config cmake
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   fmt:

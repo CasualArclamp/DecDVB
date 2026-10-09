@@ -1256,3 +1256,18 @@ On the recording (24.8 s): two AAC-LC and five HE-AAC streams at 44.1 kHz
 stereo and one Opus at 48 kHz, all from RTCP; the seven AAC decode with 0
 errors; ffmpeg reads the .aac as HE-AAC/LC and the .opus as 24.7 s of
 stereo Opus; the HE-AAC SDP, replayed over RTP into ffmpeg, decodes.
+
+## Opus in the app: libopus vendored (2026-10-10)
+
+`third_party/opus` (xiph/opus v1.6.1, shallow submodule) built by
+`decdvb-opus-sys` — DecDRM's `decdrm-opus-sys` build script and bindings:
+CMake, static, float API, no DNN extensions, the static C runtime when
+`crt-static` is on. `decdvb-audio::decode` wraps the decoder (48 kHz stereo
+out; mono duplicated by libopus) and names the mode's bandwidth; the player
+no longer refuses Opus. CI and the release workflow check out submodules;
+Linux CI installs CMake.
+
+Tests: a libopus-encoded 1 kHz tone, mono and stereo, decodes at its level
+(RMS within 0.05 of 0.354); garbage is an error; 50 RTP packets play through
+the player to the null output. On the recording, 225.0.0.20:6012 decodes
+24.7 s with 0 errors (stereo, fullband).

@@ -10,8 +10,7 @@
 //! - **mpeg4-generic in RTP** (RFC 3640): AU headers and access units, the
 //!   AudioSpecificConfig in the SDP.
 //! - **PCM in RTP** (RFC 3551): L16/L24/L8, and G.711 µ-law and A-law.
-//! - **Opus in RTP** (RFC 7587): one Opus packet a payload (recorded, not
-//!   decoded here).
+//! - **Opus in RTP** (RFC 7587): one Opus packet a payload.
 
 use decdvb_ip::mcast::rtp_payload;
 use decdvb_ip::{AudioStream, Codec};
@@ -34,7 +33,7 @@ pub enum Unit {
     },
     /// MPEG-TS bytes (recorded, not played).
     Ts(Vec<u8>),
-    /// One Opus packet (RFC 7587 §4.2) — recorded, not played.
+    /// One Opus packet (RFC 7587 §4.2).
     Opus(Vec<u8>),
 }
 
@@ -177,11 +176,6 @@ impl Depacketizer {
     /// MPEG-TS streams are recorded but not played.
     pub fn is_ts(&self) -> bool {
         matches!(self.kind, Kind::Ts)
-    }
-
-    /// Opus is recorded but not decoded here.
-    pub fn is_opus(&self) -> bool {
-        matches!(self.kind, Kind::Opus)
     }
 
     /// One UDP payload; finished units go to `out`.
@@ -462,10 +456,25 @@ mod tests {
     fn unplayable_streams_say_why() {
         assert!(Depacketizer::new(&stream(false, None, Codec::Opus, None)).is_err());
         assert!(Depacketizer::new(&stream(true, Some(96), Codec::AacRfc3640, None)).is_err());
-        // Opus in RTP is taken apart (to record), though not played.
+    }
+
+    #[test]
+    fn opus_in_rtp_plays() {
+        // libopus's packets in RTP, through the player to the null output.
         let s = stream(true, Some(96), Codec::Opus, None);
-        assert!(Depacketizer::new(&s).unwrap().is_opus());
-        let e = crate::AudioPlayer::start(&s, crate::OutputKind::Null).err();
-        assert!(e.is_some_and(|e| e.contains("VLC")));
+        let mut p = crate::AudioPlayer::start(&s, crate::OutputKind::Null).unwrap();
+        for (k, pkt) in crate::decode::tests::opus_tone(50, 2).iter().enumerate() {
+            p.packet(&rtp_packet(96, k as u16, k as u32 * 960, 5, pkt));
+        }
+        let h = p.handle();
+        for _ in 0..200 {
+            if h.status().decoded >= 50 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let st = h.status();
+        assert_eq!(st.decoded, 50, "{st:?}");
+        assert_eq!(st.carriage, "Opus in RTP");
     }
 }

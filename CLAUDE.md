@@ -13,6 +13,9 @@ cargo run --release -p decdvb-gui       # the GUI
 cargo run --release -p decdvb-cli -- modcods
 ```
 
+libopus (Opus radio) is the `third_party/opus` submodule (tag v1.6.1), built
+by `decdvb-opus-sys` with CMake, as in DecDRM: `git submodule update --init`.
+
 The live HackRF front end is behind `--features hackrf` (on `decdvb-io`, re-exported
 by both apps), so a plain build never needs the HackRF SDK and CI stays green.
 
