@@ -594,6 +594,12 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
         }
     }
 
+    if v.settings.decoder == DecoderKind::CarrierId
+        && let Some(c) = &st.cid
+    {
+        cid_card(ui, c);
+    }
+
     if matches!(
         v.settings.decoder,
         DecoderKind::Tpc2964 | DecoderKind::FastLink
@@ -1066,6 +1072,103 @@ fn payload_rows(ui: &mut Ui, f: Option<&FecStats>) {
         }
         ui.end_row();
     }
+}
+
+/// A DVB-CID VFO: the despreader, and what the identifier says.
+fn cid_card(ui: &mut Ui, c: &decdvb_engine::CidView) {
+    use decdvb_engine::cid;
+    let good = Color32::from_rgb(110, 220, 110);
+    let wait = Color32::from_rgb(240, 200, 80);
+    let s = &c.stats;
+    ui.add_space(6.0);
+    ui.label(RichText::new("Carrier ID (DVB-CID, ETSI TS 103 129)").strong());
+    egui::Grid::new("cid").num_columns(2).show(ui, |ui| {
+        ui.label("Host carrier");
+        ui.label(format!(
+            "{} → {:.0} kchip/s",
+            format::rate(c.host_symbol_rate),
+            c.chip_rate / 1e3
+        ));
+        ui.end_row();
+        if !c.wide_enough {
+            ui.label("");
+            ui.colored_label(
+                wait,
+                format!(
+                    "widen the VFO to {} for the CID's whole band",
+                    format::freq(1.35 * c.chip_rate)
+                ),
+            );
+            ui.end_row();
+        }
+        ui.label("Spreading code");
+        if s.acquired {
+            ui.colored_label(
+                good,
+                format!(
+                    "found · {:+.1} Hz from the carrier's centre · {:.1} dB a bit",
+                    s.offset_hz, s.snr_db
+                ),
+            );
+        } else {
+            ui.colored_label(wait, format!("searching… ({} tries)", s.searches))
+                .on_hover_text(
+                    "4096 chips a bit, ±1.7 kHz around the carrier's centre. A CID sits \
+                     27.5 dB under its carrier; a frame takes 976 bits (36 s at \
+                     112 kchip/s, 18 s at 224).",
+                );
+        }
+        ui.end_row();
+        if s.acquired {
+            ui.label("Frames");
+            ui.label(format!(
+                "{} decoded · {} failed · {} bits",
+                s.frames, s.bad_frames, s.bits
+            ));
+            ui.end_row();
+        }
+        let r = &s.report;
+        if let Some(g) = r.guid {
+            ui.label("Identifier");
+            ui.label(RichText::new(cid::guid_text(g)).monospace().strong());
+            ui.end_row();
+            if let Some(mac) = cid::guid_mac(g) {
+                ui.label("MAC");
+                ui.label(RichText::new(mac).monospace());
+                ui.end_row();
+            }
+        }
+        if let (Some(lat), Some(lon)) = (r.latitude(), r.longitude()) {
+            ui.label("Position");
+            ui.label(format!(
+                "{:.4}° {} {:.4}° {}",
+                lat.abs(),
+                if lat < 0.0 { "S" } else { "N" },
+                lon.abs(),
+                if lon < 0.0 { "W" } else { "E" }
+            ));
+            ui.end_row();
+        }
+        if let Some(t) = r.telephone() {
+            ui.label("Telephone");
+            ui.label(t);
+            ui.end_row();
+        }
+        if let Some(t) = r.user_text() {
+            ui.label("Text");
+            ui.label(RichText::new(t).monospace());
+            ui.end_row();
+        }
+        if s.scrambler == Some(cid::ScramblerOrder::Reversed) {
+            ui.label("");
+            ui.label(
+                RichText::new("(scrambler register read right to left)")
+                    .small()
+                    .weak(),
+            );
+            ui.end_row();
+        }
+    });
 }
 
 /// A Q-Flex FastLink VFO: the carrier, the sync word, the LDPC decoder,

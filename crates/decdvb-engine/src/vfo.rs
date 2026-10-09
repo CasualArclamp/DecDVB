@@ -45,6 +45,10 @@ pub enum DecoderKind {
     /// LDPC decoding and descrambling as measured on a live carrier; the
     /// data go to the same payload search as TPC 2964's.
     FastLink,
+    /// DVB-CID (ETSI TS 103 129): the carrier identification signal under a
+    /// host carrier — the uplink modulator's unique ID, position, telephone
+    /// and text.
+    CarrierId,
     /// Generic PSK/APSK: lock any linearly modulated carrier and write its
     /// hard-decided symbols to a `.bin` file, one byte per symbol.
     PskSymbols,
@@ -55,13 +59,14 @@ pub enum DecoderKind {
 }
 
 impl DecoderKind {
-    pub const ALL: [DecoderKind; 9] = [
+    pub const ALL: [DecoderKind; 10] = [
         DecoderKind::Identify,
         DecoderKind::Dvbs2Ip,
         DecoderKind::Dvbs2Ts,
         DecoderKind::DvbsTs,
         DecoderKind::Tpc2964,
         DecoderKind::FastLink,
+        DecoderKind::CarrierId,
         DecoderKind::PskSymbols,
         DecoderKind::IqRecord,
         DecoderKind::Spectrum,
@@ -75,6 +80,7 @@ impl DecoderKind {
             DecoderKind::DvbsTs => "DVB-S → MPEG-TS",
             DecoderKind::Tpc2964 => "TPC 2964 (IESS-315) → IP / TS",
             DecoderKind::FastLink => "Q-Flex FastLink (QPSK 0.710) → data",
+            DecoderKind::CarrierId => "Carrier ID (DVB-CID)",
             DecoderKind::PskSymbols => "Generic PSK → symbols (.bin)",
             DecoderKind::IqRecord => "IQ recorder",
             DecoderKind::Spectrum => "Spectrum only",
@@ -115,6 +121,7 @@ impl DecoderKind {
             DecoderKind::DvbsTs => "S→TS",
             DecoderKind::Tpc2964 => "TPC",
             DecoderKind::FastLink => "FL",
+            DecoderKind::CarrierId => "CID",
             DecoderKind::PskSymbols => "PSK",
             DecoderKind::IqRecord => "REC",
             DecoderKind::Spectrum => "SPEC",
@@ -241,6 +248,8 @@ pub struct VfoStatus {
     pub fec: Option<FecStats>,
     /// Generic PSK: text found in the decided bits.
     pub text: Option<decdvb_modem::text::TextView>,
+    /// DVB-CID: the despreader and what the identifier said.
+    pub cid: Option<crate::cid::CidView>,
 }
 
 /// A running demodulator's carrier loop, for display.
@@ -401,6 +410,12 @@ enum Decoder {
         /// the payload and its outputs on the FEC thread.
         fec: Option<FecWorker>,
     },
+    /// DVB-CID: Identify's first look gives the host carrier's centre and
+    /// rate, then the despreader runs on its own thread.
+    Cid {
+        buf: Vec<Iq>,
+        worker: Option<crate::cid::CidWorker>,
+    },
     Psk {
         buf: Vec<Iq>,
         demod: Option<Box<PskDemod>>,
@@ -507,6 +522,10 @@ impl Worker {
                 buf: Vec::new(),
                 demod: None,
                 fec: None,
+            },
+            DecoderKind::CarrierId => Decoder::Cid {
+                buf: Vec::new(),
+                worker: None,
             },
             DecoderKind::PskSymbols => Decoder::Psk {
                 buf: Vec::new(),
@@ -786,6 +805,32 @@ impl Worker {
                             *demod = Some(d);
                         } else {
                             buf.clear();
+                        }
+                        self.identification = Some(id);
+                    }
+                }
+            },
+            Decoder::Cid { buf, worker } => match worker {
+                Some(w) => w.offer(self.bb.clone()),
+                None => {
+                    buf.extend_from_slice(&self.bb);
+                    if buf.len() >= first_look(out_rate) {
+                        let id = identify_in(buf, out_rate, Some(self.settings.bandwidth_hz));
+                        let rs = self.settings.symbol_rate.or(id.symbol_rate);
+                        let usable = !matches!(id.verdict, Verdict::NoSignal);
+                        match rs.filter(|_| usable) {
+                            Some(rs) => {
+                                let w = crate::cid::CidWorker::spawn(
+                                    out_rate,
+                                    self.settings.bandwidth_hz.min(out_rate),
+                                    id.center_offset_hz,
+                                    rs,
+                                    self.lossless,
+                                );
+                                w.offer(std::mem::take(buf));
+                                *worker = Some(w);
+                            }
+                            None => buf.clear(),
                         }
                         self.identification = Some(id);
                     }
@@ -1089,6 +1134,24 @@ impl Worker {
                     st.fec = f;
                 }
             },
+            Decoder::Cid { buf, worker } => match worker {
+                None => {
+                    st.progress = buf.len() as f32 / first_look(out_rate) as f32;
+                    st.message = match &self.identification {
+                        Some(id) if matches!(id.verdict, Verdict::NoSignal) => {
+                            "no signal in this VFO".into()
+                        }
+                        Some(id) => format!("no symbol rate yet — {}", id.summary()),
+                        None => "measuring the host carrier…".into(),
+                    };
+                }
+                Some(w) => {
+                    let v = w.view();
+                    st.symbol_rate = Some(v.host_symbol_rate);
+                    st.message = cid_message(&v);
+                    st.cid = Some(v);
+                }
+            },
             Decoder::Psk {
                 buf,
                 demod,
@@ -1175,6 +1238,30 @@ fn fastlink_message(lock: &str, f: Option<&crate::fec::FecStats>) -> String {
         t.failed,
         t.channel_ber()
     )
+}
+
+/// A DVB-CID VFO's status line.
+fn cid_message(v: &crate::cid::CidView) -> String {
+    let s = &v.stats;
+    let rate = format!("{:.0} kchip/s", v.chip_rate / 1e3);
+    if !s.acquired {
+        return format!("looking for a DVB-CID at {rate} ({} searches)", s.searches);
+    }
+    match s.report.guid {
+        Some(g) => format!(
+            "DVB-CID {} · {} frames · {:+.0} Hz · {:.1} dB",
+            decdvb_modem::cid::guid_text(g),
+            s.frames,
+            s.offset_hz,
+            s.snr_db
+        ),
+        None => format!(
+            "DVB-CID code found at {:+.0} Hz, {:.1} dB · reading the first frame (~{:.0} s)",
+            s.offset_hz,
+            s.snr_db,
+            976.0 * 4096.0 / v.chip_rate
+        ),
+    }
 }
 
 /// A TPC 2964 VFO's status line.
@@ -1994,6 +2081,95 @@ mod tests {
         assert_eq!(t.cc_errors, 0);
         let p = &t.report.programmes[0];
         assert_eq!(p.name.as_deref(), Some("DecDVB test signal"));
+    }
+
+    #[test]
+    fn carrier_id_vfo_finds_a_cid_under_its_host() {
+        use decdvb_mod::Shaper;
+        use decdvb_modem::cid::{Field, build_frame, spread};
+        // A 224 kBd QPSK host at 15 dB Es/N0 in an 896 kS/s VFO, and under
+        // it a DVB-CID at 112 kchip/s, 220 Hz up, 27.5 dB below the host's
+        // spectral density (TS 103 129 §5.8–5.9).
+        let fs = 896_000.0;
+        let mut r = 0x5EED_1234_u64;
+        let mut rnd = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        let n_sym = 600_000; // 2.7 s
+        let host: Vec<Iq> = (0..n_sym)
+            .map(|_| {
+                let v = rnd();
+                let a = std::f32::consts::FRAC_1_SQRT_2;
+                Iq::new(
+                    if v & 1 == 0 { a } else { -a },
+                    if v & 2 == 0 { a } else { -a },
+                )
+            })
+            .collect();
+        let mut x = Vec::new();
+        Shaper::new(4, 0.35, 16).process(&host, &mut x);
+        let frame = build_frame(
+            0x0006_B0FF_FF01_AC07,
+            [
+                Field {
+                    content_id: 0,
+                    info: 1,
+                },
+                Field {
+                    content_id: 0,
+                    info: 1,
+                },
+            ],
+            false,
+        );
+        let (mut chips, mut diff) = (Vec::new(), 0);
+        spread(&[frame], &mut diff, &mut chips);
+        let chip_syms: Vec<Iq> = chips[..x.len() / 8 + 64]
+            .iter()
+            .map(|&c| Iq::new(if c == 1 { -1.0 } else { 1.0 }, 0.0))
+            .collect();
+        let mut cid = Vec::new();
+        Shaper::new(8, 0.35, 16).process(&chip_syms, &mut cid);
+        // Power: the host's samples are about unit power over its band;
+        // the CID's density 27.5 dB lower over half the bandwidth.
+        let p_host = x.iter().map(|z| z.norm_sqr()).sum::<f32>() / x.len() as f32;
+        let p_cid = cid.iter().map(|z| z.norm_sqr()).sum::<f32>() / cid.len() as f32;
+        let g = (p_host / p_cid * 0.5 * 10f32.powf(-2.75)).sqrt();
+        let noise = (p_host / 10f32.powf(1.5) * fs as f32 / 224_000.0 / 2.0).sqrt();
+        for (n, v) in x.iter_mut().enumerate() {
+            let ph = std::f64::consts::TAU * 220.0 * n as f64 / fs;
+            let mut u = || ((rnd() >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 3.46;
+            *v +=
+                cid[n] * Iq::new(ph.cos() as f32, ph.sin() as f32) * g + Iq::new(u(), u()) * noise;
+        }
+        let mut settings = VfoSettings::new("C", 0.0, 400_000.0, DecoderKind::CarrierId);
+        settings.symbol_rate = Some(224_000.0);
+        let status = Arc::new(Mutex::new(VfoStatus::default()));
+        let mut wk = Worker::new(fs, settings, status.clone(), Arc::new(AtomicU64::new(0)));
+        wk.lossless = true;
+        feed(&mut wk, &x, 65_536);
+        let t0 = Instant::now();
+        let c = loop {
+            wk.publish(0);
+            let c = status.lock().unwrap().cid.clone();
+            if let Some(c) = c.filter(|c| c.stats.acquired && c.stats.bits > 20) {
+                break c;
+            }
+            if t0.elapsed().as_secs() >= 60 {
+                let st = status.lock().unwrap();
+                panic!("no CID: {} / {:?}", st.message, st.cid);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(c.chip_rate, 112e3);
+        assert!(c.wide_enough);
+        // 220 Hz from the carrier, wherever Identify put its centre.
+        let at = c.center_hz + c.stats.offset_hz;
+        assert!((at - 220.0).abs() < 10.0, "found at {at:+.1} Hz");
+        assert!(c.stats.snr_db > 3.0, "{:?}", c.stats);
     }
 
     #[test]

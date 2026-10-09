@@ -32,6 +32,7 @@ TPC 2964 carrier). Every carrier was found and identified blind.*
 | **DVB-S → MPEG-TS** (EN 300 421): code rate, rotation and inversion found blind; Viterbi, RS, the same TS outputs | ✅ |
 | **TPC 2964 → IP / TS / voice** (Intelsat IESS-315 turbo product code, BPSK/QPSK): frame structure, scrambling and payload found from the signal; HDLC → IP, MPEG-TS, E1 and Comtech D&I++ voice | ✅ confirmed on a live Comtech CDM-600L carrier |
 | **Q-Flex FastLink → data** (Paradise, QPSK 0.710): sync word, the (2880, 2048) LDPC code and the frame scrambler, all measured from a live carrier; the data go to the same payload search and text finder | ✅ decodes a live Q-Flex (payload format not yet known) |
+| **Carrier ID (DVB-CID, ETSI TS 103 129)**: the spread-spectrum identifier under a carrier — the uplink modulator's unique ID (and MAC), position, telephone and text | ✅ to the specification, on synthetic carriers (no CID among the recordings yet) |
 | **E1 voice**: G.704 E1 or Comtech Drop & Insert++ timeslots, G.711 A-law — levels per channel, listen, record `.wav` | ✅ |
 | **Generic PSK/APSK/QAM → symbols** (`.bin`, one byte per symbol), BPSK…32APSK and 8/16/64QAM, for non-DVB carriers | ✅ |
 | Narrow carriers: VFOs down to 500 Hz, ~10 kBd SCPC carriers lock | ✅ |
@@ -206,6 +207,22 @@ change. Offline:
 
 ```bash
 decdvb decode capture_148148Sps.cf32 --decoder tpc --out dir --e1-record 1
+```
+
+### Carrier ID (DVB-CID)
+
+Modern uplink modulators hide a carrier identification signal under their
+carrier (ETSI TS 103 129): BPSK spread 4096 chips a bit, 27.5 dB below the
+carrier's spectral density, 220 Hz above its centre, saying who transmits —
+the modulator's 64-bit identifier (often its MAC address) and, if the
+operator entered them, its position, a telephone number and a short text.
+Put a **Carrier ID (DVB-CID)** VFO on a carrier (at least 1.35 × the chip
+rate wide: 151 kHz below 512 kBd, 302 kHz above): it measures the carrier,
+searches for the spreading code (a fraction of a second), then reads frames —
+one every 36 s (18 s on carriers of 512 kBd and up). Offline:
+
+```bash
+decdvb decode capture_1000000Sps.cf32 --decoder cid --fast
 ```
 
 ### Generic PSK → symbols

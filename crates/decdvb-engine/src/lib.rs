@@ -5,6 +5,7 @@
 //! in here from M1 onward — see `docs/DESIGN.md`.
 
 pub mod carriers;
+pub mod cid;
 pub mod demod;
 pub mod estimate;
 pub mod fec;
@@ -16,6 +17,7 @@ pub mod spectrum;
 pub mod vfo;
 
 pub use carriers::{Carrier, detect_carriers};
+pub use cid::CidView;
 pub use decdvb_modem::e1::Coding as E1Coding;
 pub use decdvb_modem::text::{ByteTextView, TextView};
 pub use demod::{Demod, LockState, PlFrame};

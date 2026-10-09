@@ -33,6 +33,7 @@ fn decoder_by_name(name: &str) -> Result<DecoderKind> {
         "dvbs" => DecoderKind::DvbsTs,
         "tpc" | "tpc2964" => DecoderKind::Tpc2964,
         "fastlink" | "fl" => DecoderKind::FastLink,
+        "cid" | "carrier-id" => DecoderKind::CarrierId,
         "psk" => DecoderKind::PskSymbols,
         other => bail!("unknown decoder `{other}` (id, ip, ts, dvbs, tpc, psk)"),
     })
@@ -148,6 +149,42 @@ fn report(st: &VfoStatus) {
     }
     if let Some(t) = &st.text {
         print_bit_text("text", t);
+    }
+    if let Some(c) = &st.cid {
+        use decdvb_engine::cid::{guid_mac, guid_text};
+        let s = &c.stats;
+        println!(
+            "dvb-cid: {:.0} kchip/s, code {}, {} searches, {:+.1} Hz, {:.1} dB a bit, {} bits, {} frames ({} failed){}",
+            c.chip_rate / 1e3,
+            if s.acquired { "found" } else { "not found" },
+            s.searches,
+            s.offset_hz,
+            s.snr_db,
+            s.bits,
+            s.frames,
+            s.bad_frames,
+            if c.wide_enough {
+                ""
+            } else {
+                " — VFO narrower than the CID's band"
+            }
+        );
+        let r = &s.report;
+        if let Some(g) = r.guid {
+            println!("  identifier {}", guid_text(g));
+            if let Some(m) = guid_mac(g) {
+                println!("  MAC {m}");
+            }
+        }
+        if let (Some(lat), Some(lon)) = (r.latitude(), r.longitude()) {
+            println!("  position {lat:.5}, {lon:.5}");
+        }
+        if let Some(t) = r.telephone() {
+            println!("  telephone {t}");
+        }
+        if let Some(t) = r.user_text() {
+            println!("  text \"{t}\"");
+        }
     }
     let Some(f) = &st.fec else { return };
     if let Some(t) = &f.tpc {

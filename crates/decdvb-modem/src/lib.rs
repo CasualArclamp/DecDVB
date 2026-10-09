@@ -12,6 +12,7 @@
 //!   scrambled, found from the data.
 //! - [`text`]: live text search in any bit stream, every reading at once.
 
+pub mod cid;
 pub mod conv;
 pub mod dandi;
 pub mod dvbs;

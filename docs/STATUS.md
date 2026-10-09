@@ -839,6 +839,35 @@ The FastLink data rate, 134 925 bit/s, is exactly 21/20 of Rory's
   timeslot's octet is not settled: neither a byte nor a bit split gives the
   CDM-600L timeslot's 1 ms idle cycle (this mux idles on a 4 ms cycle).
 
+## DVB-CID (2026-10-09)
+
+Rory asked for "DVB-CI": the carrier ID (ETSI TS 103 129 V1.1.1, fetched
+with his go-ahead, cache deleted), not the common interface.
+
+- `decdvb-modem::cid` follows §4–5: the 244-bit frame (UW 147147h,
+  complemented every other frame; two halves of identifier, content ID,
+  24 information bits, CRC-8, BCH(111, 69)), the x⁹ + x⁵ + 1 scrambler, four
+  copies, differential encoding, the 4096-chip x¹⁵ + x¹⁴ + 1 sequence,
+  112/224 kchip/s, +220 Hz. Checked against the document's own examples:
+  the first 32 chips (5091E364h), the check digits of 00:06:B0:FF:FF:01:AC:07
+  (75h), the position and telephone codings. The BCH generator is the
+  product of table 4's six polynomials; with GF(2⁷) from x⁷ + x³ + 1 its
+  roots include β¹…β¹² for β = α²³, so Berlekamp–Massey corrects 6.
+- The scrambler figure can be read two ways (register x⁹…x¹ written left to
+  right or right to left); the receiver tries both, keeps the one that
+  passes the CRC and says so.
+- Receiver: VFO baseband → DDC onto the host's centre (Identify) → cubic
+  resampling to 4 samples a chip → FFT search over code phase × frequency
+  (±1.7 kHz, half-bin steps, 24 bits non-coherently) → per-bit prompt,
+  early and late correlators with an FLL on the squared differential →
+  DBPSK → UW four times 244 apart → the copies summed → descramble, BCH,
+  CRC → identifier, MAC, position, telephone, text (§4.2 table 1).
+- Tested on synthetic signals: a full frame decoded from mid-stream at a
+  chip SNR of −26 dB; through a VFO, a CID 27.5 dB under a 224 kBd QPSK
+  host (Es/N0 15 dB) found within 10 Hz of +220 Hz. None of Rory's
+  recordings (CDM-600L, Q-Flex ×2, three others) carries a CID: no code
+  correlation peak in any of them.
+
 ## FFT size without a restart (2026-10-09)
 
 The waterfall's FFT size used to need **⟳ Apply** on a file and a restart

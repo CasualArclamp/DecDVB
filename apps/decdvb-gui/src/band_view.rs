@@ -212,6 +212,14 @@ pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
                 (None, _) => format!("acq {:.0} %", st.progress * 100.0),
             }
         }
+        DecoderKind::CarrierId => match &st.cid {
+            Some(c) => match c.stats.report.guid {
+                Some(g) => format!("CID {}", decdvb_engine::cid::guid_text(g)),
+                None if c.stats.acquired => format!("CID found {:+.0} Hz", c.stats.offset_hz),
+                None => "CID?".into(),
+            },
+            None => format!("acq {:.0} %", st.progress * 100.0),
+        },
         DecoderKind::PskSymbols => match &st.carrier {
             Some(c) => {
                 let lock = if c.locked { "LOCK" } else { "no lock" };
