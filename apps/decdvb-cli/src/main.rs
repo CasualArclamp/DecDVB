@@ -149,6 +149,10 @@ enum Command {
         /// cid: the receiver's clock correction, ppm (as the CID measures it).
         #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         clock_ppm: f64,
+        /// psk: write the symbols' bits (packed, MSB first) rather than a
+        /// byte a symbol.
+        #[arg(long)]
+        bits: bool,
     },
 }
 
@@ -238,6 +242,7 @@ fn main() -> Result<()> {
             labels,
             low_snr,
             clock_ppm,
+            bits,
         } => decode::decode(decode::DecodeArgs {
             file,
             format,
@@ -253,6 +258,7 @@ fn main() -> Result<()> {
             labels,
             low_snr,
             clock_ppm,
+            bits,
         }),
     }
 }

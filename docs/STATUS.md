@@ -1214,3 +1214,13 @@ display's floor it is drawn as a small dashed hump on the floor instead,
 the label still giving the level ("DSSS · 302 kHz · 29 dB under"). On the
 test capture (CID at −27.5 dB re the host's density, host at Es/N0 10 dB)
 it reads 29 dB under.
+
+## Generic PSK: bits instead of symbols (2026-10-09)
+
+`VfoSettings::psk_bits` (GUI "Output: bits instead of symbols", CLI
+`--bits`): the .bin gets each symbol's log2 M bits from its label under the
+chosen numbering, MSB first, packed into bytes (`SymbolPacker`, bits left
+over carried to the next block; the mode is fixed when a recording starts;
+the name ends -bits). Checked on the 10 kBd QPSK capture: 60 209 symbols →
+15 052 bytes, equal to the Gray labels unpacked. Also fixed: four tooltips
+whose line continuations had been lost (long runs of spaces in the text).

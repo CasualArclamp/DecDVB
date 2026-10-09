@@ -158,6 +158,10 @@ pub struct VfoSettings {
     pub find_text: bool,
     /// Generic PSK: how the symbols written to the .bin are numbered.
     pub symbol_labels: crate::psk::SymbolLabels,
+    /// Generic PSK: write each symbol's bits (log2 M of them, MSB first,
+    /// packed into bytes) rather than a byte a symbol. Taken when a
+    /// recording starts.
+    pub psk_bits: bool,
     /// Q-Flex FastLink: record the data whenever a channel of the TDM
     /// multiplex inside goes active (the 10 s before included).
     pub record_on_activity: bool,
@@ -212,6 +216,7 @@ impl VfoSettings {
             psk_modulation: None,
             find_text: true,
             symbol_labels: crate::psk::SymbolLabels::Standard,
+            psk_bits: false,
             record_on_activity: false,
             cid_low_snr: false,
             clock_ppm: 0.0,
@@ -464,7 +469,37 @@ enum Decoder {
         carrier_hz: f64,
         /// The live text search, while asked for.
         text: Option<Box<crate::psk::TextSearch>>,
+        /// How the open file is written (bits or bytes) and bits not yet
+        /// making a byte.
+        pack: SymbolPacker,
     },
+}
+
+/// Symbols into the .bin: a byte each, or their bits packed MSB first.
+#[derive(Default)]
+struct SymbolPacker {
+    bits: bool,
+    acc: u32,
+    n: u32,
+}
+
+impl SymbolPacker {
+    /// The bytes for `values` (labels, `per` bits each) into `out`.
+    fn pack(&mut self, values: impl Iterator<Item = u8>, per: u32, out: &mut Vec<u8>) {
+        if !self.bits {
+            out.extend(values);
+            return;
+        }
+        for v in values {
+            self.acc = (self.acc << per) | u32::from(v) & ((1 << per) - 1);
+            self.n += per;
+            while self.n >= 8 {
+                self.n -= 8;
+                out.push((self.acc >> self.n) as u8);
+            }
+            self.acc &= (1 << self.n) - 1;
+        }
+    }
 }
 
 struct Worker {
@@ -579,6 +614,7 @@ impl Worker {
                 open_failed: false,
                 carrier_hz: s.offset_hz,
                 text: None,
+                pack: SymbolPacker::default(),
             },
         }
     }
@@ -940,6 +976,7 @@ impl Worker {
                 open_failed,
                 carrier_hz,
                 text,
+                pack,
             } => match demod {
                 Some(d) => {
                     self.syms.clear();
@@ -949,10 +986,18 @@ impl Worker {
                         path,
                         written,
                         open_failed,
+                        pack,
                     };
                     file.follow(&self.settings, d, *carrier_hz);
                     let table = d.label_table(self.settings.symbol_labels);
-                    write_symbols(writer, written, &self.syms, &table, &mut self.sym_bytes);
+                    write_symbols(
+                        writer,
+                        written,
+                        &self.syms,
+                        &table,
+                        pack,
+                        &mut self.sym_bytes,
+                    );
                     match (self.settings.find_text, text.as_mut()) {
                         (true, Some(t)) => t.push(&self.syms),
                         (true, None) => {
@@ -996,10 +1041,18 @@ impl Worker {
                                 path,
                                 written,
                                 open_failed,
+                                pack,
                             };
                             file.follow(&self.settings, &d, *carrier_hz);
                             let table = d.label_table(self.settings.symbol_labels);
-                            write_symbols(writer, written, &self.syms, &table, &mut self.sym_bytes);
+                            write_symbols(
+                                writer,
+                                written,
+                                &self.syms,
+                                &table,
+                                pack,
+                                &mut self.sym_bytes,
+                            );
                             *demod = Some(d);
                         } else {
                             buf.clear();
@@ -1524,6 +1577,7 @@ struct PskFile<'a> {
     path: &'a mut Option<PathBuf>,
     written: &'a mut u64,
     open_failed: &'a mut bool,
+    pack: &'a mut SymbolPacker,
 }
 
 impl PskFile<'_> {
@@ -1533,13 +1587,18 @@ impl PskFile<'_> {
         match (settings.record, self.writer.is_some()) {
             (true, false) if !*self.open_failed => {
                 let p = settings.record_dir.join(format!(
-                    "decdvb-{}-{:+.0}Hz-{:.0}Bd-{}-{}.bin",
+                    "decdvb-{}-{:+.0}Hz-{:.0}Bd-{}{}-{}.bin",
                     settings.name.replace(' ', "_"),
                     carrier_hz,
                     d.symbol_rate(),
                     d.modulation().name().replace('/', ""),
+                    if settings.psk_bits { "-bits" } else { "" },
                     unix_stamp()
                 ));
+                *self.pack = SymbolPacker {
+                    bits: settings.psk_bits,
+                    ..SymbolPacker::default()
+                };
                 let _ = std::fs::create_dir_all(&settings.record_dir);
                 *self.writer = File::create(&p).ok().map(BufWriter::new);
                 *self.open_failed = self.writer.is_none();
@@ -1565,23 +1624,29 @@ fn unix_stamp() -> u64 {
         .unwrap_or(0)
 }
 
-/// Append hard decisions to the symbol file, one byte per symbol: the
-/// symbol's bit label under the DVB-S2 mapping (EN 302 307-1 §5.4; BPSK 0 ->
-/// +1). A write error closes the file rather than retrying every block.
-/// Append the symbols' bytes: each hard index through `table` (see
-/// [`crate::psk::SymbolLabels`]).
+/// Append hard decisions to the symbol file: each hard index through
+/// `table` (see [`crate::psk::SymbolLabels`]), a byte each or its bits
+/// packed (see [`SymbolPacker`]). A write error closes the file rather than
+/// retrying every block.
 fn write_symbols(
     writer: &mut Option<BufWriter<File>>,
     written: &mut u64,
     syms: &[(u8, Iq)],
     table: &[u8],
+    pack: &mut SymbolPacker,
     scratch: &mut Vec<u8>,
 ) {
     let Some(w) = writer else { return };
     scratch.clear();
-    scratch.extend(
+    // Bits a symbol: log2 of the points (BPSK 1, QPSK 2, 8PSK 3, …).
+    let per = (table.len().max(2) as u32)
+        .next_power_of_two()
+        .trailing_zeros();
+    pack.pack(
         syms.iter()
             .map(|&(i, _)| table.get(i as usize).copied().unwrap_or(i)),
+        per,
+        scratch,
     );
     if w.write_all(scratch).is_ok() {
         *written += syms.len() as u64;
@@ -1607,6 +1672,29 @@ mod tests {
     use super::*;
     use decdvb_fec::Constellation;
     use decdvb_mod::Shaper;
+
+    #[test]
+    fn symbols_pack_into_bits_msb_first() {
+        // QPSK 0, 1, 2, 3 → 00 01 10 11.
+        let mut p = SymbolPacker {
+            bits: true,
+            ..SymbolPacker::default()
+        };
+        let mut out = Vec::new();
+        p.pack([0u8, 1, 2, 3].into_iter(), 2, &mut out);
+        assert_eq!(out, [0x1B]);
+        // 8PSK 7, 0, 5 → 111 000 10|1: a byte, one bit kept for the next.
+        out.clear();
+        p.pack([7u8, 0, 5].into_iter(), 3, &mut out);
+        assert_eq!(out, [0xE2]);
+        p.pack([0u8, 0, 0].into_iter(), 3, &mut out);
+        assert_eq!(out, [0xE2, 0x80]);
+        // Bytes mode: the labels as they are.
+        let mut b = SymbolPacker::default();
+        out.clear();
+        b.pack([3u8, 1].into_iter(), 2, &mut out);
+        assert_eq!(out, [3, 1]);
+    }
 
     /// Drive a worker the way `run` does, without the thread.
     fn feed(w: &mut Worker, x: &[Iq], block: usize) {

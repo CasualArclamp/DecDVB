@@ -243,7 +243,17 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                     })
                     .response
                     .on_hover_text(
-                        "The byte written for each symbol: the standard label (DVB-S2's or                          the modem manual's mapping), its position (round the circle for                          PSK, column and row for square QAM), or the Gray code of the                          position (per axis for QAM). APSK and 8QAM keep their labels.",
+                        "The byte written for each symbol: the standard label (DVB-S2's or the modem manual's mapping), its position (round the circle for PSK, column and row for square QAM), or the Gray code of the position (per axis for QAM). APSK and 8QAM keep their labels.",
+                    );
+                ui.end_row();
+
+                ui.label("Output");
+                ui.checkbox(&mut s.psk_bits, "bits instead of symbols")
+                    .on_hover_text(
+                        "Write each symbol's bits, log2 M of them (BPSK 1, QPSK 2, 8PSK 3, \
+                         16QAM 4...), from its label under the numbering above, MSB first and \
+                         packed into bytes, rather than one byte a symbol. Taken when a \
+                         recording starts; the file name ends -bits.",
                     );
                 ui.end_row();
 
@@ -881,12 +891,12 @@ fn e1_card(ui: &mut Ui, e: &decdvb_engine::E1View, v: &UiVfo, actions: &mut Vec<
                         let label = ui.label(RichText::new(format!("{db:5.0} dB {what}")).small());
                         if let Coding::SubRate(mask) = coding {
                             label.on_hover_text(format!(
-                                "Only bits {} change and the sign bit never does, so this                                  is not G.711 audio: sub-rate channels (I.460) or                                  compressed voice. Played as A-law it sounds like                                  digital noise.",
+                                "Only bits {} change and the sign bit never does, so this is not G.711 audio: sub-rate channels (I.460) or compressed voice. Played as A-law it sounds like digital noise.",
                                 Coding::bits_text(mask)
                             ));
                         } else if coding == Coding::Steady && db >= -60.0 {
                             label.on_hover_text(
-                                "Every bit repeats each millisecond: an idle pattern,                                  or a steady test tone.",
+                                "Every bit repeats each millisecond: an idle pattern, or a steady test tone.",
                             );
                         }
                         let on = play == Some(ts);
@@ -1961,7 +1971,7 @@ fn tdm_card(ui: &mut Ui, t: &decdvb_engine::TdmStats, triggered: Option<u64>) {
             ),
         )
         .on_hover_text(
-            "One alignment bit a frame: the Barker-7 word (reversed) on alternate              frames, a 20 ms marker (01101…) between. Found blind on a live Q-Flex              carrier; the multiplexer's make is not known.",
+            "One alignment bit a frame: the Barker-7 word (reversed) on alternate frames, a 20 ms marker (01101…) between. Found blind on a live Q-Flex carrier; the multiplexer's make is not known.",
         );
         ui.end_row();
     });
