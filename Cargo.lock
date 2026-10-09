@@ -576,7 +576,7 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
 name = "decdvb-audio"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cpal",
  "decdvb-ip",
@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "decdvb-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "decdvb-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "num-complex",
  "thiserror 2.0.21",
@@ -611,7 +611,7 @@ dependencies = [
 
 [[package]]
 name = "decdvb-dsp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "decdvb-core",
  "num-complex",
@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "decdvb-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "decdvb-audio",
  "decdvb-core",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "decdvb-fec"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "decdvb-core",
  "num-complex",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "decdvb-frame"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "decdvb-core",
  "num-complex",
@@ -659,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "decdvb-gse"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "decdvb-core",
  "decdvb-ip",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "decdvb-gui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "decdvb-audio",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "decdvb-io"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "decdvb-core",
  "num-complex",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "decdvb-ip"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "decdvb-core",
  "thiserror 2.0.21",
@@ -706,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "decdvb-mod"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "decdvb-core",
  "decdvb-dsp",
@@ -721,14 +721,14 @@ dependencies = [
 
 [[package]]
 name = "decdvb-modem"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "decdvb-core",
 ]
 
 [[package]]
 name = "decdvb-ts"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "decdvb-core",
  "decdvb-frame",
