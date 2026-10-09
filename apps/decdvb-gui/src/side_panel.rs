@@ -750,16 +750,32 @@ fn e1_card(ui: &mut Ui, e: &decdvb_engine::E1View, v: &UiVfo, actions: &mut Vec<
                         let name = if e.channels.is_some() { "ch" } else { "TS" };
                         ui.label(RichText::new(format!("{name} {ts:2}")).monospace());
                         level_bar(ui, db);
+                        use decdvb_engine::E1Coding as Coding;
+                        let coding = e.coding.get(ts as usize).copied().unwrap_or_default();
                         let what = if ts == 16 && st.cas {
                             "signalling"
                         } else if db < -60.0 {
                             "idle"
+                        } else if matches!(coding, Coding::SubRate(_)) {
+                            "not G.711"
+                        } else if coding == Coding::Steady {
+                            "steady"
                         } else if db > -12.0 {
                             "data?"
                         } else {
                             "active"
                         };
-                        ui.label(RichText::new(format!("{db:5.0} dB {what}")).small());
+                        let label = ui.label(RichText::new(format!("{db:5.0} dB {what}")).small());
+                        if let Coding::SubRate(mask) = coding {
+                            label.on_hover_text(format!(
+                                "Only bits {} change and the sign bit never does, so this                                  is not G.711 audio: sub-rate channels (I.460) or                                  compressed voice. Played as A-law it sounds like                                  digital noise.",
+                                Coding::bits_text(mask)
+                            ));
+                        } else if coding == Coding::Steady && db >= -60.0 {
+                            label.on_hover_text(
+                                "Every bit repeats each millisecond: an idle pattern,                                  or a steady test tone.",
+                            );
+                        }
                         let on = play == Some(ts);
                         if ui
                             .small_button(if on { "⏹" } else { "▶" })

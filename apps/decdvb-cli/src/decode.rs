@@ -193,7 +193,16 @@ fn report(st: &VfoStatus) {
         }
         for (ts, db) in e.levels_db.iter().enumerate().skip(1) {
             if *db > -60.0 {
-                println!("  TS {ts:2}: {db:6.1} dBFS");
+                use decdvb_modem::e1::Coding;
+                let note = match e.coding.get(ts).copied().unwrap_or_default() {
+                    Coding::SubRate(m) => format!(
+                        " · not G.711: only bits {} change (sub-rate channels or compressed voice)",
+                        Coding::bits_text(m)
+                    ),
+                    Coding::Steady => " · steady (idle pattern or tone)".into(),
+                    _ => String::new(),
+                };
+                println!("  TS {ts:2}: {db:6.1} dBFS{note}");
             }
         }
     }

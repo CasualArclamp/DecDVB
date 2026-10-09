@@ -717,9 +717,8 @@ Q-Flex.
   V.35 descrambler (taps 3, 20) the data fold at 2944 bits into a 24-bit
   header `000001010111101000111000` and four 10-bit overheads
   (`0111111111` ×3, the last with a varying bit) between five 576-bit blocks;
-  the data are byte-aligned G.711 A-law, 360 bytes (45 ms) a frame. The
-  audio: open-squelch hiss and a stretch of steady 100 Hz hum (pitch
-  r = 0.8 in 61/63 blocks) — coherent sound, so the layout is right.
+  the data are 360 bytes (45 ms) of the timeslot a frame. (First read as
+  open-squelch hiss and hum; wrong — see the next section.)
   `decdvb-modem::dandi` deframes it; the payload search tries it; the FEC
   thread works out the timeslots from the symbol rate (n × 64k × 46/45) and
   feeds them to the E1 voice stage; the GUI's Voice card shows "ch 1..n".
@@ -731,6 +730,29 @@ Q-Flex.
   symbols (~10 %), no header DecDVB knows — FastLink or Paradise TPC; open.
 - With several D&I++ timeslots the byte order (alternating) is assumed, not
   confirmed.
+
+## The CDM-600L's timeslot is not G.711 (2026-10-09)
+
+Rory: the Comtech voice sounds like digital noise. Right — the D&I++
+deframing is sound (header and overheads in place, frames every 2944 bits),
+but the timeslot does not hold G.711:
+
+- Each octet's bits 1 and 4–8 (G.704 numbering, bit 1 first) repeat a fixed
+  pattern every millisecond — bit 1 reads `01100000` over eight octets, and
+  bits 4–8 read serially are `0x60` repeated — through the whole capture.
+- Only bits 2 and 3 change: two 8 kbit/s streams (I.460-style sub-rate).
+  During quiet stretches each repeats an identical 80-bit (10 ms) pattern —
+  what a speech codec makes of digital silence; otherwise they look random.
+  The bit-2 stream also carries a framing bit every 5th bit (0, with a 1
+  every 160 bits = 20 ms); the bit-3 stream has no fixed bits at all.
+- Not G.729 in its ITU bit order: the pitch-parity bit (P0 over P1's six
+  MSBs) fits at no offset, nor does any 6-bit parity elsewhere in the frame.
+  The codec, and the equipment feeding the E1, are unknown.
+- So the A-law levels (−9 dBFS, "loud") and the noise heard were the
+  idle-pattern bits. The E1 stage now judges each timeslot by which bits
+  change (compared with the same bit a millisecond earlier): sign bit
+  moving → G.711; nothing moving → steady (idle or a tone); sign bit frozen
+  while others move → **not G.711, bits …** (Voice card, `decdvb decode`).
 
 ## Q-Flex FastLink, blind (2026-10-09)
 
@@ -761,3 +783,11 @@ keeps every symbol, 18× real time).
   2880; bit degrees vary with position mod 16. Next: the interleaver, the
   data positions and the data scrambler — or a capture with the Q-Flex
   sending a test pattern, which would give them directly.
+
+## FFT size without a restart (2026-10-09)
+
+The waterfall's FFT size used to need **⟳ Apply** on a file and a restart
+of the radio. It is now an engine command (`Engine::set_fft_size`, like DC
+removal): the front-end thread swaps its spectrum and block length between
+blocks, drops rows of the old width and starts the smoothed spectrum again;
+the source, the HackRF and the VFOs carry on untouched.

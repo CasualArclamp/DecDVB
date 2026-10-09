@@ -122,8 +122,8 @@ enum Command {
         /// Write the decoder's outputs (PCAP, TS, data, E1 audio) here.
         #[arg(long)]
         out: Option<PathBuf>,
-        /// As fast as possible rather than in real time (may drop blocks
-        /// if a decoder cannot keep up).
+        /// As fast as possible rather than in real time (nothing is
+        /// dropped: the file waits for slow decoders).
         #[arg(long)]
         fast: bool,
         /// Record this E1 timeslot (or D&I++ channel) to a .wav in --out.

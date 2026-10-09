@@ -354,6 +354,9 @@ pub struct E1View {
     /// Level of each timeslot over the last half second, dBFS (A-law
     /// decoded; idle channels sit near −70, data near −5).
     pub levels_db: Vec<f32>,
+    /// What each timeslot carries, judged from which bits change: G.711, or
+    /// something that only sounds like noise played as A-law.
+    pub coding: Vec<decdvb_modem::e1::Coding>,
     /// The timeslot playing, and its player.
     pub playing: Option<u8>,
     pub audio: Option<AudioHandle>,
@@ -373,6 +376,7 @@ struct E1Stage {
     n: u32,
     chunks: Vec<[f64; decdvb_modem::e1::TIMESLOTS]>,
     levels_db: Vec<f32>,
+    activity: decdvb_modem::e1::BitActivity,
     play_want: Option<u8>,
     player: Option<AudioPlayer>,
     play_buf: Vec<u8>,
@@ -421,6 +425,7 @@ impl E1Stage {
             n: 0,
             chunks: Vec::new(),
             levels_db: Vec::new(),
+            activity: decdvb_modem::e1::BitActivity::new(),
             play_want: None,
             player: None,
             play_buf: Vec::new(),
@@ -498,6 +503,7 @@ impl E1Stage {
     fn frames(&mut self, frames: &[[u8; decdvb_modem::e1::TIMESLOTS]]) {
         use decdvb_ip::mcast::rtp_packet;
         for f in frames {
+            self.activity.push(f);
             for (a, &b) in self.acc.iter_mut().zip(f) {
                 let v = decdvb_modem::e1::alaw(b) as f64;
                 *a += v * v;
@@ -569,6 +575,7 @@ impl E1Stage {
             channels: self.dandi,
             stats,
             levels_db: self.levels_db.clone(),
+            coding: self.activity.coding().to_vec(),
             playing: self.play_want.filter(|_| self.player.is_some()),
             audio: self.player.as_ref().map(|p| p.handle()),
             recording: self.record_want.filter(|_| self.recorder.is_some()),

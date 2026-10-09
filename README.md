@@ -198,7 +198,10 @@ layout is not published and was worked out from a CDM-600L carrier: a
 overhead). Behind the TPC 2964 decoder the payload search finds either,
 under the V.35 descrambler or any other it tries, and the **Voice** card
 lists the channels with their levels: **▶** listens (the app's player and
-volume), **●** records a `.wav`. Offline:
+volume), **●** records a `.wav`. A timeslot whose sign bit never changes is
+not G.711 audio — sub-rate channels or compressed voice, which played as
+A-law is digital noise — and is marked **not G.711** with the bits that do
+change. Offline:
 
 ```bash
 decdvb decode capture_148148Sps.cf32 --decoder tpc --out dir --e1-record 1

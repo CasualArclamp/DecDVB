@@ -103,7 +103,7 @@ struct App {
     format: SampleFormat,
     rf_center_mhz: f64,
     opts: EngineOptions,
-    applied: Option<(f64, SampleFormat, usize, bool, bool)>,
+    applied: Option<(f64, SampleFormat, bool, bool)>,
     history: History,
     ring: RingImage,
     last_seq: u64,
@@ -285,11 +285,12 @@ impl App {
         }
     }
 
-    fn source_key(&self) -> (f64, SampleFormat, usize, bool, bool) {
+    /// The settings that need the source restarted (the FFT size does not:
+    /// see [`Engine::set_fft_size`]).
+    fn source_key(&self) -> (f64, SampleFormat, bool, bool) {
         (
             self.sample_rate,
             self.format,
-            self.opts.fft_size,
             self.opts.realtime,
             self.opts.loop_file,
         )
@@ -603,6 +604,8 @@ impl App {
                     ui.selectable_value(&mut self.format, SampleFormat::Cs16, "cs16");
                     ui.selectable_value(&mut self.format, SampleFormat::Cf32, "cf32");
                 });
+            // The FFT size applies at once, file or radio, with no restart.
+            let fft_before = self.opts.fft_size;
             egui::ComboBox::from_id_salt("fft")
                 .width(70.0)
                 .selected_text(format!("FFT {}", self.opts.fft_size))
@@ -611,11 +614,16 @@ impl App {
                         ui.selectable_value(&mut self.opts.fft_size, n, format!("{n}"));
                     }
                 });
+            if self.opts.fft_size != fft_before
+                && let Some(e) = &self.engine
+            {
+                e.set_fft_size(self.opts.fft_size);
+            }
             ui.checkbox(&mut self.opts.loop_file, "loop");
             ui.checkbox(&mut self.opts.realtime, "real time")
                 .on_hover_text("Play files at their sample rate. Off: as fast as the CPU allows.");
 
-            // Rate, format, FFT size, loop and real time need a restart.
+            // Rate, format, loop and real time need a restart.
             if self.path.is_some()
                 && self.applied != Some(self.source_key())
                 && ui

@@ -97,6 +97,7 @@ struct Shared {
 enum Cmd {
     Pause(bool),
     DcRemoval(bool),
+    FftSize(usize),
     Stop,
 }
 
@@ -176,6 +177,15 @@ impl Engine {
         let _ = self.cmd.send(Cmd::DcRemoval(on));
     }
 
+    /// Change the waterfall's FFT size without restarting the source — a
+    /// radio stays open and the VFOs keep running. Sizes that are not a power
+    /// of two of at least 64 are ignored.
+    pub fn set_fft_size(&self, n: usize) {
+        if n.is_power_of_two() && n >= 64 {
+            let _ = self.cmd.send(Cmd::FftSize(n));
+        }
+    }
+
     /// Add a VFO; it starts at once.
     pub fn add_vfo(&mut self, settings: VfoSettings) -> VfoId {
         let id = self.next_id;
@@ -243,7 +253,10 @@ impl Drop for Engine {
 
 fn run(mut source: Box<dyn IqSource>, opts: EngineOptions, shared: Arc<Shared>, rx: Receiver<Cmd>) {
     let rate = source.sample_rate();
-    let block_len = ((rate / opts.rows_per_sec).round() as usize).max(opts.fft_size * 2);
+    // A block is one waterfall row: 1/rows_per_sec of signal, but never less
+    // than two FFTs. Both change with the FFT size, so they are `mut`.
+    let block_for = |fft: usize| ((rate / opts.rows_per_sec).round() as usize).max(fft * 2);
+    let mut block_len = block_for(opts.fft_size);
     let mut spec = Spectrum::new(opts.fft_size);
     let mut acc: Vec<Iq> = Vec::with_capacity(block_len * 2);
     let mut tmp: Vec<Iq> = Vec::new();
@@ -293,6 +306,17 @@ fn run(mut source: Box<dyn IqSource>, opts: EngineOptions, shared: Arc<Shared>, 
                     dc_removal = on;
                     dc.reset();
                 }
+                Some(Cmd::FftSize(n)) if n != spec.size() => {
+                    spec = Spectrum::new(n);
+                    block_len = block_for(n);
+                    // The smoothed spectrum starts again at the new
+                    // resolution (its length no longer matches), and rows of
+                    // the old width are dropped so the GUI never mixes them.
+                    avg_lin.clear();
+                    shared.rows.lock().unwrap().clear();
+                    shared.front.lock().unwrap().fft_size = n;
+                }
+                Some(Cmd::FftSize(_)) => {}
                 None if paused => continue,
                 None => break,
             }
@@ -494,6 +518,58 @@ mod tests {
         }
         let rs = ident.symbol_rate.unwrap();
         assert!((rs - 500e3).abs() / 500e3 < 0.01, "Rs {rs}");
+
+        drop(eng);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fft_size_changes_without_a_restart() {
+        // A tone at +250 kHz in a 1 MS/s file, looping.
+        let path = std::env::temp_dir().join("decdvb-engine-fft-size.cf32");
+        let x: Vec<Iq> = (0..200_000)
+            .map(|k| {
+                let p = std::f64::consts::TAU * 0.25 * k as f64;
+                Iq::new(p.cos() as f32, p.sin() as f32)
+            })
+            .collect();
+        let mut w = IqFileWriter::create(&path, SampleFormat::Cf32).unwrap();
+        w.write(&x).unwrap();
+        w.finish().unwrap();
+        let src = IqFileReader::open(&path, SampleFormat::Cf32, 1e6, 1 << 16).unwrap();
+        let eng = Engine::start(
+            Box::new(src),
+            EngineOptions {
+                realtime: false,
+                ..Default::default()
+            },
+        );
+        let width = |eng: &Engine| eng.new_rows(0).last().map(|(_, r)| r.len());
+        assert_eq!(
+            wait_for(10.0, || width(&eng).filter(|&w| w == 4096)),
+            Some(4096)
+        );
+        let samples = eng.front().samples;
+
+        eng.set_fft_size(1024);
+        eng.set_fft_size(1000); // not a power of two: ignored
+        assert_eq!(
+            wait_for(10.0, || width(&eng).filter(|&w| w == 1024)),
+            Some(1024)
+        );
+        let f = eng.front();
+        assert_eq!(f.fft_size, 1024);
+        // The same engine kept counting: a restart would begin again at zero.
+        assert!(f.samples > samples);
+        // Every row still kept is of the new width.
+        assert!(eng.new_rows(0).iter().all(|(_, r)| r.len() == 1024));
+        // The tone sits at +250 kHz: bin 3/4 of the way across.
+        // `new_rows` returns an owned Vec; take the last row out of it.
+        let row = eng.new_rows(0).pop().unwrap().1;
+        let peak = (0..row.len())
+            .max_by(|&a, &b| row[a].total_cmp(&row[b]))
+            .unwrap();
+        assert!((peak as i64 - 768).abs() <= 1, "peak at bin {peak}");
 
         drop(eng);
         let _ = std::fs::remove_file(&path);

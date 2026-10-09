@@ -2,7 +2,8 @@
 //! E1 and carried in frames of 2944 bits — 64 overhead bits and 2880 data
 //! bits, so the satellite rate is 46/45 of the data rate (CDM-625 manual
 //! §11; CDM-600 likewise). The frame layout is not published; it was found
-//! on a CDM-600L carrier (one timeslot of G.711 voice, V.35-scrambled):
+//! on a CDM-600L carrier (one timeslot, V.35-scrambled — a timeslot that
+//! turned out to hold sub-rate channels, not G.711; see `e1::Coding`):
 //!
 //! | bits      | what                                   |
 //! |-----------|----------------------------------------|

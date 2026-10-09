@@ -183,6 +183,127 @@ pub fn alaw_encode(x: f32) -> u8 {
     ((sign | (seg << 4) | mant) as u8) ^ 0x55
 }
 
+/// What a 64 kbit/s timeslot carries, judged from which of its bits change.
+/// Bits are numbered as G.704 and I.460 do: bit 1 is the first sent (the
+/// MSB, A-law's sign).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Coding {
+    /// Not measured yet.
+    #[default]
+    Unknown,
+    /// Audio: the sign bit comes and goes, as any zero-mean signal's does.
+    G711,
+    /// Every bit repeats each millisecond: an idle pattern, digital silence
+    /// or a steady tone.
+    Steady,
+    /// The sign bit never changes while other bits do: not G.711 but
+    /// sub-rate channels (I.460) or compressed voice in the bits marked —
+    /// mask bit 7 (`0x80`) is bit 1, bit 0 (`0x01`) is bit 8. As A-law it
+    /// plays as digital noise.
+    SubRate(u8),
+}
+
+impl Coding {
+    /// The bits marked in a [`Coding::SubRate`] mask as "2–3", "1, 4–8".
+    pub fn bits_text(mask: u8) -> String {
+        let on = |b: usize| mask & (0x80 >> b) != 0;
+        let mut out = Vec::new();
+        let mut b = 0;
+        while b < 8 {
+            if on(b) {
+                let start = b;
+                while b + 1 < 8 && on(b + 1) {
+                    b += 1;
+                }
+                out.push(if start == b {
+                    format!("{}", start + 1)
+                } else {
+                    format!("{}–{}", start + 1, b + 1)
+                });
+            }
+            b += 1;
+        }
+        out.join(", ")
+    }
+}
+
+/// Frames a judgement needs (half a second).
+const ACTIVITY_FRAMES: u32 = 4000;
+/// A bit is frozen when it differs from itself a millisecond (eight frames)
+/// earlier in fewer than this share of frames, and active above `ACTIVE`.
+const FROZEN: f64 = 0.02;
+const ACTIVE: f64 = 0.05;
+
+/// Which bits of each timeslot change, judged every half second. A bit is
+/// compared with itself eight frames back so that idle patterns repeating
+/// each millisecond count as unchanging.
+pub struct BitActivity {
+    past: [[u8; TIMESLOTS]; 8],
+    at: usize,
+    filled: usize,
+    changes: [[u32; 8]; TIMESLOTS],
+    n: u32,
+    coding: [Coding; TIMESLOTS],
+}
+
+impl Default for BitActivity {
+    fn default() -> Self {
+        BitActivity {
+            past: [[0; TIMESLOTS]; 8],
+            at: 0,
+            filled: 0,
+            changes: [[0; 8]; TIMESLOTS],
+            n: 0,
+            coding: [Coding::Unknown; TIMESLOTS],
+        }
+    }
+}
+
+impl BitActivity {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, frame: &[u8; TIMESLOTS]) {
+        if self.filled == 8 {
+            for ((c, &now), &then) in self.changes.iter_mut().zip(frame).zip(&self.past[self.at]) {
+                let d = now ^ then;
+                for (b, cb) in c.iter_mut().enumerate() {
+                    *cb += u32::from(d & (0x80 >> b) != 0);
+                }
+            }
+            self.n += 1;
+        } else {
+            self.filled += 1;
+        }
+        self.past[self.at] = *frame;
+        self.at = (self.at + 1) % 8;
+        if self.n >= ACTIVITY_FRAMES {
+            let n = f64::from(self.n);
+            for (k, c) in self.changes.iter().enumerate() {
+                let share = c.map(|x| f64::from(x) / n);
+                let active: u8 = (0..8)
+                    .filter(|&b| share[b] > ACTIVE)
+                    .fold(0, |m, b| m | (0x80 >> b));
+                self.coding[k] = if share.iter().all(|&s| s < FROZEN) {
+                    Coding::Steady
+                } else if share[0] < FROZEN && active != 0 {
+                    Coding::SubRate(active)
+                } else {
+                    Coding::G711
+                };
+            }
+            self.changes = [[0; 8]; TIMESLOTS];
+            self.n = 0;
+        }
+    }
+
+    /// The latest judgement for each timeslot (index 0 is TS0).
+    pub fn coding(&self) -> &[Coding; TIMESLOTS] {
+        &self.coding
+    }
+}
+
 /// An E1 transmitter's framing (for tests and test signals): 30 or 31
 /// channels' bytes per frame in, 256 bits out, FAS/NFAS in timeslot 0.
 #[derive(Default)]
@@ -280,5 +401,33 @@ mod tests {
         rx.push(&bits, &mut out);
         assert!(!rx.stats.locked);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn tells_g711_from_sub_rate_channels() {
+        let mut r = rng(5);
+        let mut act = BitActivity::new();
+        // The 8-octet idle pattern seen on a live CDM-600L timeslot: bits 1
+        // and 4–8 repeat each millisecond.
+        const IDLE: [u8; 8] = [0x0c, 0x81, 0x90, 0x06, 0x00, 0x18, 0x03, 0x00];
+        // A-law digital milliwatt (G.711 Table 5): a steady 1 kHz tone.
+        const DMW: [u8; 8] = [0x34, 0x21, 0x21, 0x34, 0xB4, 0xA1, 0xA1, 0xB4];
+        for k in 0..2 * ACTIVITY_FRAMES as usize {
+            let mut f = [0xD5u8; TIMESLOTS]; // silence everywhere else
+            // TS1: two random bits (2 and 3) in the idle pattern.
+            f[1] = IDLE[k % 8] | (r() as u8 & 0x60);
+            // TS2: noise at about −20 dBFS, as A-law.
+            let x = ((r() >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 0.3;
+            f[2] = alaw_encode(x as f32);
+            f[3] = DMW[k % 8];
+            act.push(&f);
+        }
+        let c = act.coding();
+        assert_eq!(c[1], Coding::SubRate(0x60));
+        assert_eq!(Coding::bits_text(0x60), "2–3");
+        assert_eq!(c[2], Coding::G711);
+        assert_eq!(c[3], Coding::Steady);
+        assert_eq!(c[4], Coding::Steady);
+        assert_eq!(Coding::bits_text(0b1001_1111), "1, 4–8");
     }
 }
