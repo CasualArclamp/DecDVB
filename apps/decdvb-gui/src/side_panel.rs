@@ -1027,6 +1027,21 @@ fn payload_rows(ui: &mut Ui, f: Option<&FecStats>) {
             }
         }
         ui.end_row();
+        if let Some(e) = &p.paradise {
+            ui.label("Framing");
+            ui.label(format!(
+                "{} · {} groups · {} FAW errors · ESC busy {:.1} %",
+                if e.locked { "aligned" } else { "searching" },
+                e.groups,
+                e.faw_errors,
+                100.0 * e.esc_busy as f64 / e.groups.max(1) as f64
+            ))
+            .on_hover_text(
+                "Paradise closed network + ESC: an overhead octet after every 20 data \
+                 octets; FAW 98h every 672 bits; the ESC bits ride in the overhead.",
+            );
+            ui.end_row();
+        }
         if p.hdlc_good + p.hdlc_bad > 0 {
             ui.label("HDLC");
             ui.label(format!("{} frames · {} bad FCS", p.hdlc_good, p.hdlc_bad));

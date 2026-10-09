@@ -188,6 +188,16 @@ fn report(st: &VfoStatus) {
             p.hdlc_bad,
             p.ts_packets
         );
+        if let Some(e) = &p.paradise {
+            println!(
+                "  paradise framing: {}, {} groups, {} FAW errors, {} losses, ESC busy {:.1} %",
+                if e.locked { "aligned" } else { "searching" },
+                e.groups,
+                e.faw_errors,
+                e.losses,
+                100.0 * e.esc_busy as f64 / e.groups.max(1) as f64
+            );
+        }
     }
     if let Some(e) = &f.e1 {
         println!(

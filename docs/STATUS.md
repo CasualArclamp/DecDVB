@@ -818,6 +818,27 @@ Blind, from Rory's 6.9-minute Q-Flex capture (FastLink QPSK 0.710):
   128.5 kbit/s data rate is 257/256 of 128 kbit/s, so an overhead bit every
   257 is likely); no HDLC.
 
+## Inside FastLink: Paradise closed network + ESC (2026-10-09)
+
+The FastLink data rate, 134 925 bit/s, is exactly 21/20 of Rory's
+128.5 kbit/s: an overhead octet after every 20 data octets.
+
+- Folded at 672 bits (four overhead octets) the overhead shows: a frame
+  alignment word `1x011000` (98h, one bit ESC), an ESC octet, a control
+  octet `0xm1xxxx` (`m` a 64-group multiframe pattern, `x` ESC) and another
+  ESC octet. 22 ESC bits a group, 0 when idle, in bursts of 38–59 groups
+  (short packets; ~4.4 kbit/s against the menu's 4800 baud). No HDLC in
+  them under any common descrambler or bit order — unread for now.
+- Aligned 99.97 % of 7 minutes (the misses all where the LDPC slipped), and
+  found unaided on Rory's second Q-Flex capture: `decdvb-modem::paradise`
+  is a payload-search format ("Paradise closed network + ESC framing").
+- The 128.5 kbit/s inside: 2 ms frames of 257 bits — one bit of a
+  ~500 bit/s side channel (random-looking), then sixteen 16-bit words at
+  8 kHz: two 64 kbit/s timeslots. In silence the words repeat every 4 ms
+  with a few bits moving; in traffic they fill up. Which bits are which
+  timeslot's octet is not settled: neither a byte nor a bit split gives the
+  CDM-600L timeslot's 1 ms idle cycle (this mux idles on a 4 ms cycle).
+
 ## FFT size without a restart (2026-10-09)
 
 The waterfall's FFT size used to need **⟳ Apply** on a file and a restart

@@ -17,6 +17,7 @@
 
 use crate::dandi::{DiPlusRx, DiPlusStats};
 use crate::e1::{E1Rx, TIMESLOTS};
+use crate::paradise::EscRx;
 use crate::tpc2964::additive_sequence;
 
 /// How the data might be scrambled.
@@ -348,6 +349,8 @@ pub enum Format {
     E1,
     /// Comtech Drop & Insert++.
     DiPlus,
+    /// Paradise closed network plus ESC.
+    ParadiseEsc,
 }
 
 /// The data of one frame, made useful.
@@ -360,6 +363,10 @@ pub struct PayloadOut {
     pub e1: Vec<[u8; TIMESLOTS]>,
     /// D&I++ timeslot bytes, in order.
     pub dandi: Vec<u8>,
+    /// Paradise closed network plus ESC: the data bits and the ESC bits
+    /// (0/1) with the overhead taken out.
+    pub inner: Vec<u8>,
+    pub esc: Vec<u8>,
     /// The descrambled data, MSB first, while the format is unknown or for
     /// recording.
     pub raw: Vec<u8>,
@@ -371,6 +378,8 @@ impl PayloadOut {
         self.ts.clear();
         self.e1.clear();
         self.dandi.clear();
+        self.inner.clear();
+        self.esc.clear();
         self.raw.clear();
     }
 }
@@ -386,6 +395,8 @@ pub struct PayloadStats {
     pub e1: Option<crate::e1::E1Stats>,
     /// D&I++ framing, likewise.
     pub dandi: Option<DiPlusStats>,
+    /// Paradise closed network plus ESC framing, likewise.
+    pub paradise: Option<crate::paradise::EscStats>,
     /// Frames of data looked at before deciding (or so far).
     pub probed: u64,
 }
@@ -405,6 +416,7 @@ pub struct PayloadRx {
     ts: TsAlign,
     e1: E1Rx,
     dandi: DiPlusRx,
+    paradise: EscRx,
     /// Bits not yet packed into `raw` bytes.
     raw_bits: Vec<u8>,
     pub stats: PayloadStats,
@@ -422,6 +434,7 @@ impl PayloadRx {
             ts: TsAlign::default(),
             e1: E1Rx::new(),
             dandi: DiPlusRx::new(),
+            paradise: EscRx::new(),
             raw_bits: Vec::new(),
             stats: PayloadStats::default(),
         }
@@ -448,14 +461,21 @@ impl PayloadRx {
         let held_bits: u64 = self.held.iter().map(|f| f.len() as u64).sum();
         for kind in Descrambler::all() {
             let mut d = Running::new(kind, self.frame_len);
-            let (mut hdlc, mut ts, mut e1, mut di) = (
+            let (mut hdlc, mut ts, mut e1, mut di, mut pe) = (
                 Hdlc::default(),
                 TsAlign::default(),
                 E1Rx::new(),
                 DiPlusRx::new(),
+                EscRx::new(),
             );
-            let (mut frames, mut pkts, mut e1f, mut dib) =
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let (mut frames, mut pkts, mut e1f, mut dib, mut ped, mut pee) = (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            );
             for f in &self.held {
                 let mut bits = f.clone();
                 d.frame(&mut bits);
@@ -463,6 +483,7 @@ impl PayloadRx {
                 ts.push(&bits, &mut pkts);
                 e1.push(&bits, &mut e1f);
                 di.push(&bits, &mut dib);
+                pe.push(&bits, &mut ped, &mut pee);
             }
             let fcs = frames.first().map_or(Fcs::Crc16, |f| f.1);
             let framed = |covered: u64| (2 * covered >= held_bits).then_some(covered);
@@ -476,6 +497,10 @@ impl PayloadRx {
                 (
                     framed(di.stats.frames * crate::dandi::FRAME as u64),
                     Format::DiPlus,
+                ),
+                (
+                    framed(pe.stats.groups * crate::paradise::GROUP as u64),
+                    Format::ParadiseEsc,
                 ),
             ];
             for (score, fmt) in candidates {
@@ -493,6 +518,7 @@ impl PayloadRx {
                     (Format::Ts, _) => "MPEG-TS",
                     (Format::E1, _) => "E1 (G.704 framing)",
                     (Format::DiPlus, _) => "E1 timeslots, Comtech D&I++ framing",
+                    (Format::ParadiseEsc, _) => "Paradise closed network + ESC framing",
                     (Format::Hdlc, Fcs::Crc16) => "HDLC (FCS-16)",
                     (Format::Hdlc, Fcs::Crc32) => "HDLC (FCS-32)",
                 },
@@ -532,6 +558,10 @@ impl PayloadRx {
             Format::DiPlus => {
                 self.dandi.push(&bits, &mut out.dandi);
                 self.stats.dandi = Some(self.dandi.stats.clone());
+            }
+            Format::ParadiseEsc => {
+                self.paradise.push(&bits, &mut out.inner, &mut out.esc);
+                self.stats.paradise = Some(self.paradise.stats.clone());
             }
         }
         if raw {

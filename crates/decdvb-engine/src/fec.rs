@@ -1493,12 +1493,19 @@ fn run(
                     raw.write(&payload_out.raw);
                     // Unknown format: look for text in every reading of
                     // the bits (once known, the TS or IP stage looks).
-                    if pay.format().is_none() {
+                    // Unknown format, or framing whose contents are not
+                    // known (Paradise's): look for text in the data.
+                    let unread = if pay.format().is_none() {
+                        Some(data.as_slice())
+                    } else {
+                        (!payload_out.inner.is_empty()).then_some(payload_out.inner.as_slice())
+                    };
+                    if let Some(bits) = unread {
                         tpc_text
                             .get_or_insert_with(|| {
                                 decdvb_modem::text::TextFinder::new(vec!["data".into()])
                             })
-                            .push(0, data);
+                            .push(0, bits);
                     }
                     if !payload_out.ts.is_empty() {
                         let stage = ts.get_or_insert_with(TsStage::new);

@@ -18,6 +18,7 @@ pub mod dvbs;
 pub mod e1;
 pub mod fastlink;
 pub mod interleave;
+pub mod paradise;
 pub mod payload;
 pub mod rs;
 pub mod text;
