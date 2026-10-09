@@ -19,7 +19,7 @@ pub use carriers::{Carrier, detect_carriers};
 pub use decdvb_modem::text::{ByteTextView, TextView};
 pub use demod::{Demod, LockState, PlFrame};
 pub use estimate::{BandEstimate, estimate_band};
-pub use fec::{BbFrame, FecDecoder, FecOutput, FecStats, GseView, TsView};
+pub use fec::{BbFrame, E1View, FecDecoder, FecOutput, FecStats, GseView, TsView};
 pub use frontend::{Engine, EngineOptions, FrontStatus, SourceState};
 pub use identify::{
     ConstellationGuess, Identification, RateSource, Verdict, identify, identify_in,

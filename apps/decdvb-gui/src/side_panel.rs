@@ -597,6 +597,9 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
         && let Some(c) = &st.carrier
     {
         tpc_card(ui, c, &st);
+        if let Some(e) = st.fec.as_ref().and_then(|f| f.e1.as_ref()) {
+            e1_card(ui, e, v, &mut actions);
+        }
         if let Some(f) = &st.fec {
             if let Some(g) = &f.gse {
                 gse_card(ui, g);
@@ -673,6 +676,133 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
     }
 
     actions
+}
+
+/// An E1 in a modem's data: its alignment and timeslots, each with its
+/// level; any one can be played (G.711 A-law, through the app's player) and
+/// one recorded to a `.wav`.
+fn e1_card(ui: &mut Ui, e: &decdvb_engine::E1View, v: &UiVfo, actions: &mut Vec<Action>) {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("E1 voice (G.704 / G.711 A-law)").strong());
+        if v.settings.e1_play.is_some() {
+            volume_control(ui);
+        }
+    });
+    let st = &e.stats;
+    ui.label(
+        RichText::new(format!(
+            "{} · {} frames · {} FAS errors{}",
+            if st.locked {
+                "frame aligned"
+            } else {
+                "looking for frame alignment"
+            },
+            st.frames,
+            st.fas_errors,
+            if st.cas { " · CAS in TS16" } else { "" }
+        ))
+        .small(),
+    );
+    if let Some(err) = &e.error {
+        ui.colored_label(Color32::from_rgb(230, 110, 110), err);
+    }
+    if let Some(a) = &e.audio {
+        let s = a.status();
+        ui.label(
+            RichText::new(format!(
+                "playing TS {} · {:?} · buffer {} ms",
+                v.settings.e1_play.unwrap_or_default(),
+                s.state,
+                s.buffer_ms
+            ))
+            .small()
+            .weak(),
+        );
+    }
+    if let Some((path, bytes)) = &e.record_file {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        let txt = format!("{} ({})", name.unwrap_or_default(), format::bytes(*bytes));
+        if e.recording.is_some() {
+            ui.colored_label(Color32::from_rgb(230, 90, 90), format!("● {txt}"));
+        } else {
+            ui.label(RichText::new(format!("{txt}, stopped")).small());
+        }
+    }
+    if e.levels_db.len() < 32 {
+        ui.label(RichText::new("measuring the timeslots…").weak());
+        return;
+    }
+    let (mut play, mut rec) = (v.settings.e1_play, v.settings.e1_record);
+    egui::ScrollArea::vertical()
+        .id_salt(("e1_slots", v.id))
+        .max_height(320.0)
+        .show(ui, |ui| {
+            egui::Grid::new(("e1_grid", v.id))
+                .num_columns(5)
+                .striped(true)
+                .show(ui, |ui| {
+                    for ts in 1..32u8 {
+                        let db = e.levels_db[ts as usize];
+                        ui.label(RichText::new(format!("TS {ts:2}")).monospace());
+                        level_bar(ui, db);
+                        let what = if ts == 16 && st.cas {
+                            "signalling"
+                        } else if db < -60.0 {
+                            "idle"
+                        } else if db > -12.0 {
+                            "data?"
+                        } else {
+                            "active"
+                        };
+                        ui.label(RichText::new(format!("{db:5.0} dB {what}")).small());
+                        let on = play == Some(ts);
+                        if ui
+                            .small_button(if on { "⏹" } else { "▶" })
+                            .on_hover_text(if on { "Stop" } else { "Listen" })
+                            .clicked()
+                        {
+                            play = if on { None } else { Some(ts) };
+                        }
+                        let recording = rec == Some(ts);
+                        if ui
+                            .small_button(if recording { "⏹" } else { "●" })
+                            .on_hover_text(if recording {
+                                "Stop recording"
+                            } else {
+                                "Record this timeslot to a .wav"
+                            })
+                            .clicked()
+                        {
+                            rec = if recording { None } else { Some(ts) };
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+    if play != v.settings.e1_play || rec != v.settings.e1_record {
+        let mut s = v.settings.clone();
+        s.e1_play = play;
+        s.e1_record = rec;
+        actions.push(Action::Update(v.id, s));
+    }
+}
+
+/// One thin level bar on a 70 dB scale.
+fn level_bar(ui: &mut Ui, db: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(80.0, 8.0), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::same(2), Color32::from_gray(40));
+    let frac = ((db + 70.0) / 70.0).clamp(0.0, 1.0);
+    let bar = egui::Rect::from_min_size(rect.min, vec2(rect.width() * frac, rect.height()));
+    let col = if db > -12.0 {
+        Color32::from_rgb(230, 150, 90)
+    } else if db > -60.0 {
+        Color32::from_rgb(110, 220, 110)
+    } else {
+        Color32::from_gray(90)
+    };
+    p.rect_filled(bar, CornerRadius::same(2), col);
 }
 
 /// Text in a decoder's output: the transport stream's payloads for the TS

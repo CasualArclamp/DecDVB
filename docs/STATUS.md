@@ -688,3 +688,17 @@ it (live text in the generic decoder, the proprietary-waveform cues).
   Identify.
 - Tests: the DVB-S VFO finds "DecDVB test signal" recurring in its TS; the
   MPE carrier shows the SAP announcement's SDP lines in its IP text.
+
+## E1 voice in a modem's data (2026-10-09)
+
+Rory carries an E1 with G.711 airband voice over a Comtech CDM-600 link.
+`decdvb-modem::e1`: G.704 frame alignment at any bit offset (FAS x0011011
+every 512 bits with the NFAS bit between, 8 in a row to align, 3 bad to lose
+— G.706), timeslots out, CAS seen in TS16, G.711 A-law both ways. The payload
+search tries E1 beside HDLC and TS under each descrambler. The FEC thread's
+E1 stage meters every timeslot (dBFS over half a second: idle ≈ −70, voice
+in between, data ≈ −5) and plays one / records one to `.wav` by handing
+20 ms RTP PCMA packets to the multicast-audio player and recorder. GUI: an
+E1 card with a level bar, ▶ and ● per timeslot. Test: a scrambled E1 in TPC
+2964 with a tone in TS 7 — found, metered, played, recorded. Drop-and-insert
+(IBS-framed n×64k) is not handled yet: waiting on what the CDM-600 sends.

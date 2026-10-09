@@ -147,6 +147,9 @@ pub struct VfoSettings {
     pub audio_external: bool,
     /// DVB-S2 → IP or TS: record this multicast audio stream to a file.
     pub audio_record: Option<std::net::SocketAddr>,
+    /// A modem carrying an E1: the timeslot to play, and one to record.
+    pub e1_play: Option<u8>,
+    pub e1_record: Option<u8>,
     /// Where the IQ recorder and the symbol writer write.
     pub record_dir: PathBuf,
 }
@@ -179,6 +182,8 @@ impl VfoSettings {
             audio_play: None,
             audio_external: false,
             audio_record: None,
+            e1_play: None,
+            e1_record: None,
             record_dir: std::env::temp_dir(),
         }
     }
@@ -1162,6 +1167,8 @@ fn fec_output(s: &VfoSettings, ddc: &Ddc) -> FecOutput {
         audio_play: s.audio_play,
         audio_external: s.audio_external,
         audio_record: s.audio_record,
+        e1_play: s.e1_play,
+        e1_record: s.e1_record,
     }
 }
 
@@ -2009,6 +2016,84 @@ mod tests {
                 .iter()
                 .any(|a| a.group == "239.1.2.3".parse::<std::net::IpAddr>().unwrap())
         );
+    }
+
+    #[test]
+    fn tpc2964_vfo_plays_and_records_a_timeslot_of_an_e1() {
+        use decdvb_mod::Shaper;
+        use decdvb_modem::e1::{E1Tx, TIMESLOTS, alaw_encode};
+        use decdvb_modem::payload::SelfSyncScrambler;
+        use decdvb_modem::tpc2964::{DATA, Structure, TpcTx, modulate};
+        // 0.6 s of E1: a 1 kHz tone in timeslot 7, the rest idle, V.35-style
+        // scrambled, in TPC 2964 frames on QPSK at 125 kBd.
+        let mut e1 = E1Tx::new();
+        let mut data = Vec::new();
+        for n in 0..4800 {
+            let mut ts = [0xD5u8; TIMESLOTS];
+            let t = n as f32 / 8000.0;
+            ts[7] = alaw_encode(0.4 * (std::f32::consts::TAU * 1000.0 * t).sin());
+            e1.frame(&ts, &mut data);
+        }
+        SelfSyncScrambler::new(&[3, 20]).scramble(&mut data);
+        let tx = TpcTx::new(Structure::TEST);
+        let mut bits = Vec::new();
+        for d in data.as_chunks::<DATA>().0 {
+            tx.frame(d, &mut bits);
+        }
+        let mut syms = Vec::new();
+        modulate(&bits[500..], true, &mut syms);
+        let mut sh = Shaper::new(4, 0.35, 16);
+        let mut x = Vec::new();
+        sh.process(&syms, &mut x);
+        let w = std::f64::consts::TAU * 40_000.0 / 500_000.0;
+        for (n, v) in x.iter_mut().enumerate() {
+            let ph = w * n as f64;
+            *v *= Iq::new(ph.cos() as f32, ph.sin() as f32);
+        }
+        let dir = std::env::temp_dir().join(format!("decdvb-e1-{}", std::process::id()));
+        let mut settings = VfoSettings::new("E1", 40_000.0, 190_000.0, DecoderKind::Tpc2964);
+        settings.record_dir = dir.clone();
+        settings.e1_play = Some(7);
+        settings.e1_record = Some(7);
+        let status = Arc::new(Mutex::new(VfoStatus::default()));
+        let mut wk = Worker::new(
+            500_000.0,
+            settings,
+            status.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        feed(&mut wk, &x, 65_536);
+        let t0 = Instant::now();
+        let e = loop {
+            wk.publish(0);
+            let f = status.lock().unwrap().fec.clone();
+            if let Some(e) = f.as_ref().and_then(|f| f.e1.clone()).filter(|e| {
+                e.levels_db.len() == 32 && e.record_file.as_ref().is_some_and(|r| r.1 > 8000)
+            }) {
+                break e;
+            }
+            if t0.elapsed().as_secs() >= 30 {
+                let st = status.lock().unwrap();
+                panic!(
+                    "no E1: {} / {:?}",
+                    st.message,
+                    st.fec.as_ref().map(|f| (&f.payload, &f.e1))
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        drop(wk);
+        let _ = std::fs::remove_dir_all(&dir);
+        // The synthetic carrier's one carrier slip costs a TPC frame, and
+        // the E1 its alignment once.
+        assert!(e.stats.locked && e.stats.losses <= 1, "{:?}", e.stats);
+        assert!(e.levels_db[7] > -15.0, "TS 7 at {} dB", e.levels_db[7]);
+        assert!(e.levels_db[1] < -60.0, "TS 1 at {} dB", e.levels_db[1]);
+        assert_eq!(e.playing, Some(7));
+        let a = e.audio.expect("no player").status();
+        assert!(a.decoded > 10, "{a:?}");
+        let (path, _) = e.record_file.unwrap();
+        assert!(path.to_string_lossy().ends_with(".wav"), "{path:?}");
     }
 
     #[test]

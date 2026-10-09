@@ -3,14 +3,16 @@
 //! MPEG transport stream, often scrambled for energy dispersal. Neither the
 //! format nor the scrambler is signalled, so both are found by trying each
 //! candidate on a stretch of data and keeping the one under which frames
-//! check out: HDLC frames whose FCS is right, or TS packets whose sync
-//! bytes recur every 188 bytes.
+//! check out: HDLC frames whose FCS is right, TS packets whose sync bytes
+//! recur every 188 bytes, or E1 frames whose alignment signal recurs every
+//! 512 bits (an E1 carried transparently, see [`crate::e1`]).
 //!
 //! The scramblers tried are the RCV-20x's polynomial 1 + x² + x³ + x⁹ + x¹²
 //! (as a self-synchronising descrambler, either way round, and additive per
 //! frame), and the self-synchronising ones of ITU-T V.35 (taps 3, 20,
 //! without its 32-bit run counter) and V.29/V.27 (taps 18, 23).
 
+use crate::e1::{E1Rx, TIMESLOTS};
 use crate::tpc2964::additive_sequence;
 
 /// How the data might be scrambled.
@@ -339,6 +341,7 @@ impl TsAlign {
 pub enum Format {
     Hdlc,
     Ts,
+    E1,
 }
 
 /// The data of one frame, made useful.
@@ -347,6 +350,8 @@ pub struct PayloadOut {
     /// HDLC frames that checked, without their FCS.
     pub frames: Vec<(Vec<u8>, Fcs)>,
     pub ts: Vec<[u8; 188]>,
+    /// E1 frames: 32 timeslot bytes each.
+    pub e1: Vec<[u8; TIMESLOTS]>,
     /// The descrambled data, MSB first, while the format is unknown or for
     /// recording.
     pub raw: Vec<u8>,
@@ -356,6 +361,7 @@ impl PayloadOut {
     pub fn clear(&mut self) {
         self.frames.clear();
         self.ts.clear();
+        self.e1.clear();
         self.raw.clear();
     }
 }
@@ -367,6 +373,8 @@ pub struct PayloadStats {
     pub hdlc_good: u64,
     pub hdlc_bad: u64,
     pub ts_packets: u64,
+    /// E1 framing, when that is what the data are.
+    pub e1: Option<crate::e1::E1Stats>,
     /// Frames of data looked at before deciding (or so far).
     pub probed: u64,
 }
@@ -384,6 +392,7 @@ pub struct PayloadRx {
     chosen: Option<(Running, Format)>,
     hdlc: Hdlc,
     ts: TsAlign,
+    e1: E1Rx,
     /// Bits not yet packed into `raw` bytes.
     raw_bits: Vec<u8>,
     pub stats: PayloadStats,
@@ -399,6 +408,7 @@ impl PayloadRx {
             chosen: None,
             hdlc: Hdlc::default(),
             ts: TsAlign::default(),
+            e1: E1Rx::new(),
             raw_bits: Vec::new(),
             stats: PayloadStats::default(),
         }
@@ -422,16 +432,24 @@ impl PayloadRx {
         let mut best: Option<(u64, Descrambler, Format, Fcs)> = None;
         for kind in Descrambler::all() {
             let mut d = Running::new(kind, self.frame_len);
-            let (mut hdlc, mut ts) = (Hdlc::default(), TsAlign::default());
-            let (mut frames, mut pkts) = (Vec::new(), Vec::new());
+            let (mut hdlc, mut ts, mut e1) = (Hdlc::default(), TsAlign::default(), E1Rx::new());
+            let (mut frames, mut pkts, mut e1f) = (Vec::new(), Vec::new(), Vec::new());
             for f in &self.held {
                 let mut bits = f.clone();
                 d.frame(&mut bits);
                 hdlc.push(&bits, &mut frames);
                 ts.push(&bits, &mut pkts);
+                e1.push(&bits, &mut e1f);
             }
             let fcs = frames.first().map_or(Fcs::Crc16, |f| f.1);
-            for (n, fmt) in [(hdlc.good, Format::Hdlc), (ts.packets, Format::Ts)] {
+            // E1 frames are counted in TS-packet-sized lots, so the formats
+            // weigh alike (a TS packet is 1504 bits, an E1 frame 256).
+            let e1_units = e1.stats.frames * 256 / 1504;
+            for (n, fmt) in [
+                (hdlc.good, Format::Hdlc),
+                (ts.packets, Format::Ts),
+                (e1_units, Format::E1),
+            ] {
                 if n >= PROBE_UNITS && best.is_none_or(|b| n > b.0) {
                     best = Some((n, kind, fmt, fcs));
                 }
@@ -442,6 +460,7 @@ impl PayloadRx {
                 "{}, {}",
                 match (fmt, fcs) {
                     (Format::Ts, _) => "MPEG-TS",
+                    (Format::E1, _) => "E1 (G.704 framing)",
                     (Format::Hdlc, Fcs::Crc16) => "HDLC (FCS-16)",
                     (Format::Hdlc, Fcs::Crc32) => "HDLC (FCS-32)",
                 },
@@ -473,6 +492,10 @@ impl PayloadRx {
             Format::Ts => {
                 self.ts.push(&bits, &mut out.ts);
                 self.stats.ts_packets = self.ts.packets;
+            }
+            Format::E1 => {
+                self.e1.push(&bits, &mut out.e1);
+                self.stats.e1 = Some(self.e1.stats.clone());
             }
         }
         if raw {
@@ -604,6 +627,37 @@ mod tests {
                 assert_eq!(w[1][1], w[0][1] + 1);
             }
         }
+    }
+
+    #[test]
+    fn finds_a_scrambled_e1() {
+        use crate::e1::{E1Tx, alaw_encode};
+        const L: usize = 2223;
+        let mut tx = E1Tx::new();
+        let mut bits = vec![0, 1, 1];
+        let mut next = rng(12);
+        for n in 0..400 {
+            let mut ts = [0u8; TIMESLOTS];
+            for v in ts.iter_mut().skip(1) {
+                *v = 0xD5; // idle channels
+            }
+            ts[7] = alaw_encode(0.3 * (n as f32 * 0.4).sin());
+            ts[20] = next() as u8;
+            tx.frame(&ts, &mut bits);
+        }
+        let kind = Descrambler::SelfSync(&[3, 20]);
+        let sent = scramble(kind, L, &bits);
+        let mut rx = PayloadRx::new(L);
+        let mut out = PayloadOut::default();
+        let mut frames = Vec::new();
+        for f in sent.as_chunks::<L>().0 {
+            rx.push(f, &mut out);
+            frames.append(&mut out.e1);
+        }
+        assert_eq!(rx.format(), Some(Format::E1), "{:?}", rx.stats);
+        assert!(rx.stats.found.as_ref().unwrap().contains("taps 3, 20"));
+        assert!(frames.len() > 300, "{}", frames.len());
+        assert!(frames.iter().all(|f| f[1] == 0xD5));
     }
 
     #[test]

@@ -338,6 +338,191 @@ pub struct FecStats {
     /// Text in a modem's data while what they carry is not known (TPC
     /// 2964), every reading of the bits at once.
     pub text: Option<decdvb_modem::text::TextView>,
+    /// An E1 in a modem's data: its framing and voice channels.
+    pub e1: Option<E1View>,
+}
+
+/// An E1's state, for display.
+#[derive(Debug, Clone, Default)]
+pub struct E1View {
+    pub stats: decdvb_modem::e1::E1Stats,
+    /// Level of each timeslot over the last half second, dBFS (A-law
+    /// decoded; idle channels sit near −70, data near −5).
+    pub levels_db: Vec<f32>,
+    /// The timeslot playing, and its player.
+    pub playing: Option<u8>,
+    pub audio: Option<AudioHandle>,
+    /// The timeslot recording, and the file (current or last) with bytes.
+    pub recording: Option<u8>,
+    pub record_file: Option<(PathBuf, u64)>,
+    pub error: Option<String>,
+}
+
+/// An E1's voice channels: their levels, and one played and one recorded
+/// through the multicast-audio player and recorder as RTP A-law (PCMA,
+/// 8 kHz) — G.711 is what both already take.
+struct E1Stage {
+    acc: [f64; decdvb_modem::e1::TIMESLOTS],
+    n: u32,
+    levels_db: Vec<f32>,
+    play_want: Option<u8>,
+    player: Option<AudioPlayer>,
+    play_buf: Vec<u8>,
+    play_rtp: (u16, u32),
+    record_want: Option<u8>,
+    recorder: Option<AudioRecorder>,
+    record_buf: Vec<u8>,
+    record_rtp: (u16, u32),
+    record_last: Option<(PathBuf, u64)>,
+    error: Option<String>,
+}
+
+/// Frames in a level reading: half a second.
+const E1_LEVEL_FRAMES: u32 = 4000;
+/// A-law bytes per RTP packet: 20 ms.
+const E1_CHUNK: usize = 160;
+
+/// A timeslot as an audio stream the player and recorder understand.
+fn e1_stream(ts: u8) -> AudioStream {
+    AudioStream {
+        group: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        port: ts as u16,
+        src: None,
+        packets: 0,
+        rate_bps: 64e3,
+        rtp: true,
+        pt: Some(8), // PCMA (RFC 3551)
+        codec: decdvb_ip::Codec::Pcm,
+        sdp: None,
+    }
+}
+
+impl E1Stage {
+    fn new() -> Self {
+        E1Stage {
+            acc: [0.0; decdvb_modem::e1::TIMESLOTS],
+            n: 0,
+            levels_db: Vec::new(),
+            play_want: None,
+            player: None,
+            play_buf: Vec::new(),
+            play_rtp: (0, 0),
+            record_want: None,
+            recorder: None,
+            record_buf: Vec::new(),
+            record_rtp: (0, 0),
+            record_last: None,
+            error: None,
+        }
+    }
+
+    fn follow(&mut self, o: &FecOutput) {
+        if o.e1_play != self.play_want {
+            self.play_want = o.e1_play;
+            self.player = None;
+            self.play_buf.clear();
+            if let Some(t) = o.e1_play {
+                match AudioPlayer::start(&e1_stream(t), AUDIO_OUTPUT) {
+                    Ok(p) => self.player = Some(p),
+                    Err(e) => self.error = Some(e),
+                }
+            }
+        }
+        if o.e1_record != self.record_want {
+            self.record_want = o.e1_record;
+            if let Some(r) = self.recorder.take() {
+                self.record_last = r.path().map(|p| (p.to_path_buf(), r.bytes));
+            }
+            self.record_buf.clear();
+            if let Some(t) = o.e1_record {
+                let stamp = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let stem = format!(
+                    "decdvb-{}-{:+.0}Hz-e1-ts{t:02}-{stamp}",
+                    o.name.replace(' ', "_"),
+                    o.carrier_hz
+                );
+                let _ = std::fs::create_dir_all(&o.dir);
+                match AudioRecorder::start(&e1_stream(t), &o.dir, &stem) {
+                    Ok(r) => self.recorder = Some(r),
+                    Err(e) => self.error = Some(e),
+                }
+            }
+        }
+    }
+
+    fn frames(&mut self, frames: &[[u8; decdvb_modem::e1::TIMESLOTS]]) {
+        use decdvb_ip::mcast::rtp_packet;
+        for f in frames {
+            for (a, &b) in self.acc.iter_mut().zip(f) {
+                let v = decdvb_modem::e1::alaw(b) as f64;
+                *a += v * v;
+            }
+            self.n += 1;
+            if self.n >= E1_LEVEL_FRAMES {
+                self.levels_db = self
+                    .acc
+                    .iter()
+                    .map(|&a| (10.0 * (a / self.n as f64).max(1e-12).log10()) as f32)
+                    .collect();
+                self.acc = [0.0; decdvb_modem::e1::TIMESLOTS];
+                self.n = 0;
+            }
+            // One RTP packet per 20 ms of the chosen timeslot.
+            if let (Some(t), Some(p)) = (self.play_want, &mut self.player) {
+                self.play_buf.push(f[t as usize]);
+                if self.play_buf.len() == E1_CHUNK {
+                    let (seq, ts) = &mut self.play_rtp;
+                    p.packet(&rtp_packet(
+                        8,
+                        *seq,
+                        *ts,
+                        0xE1E1_0000 | t as u32,
+                        &self.play_buf,
+                    ));
+                    *seq = seq.wrapping_add(1);
+                    *ts = ts.wrapping_add(E1_CHUNK as u32);
+                    self.play_buf.clear();
+                }
+            }
+            if let (Some(t), Some(r)) = (self.record_want, &mut self.recorder) {
+                self.record_buf.push(f[t as usize]);
+                if self.record_buf.len() == E1_CHUNK {
+                    let (seq, ts) = &mut self.record_rtp;
+                    r.packet(&rtp_packet(
+                        8,
+                        *seq,
+                        *ts,
+                        0xE1E1_0000 | t as u32,
+                        &self.record_buf,
+                    ));
+                    *seq = seq.wrapping_add(1);
+                    *ts = ts.wrapping_add(E1_CHUNK as u32);
+                    self.record_buf.clear();
+                }
+            }
+        }
+    }
+
+    fn view(&self, stats: decdvb_modem::e1::E1Stats) -> E1View {
+        E1View {
+            stats,
+            levels_db: self.levels_db.clone(),
+            playing: self.play_want.filter(|_| self.player.is_some()),
+            audio: self.player.as_ref().map(|p| p.handle()),
+            recording: self.record_want.filter(|_| self.recorder.is_some()),
+            record_file: match &self.recorder {
+                Some(r) => r.path().map(|p| (p.to_path_buf(), r.bytes)),
+                None => self.record_last.clone(),
+            },
+            error: self
+                .error
+                .clone()
+                .or_else(|| self.recorder.as_ref().and_then(|r| r.error.clone())),
+        }
+    }
 }
 
 /// The transport stream and its outputs, for display.
@@ -441,6 +626,9 @@ pub struct FecOutput {
     pub audio_external: bool,
     /// Record this multicast audio stream to a file in `dir`.
     pub audio_record: Option<SocketAddr>,
+    /// An E1's timeslot to play, and one to record (to a `.wav` in `dir`).
+    pub e1_play: Option<u8>,
+    pub e1_record: Option<u8>,
 }
 
 /// Runs a [`FecDecoder`] on its own thread.
@@ -1168,6 +1356,7 @@ fn run(
     let mut payload_out = decdvb_modem::payload::PayloadOut::default();
     let mut raw = RawFile::default();
     let mut tpc_text: Option<decdvb_modem::text::TextFinder> = None;
+    let mut e1: Option<E1Stage> = None;
     while let Ok(input) = rx.recv() {
         let t0 = Instant::now();
         let f = match input {
@@ -1207,6 +1396,11 @@ fn run(
                             ipst.mpe(&stage.datagrams, &stage.mpe.stats);
                         }
                     }
+                    if !payload_out.e1.is_empty() {
+                        let stage = e1.get_or_insert_with(E1Stage::new);
+                        stage.follow(&o);
+                        stage.frames(&payload_out.e1);
+                    }
                     for (frame, fcs) in &payload_out.frames {
                         if let Some((pkt, info)) = hdlc_ip(frame) {
                             let ipst = ip.get_or_insert_with(IpStage::new);
@@ -1240,6 +1434,10 @@ fn run(
                 s.tpc = Some(rx.stats.clone());
                 s.payload = Some(pay.stats.clone());
                 s.text = tpc_text.as_ref().map(|t| t.view());
+                if let Some(stage) = &mut e1 {
+                    stage.follow(&o);
+                    s.e1 = Some(stage.view(pay.stats.e1.clone().unwrap_or_default()));
+                }
                 s.raw_file = raw.path.clone().map(|p| (p, raw.bytes));
                 s.raw_active = raw.file.is_some();
                 if let Some(stage) = &mut ts {

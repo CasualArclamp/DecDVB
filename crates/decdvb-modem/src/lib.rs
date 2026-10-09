@@ -14,6 +14,7 @@
 
 pub mod conv;
 pub mod dvbs;
+pub mod e1;
 pub mod interleave;
 pub mod payload;
 pub mod rs;
