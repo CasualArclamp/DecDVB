@@ -1157,3 +1157,14 @@ normal mode locks to −42..−43 dB; low-SNR mode to −46 dB (−45: normal
 cannot, low can — test); frames decode to about −42 dB (~1 dB a bit) in
 either. Tracking shows ~0.6–1.3 dB less than ideal: the 4-per-chip grid
 (chip edges between samples) and timing dither — 8 per chip would halve it.
+
+## DVB-CID at eight samples a chip (2026-10-09)
+
+`cid::SPS` 4 → 8 (the CID thread resamples to 8 × the chip rate): a chip's
+edge now falls within 1/16 chip of a sample. Early/late stay a quarter chip
+out (±2 samples), timing steps an eighth, the timing loop's gain scaled to
+move as fast in chips; the search decimates by SPS/2 to two a chip (its
+frequency bins follow: a first try took them from fs/2 and doubled every
+acquisition frequency). Weak-signal tests now set the level as SNR a bit.
+Measured: tracking ~0.6 dB short of ideal (was 1.3–1.6); frames decode to
+−0.5 dB a bit in low-SNR mode, 0 dB in normal (was about +0.1).

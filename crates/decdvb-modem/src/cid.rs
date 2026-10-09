@@ -12,7 +12,7 @@
 //! centre and 27.5 dB or more below its spectral density. A frame lasts
 //! 976 × 4096 chips: 35.7 s at 112 kchip/s.
 //!
-//! The receiver here works on samples at four per chip, centred on the
+//! The receiver here works on samples at eight per chip, centred on the
 //! host carrier: an FFT search over code phase and frequency, then one
 //! correlation per bit (with early and late ones to follow the timing),
 //! differential detection, the unique word, the four copies combined,
@@ -41,8 +41,11 @@ pub const CHIPS: usize = 4096;
 /// The CID's offset above the host carrier's centre (§5.9); below it when
 /// the modulator inverts the spectrum.
 pub const OFFSET_HZ: f64 = 220.0;
-/// Samples per chip the receiver takes.
-pub const SPS: usize = 4;
+/// Samples per chip the receiver takes. (Eight: a chip's edge falls
+/// within 1/16 chip of a sample, 0.2 dB lost on average; four lost 0.6.)
+pub const SPS: usize = 8;
+/// The early and late correlators' offset, samples: a quarter chip.
+const EL: usize = SPS / 4;
 
 /// The chip rate for a host carrier of `symbol_rate` (§5.5).
 pub fn chip_rate(symbol_rate: f64) -> f64 {
@@ -749,7 +752,7 @@ fn acq_threshold(bits: usize, cells: usize, false_rate: f64) -> f32 {
 /// of 64 low ones almost never came and a slipped tracker followed noise.)
 const LOST_BITS: u32 = 64;
 
-/// DVB-CID receiver: samples at four per chip, centred on the host
+/// DVB-CID receiver: samples at eight per chip, centred on the host
 /// carrier, in; frames out.
 pub struct CidRx {
     fs: f64,
@@ -863,7 +866,7 @@ impl CidRx {
         if let Some((t, ..)) = &mut self.track
             && *t > CHIPS * SPS
         {
-            let drop = *t - 2;
+            let drop = *t - EL - 1;
             self.held.drain(..drop);
             *t -= drop;
         }
@@ -911,16 +914,17 @@ impl CidRx {
             return false;
         }
         self.stats.searches += 1;
-        let fs2 = self.fs / 2.0;
+        // The search runs at two samples a chip.
+        let fs2 = self.fs * 2.0 / SPS as f64;
         let bin = fs2 / l2 as f64;
         let k_max = ((OFFSET_HZ + self.span_hz) / bin).ceil() as isize;
-        // Two per chip, by averaging pairs (`as_chunks` views the samples
-        // as [Iq; 2] arrays).
+        // Two per chip, by averaging SPS/2 samples at a time (`as_chunks`
+        // views the samples as [Iq; SPS/2] arrays).
         let x2: Vec<Iq> = self.held[..acq_bits * l4]
-            .as_chunks::<2>()
+            .as_chunks::<{ SPS / 2 }>()
             .0
             .iter()
-            .map(|p| (p[0] + p[1]) * 0.5)
+            .map(|p| p.iter().sum::<Iq>() * (2.0 / SPS as f32))
             .collect();
         let n_k = 2 * k_max as usize + 1;
         let cells = 2 * n_k;
@@ -1014,9 +1018,10 @@ impl CidRx {
                 freq += (0.5 * (ym - yp) / den).clamp(-0.5, 0.5) * 0.5 * bin;
             }
         }
-        // A bit starts at sample `2·lag` (four per chip) in the block — to a
-        // quarter chip, the neighbouring code phases say which side (a weak
-        // CID's slow timing loop would take hundreds of bits to get there).
+        // A bit starts at sample `lag·SPS/2` in the block (the search ran at
+        // two per chip) — to within a sample, the neighbouring code phases
+        // say which side (a weak CID's slow timing loop would take hundreds
+        // of bits to get there).
         let row = &acc[cell * l2..(cell + 1) * l2];
         let (lm, l0, lp) = (
             f64::from(row[(lag + l2 - 1) % l2]),
@@ -1024,13 +1029,16 @@ impl CidRx {
             f64::from(row[(lag + 1) % l2]),
         );
         let den = lm - 2.0 * l0 + lp;
+        let half_chip = (SPS / 2) as f64;
         let nudge = if den < 0.0 {
-            // In half chips, then samples (two a half chip), rounded.
-            (0.5 * (lm - lp) / den * 2.0).round().clamp(-1.0, 1.0) as isize
+            // In half chips, then samples, rounded.
+            (0.5 * (lm - lp) / den * half_chip)
+                .round()
+                .clamp(-half_chip / 2.0, half_chip / 2.0) as isize
         } else {
             0
         };
-        let start = (2 * lag as isize + nudge).max(0) as usize;
+        let start = ((SPS / 2 * lag) as isize + nudge).max(0) as usize;
         self.track = Some((start, 0.0, freq, 0.0, Iq::new(0.0, 0.0)));
         self.since_lock = 0;
         self.stats.acquired = true;
@@ -1052,12 +1060,12 @@ impl CidRx {
         let Some((t, phase, freq, terr, prev)) = self.track else {
             return false;
         };
-        if t == 0 {
-            // The early correlator needs a sample before: take the next bit.
-            self.track = Some((l4, phase + freq * l4 as f64 / self.fs, freq, terr, prev));
+        if t < EL {
+            // The early correlator needs samples before: take the next bit.
+            self.track = Some((t + l4, phase + freq * l4 as f64 / self.fs, freq, terr, prev));
             return true;
         }
-        if t + l4 + 1 > self.held.len() {
+        if t + l4 + EL > self.held.len() {
             return false;
         }
         let w = std::f64::consts::TAU * freq / self.fs;
@@ -1084,8 +1092,8 @@ impl CidRx {
                 p_first = p;
             }
             p += self.held[i] * rot * c;
-            e += self.held[i - 1] * rot * c;
-            l += self.held[i + 1] * rot * c;
+            e += self.held[i - EL] * rot * c;
+            l += self.held[i + EL] * rot * c;
             // Noise reference: the code half a period away.
             q += self.held[i] * rot * self.code4[(n + l4 / 2) % l4];
             rot *= step;
@@ -1209,7 +1217,9 @@ impl CidRx {
             (true, true) => 0.05,
             (true, false) => 0.01,
         };
-        let mut terr = terr + dll * f64::from((ea - la) / (ea + la).max(1e-30));
+        // (Steps are a sample, 1/SPS chip: the gain scaled to move as fast
+        // in chips as at four per chip.)
+        let mut terr = terr + dll * (SPS / 4) as f64 * f64::from((ea - la) / (ea + la).max(1e-30));
         let mut next = t + l4;
         if terr > 0.5 {
             next -= 1;
@@ -1654,11 +1664,11 @@ mod tests {
         (rx, out)
     }
 
-    /// A CID `db` under the noise (in a sample), the receiver in low-SNR
-    /// mode or not: (receiver, frames).
-    fn weak_cid(db: f32, low_snr: bool) -> (CidRx, Vec<CidFrame>) {
-        // About 1.4 dB a bit after despreading (41 dB under the noise in
-        // the band): the 24-bit search cannot see it, a deeper one can;
+    /// A CID at `snr_db` a bit after despreading (bit energy over the noise
+    /// density), the receiver in low-SNR mode or not: (receiver, frames).
+    fn weak_cid(snr_db: f32, low_snr: bool) -> (CidRx, Vec<CidFrame>) {
+        // About 1.1 dB a bit after despreading: the 24-bit search cannot
+        // see it, a deeper one can;
         // tracking holds at that level and the frame decodes from its four
         // copies summed.
         let guid = 0x0006_B0FF_FF01_AC07;
@@ -1704,7 +1714,8 @@ mod tests {
             }
             a * 1.732
         };
-        let amp = 10f32.powf(db / 20.0);
+        // Unit noise a sample: a bit's SNR is the samples a bit × amp².
+        let amp = 10f32.powf(snr_db / 20.0) / ((CHIPS * SPS) as f32).sqrt();
         let skip = 500 * CHIPS * SPS + 999;
         let mut rx = CidRx::new(chip_rate);
         rx.set_low_snr(low_snr);
@@ -1734,13 +1745,13 @@ mod tests {
     #[test]
     #[ignore]
     fn finds_and_reads_a_cid_near_0_db_a_bit() {
-        // About 1.4 dB a bit after despreading (41 dB under the noise in
-        // the band): the 24-bit search cannot see it, a deeper one can;
+        // About 1.1 dB a bit after despreading: the 24-bit search cannot
+        // see it, a deeper one can;
         // tracking holds at that level and the frame decodes from its four
         // copies summed.
         let guid = 0x0006_B0FF_FF01_AC07;
         let f0 = 180.0;
-        let (rx, out) = weak_cid(-41.0, false);
+        let (rx, out) = weak_cid(1.1, false);
         let m = rx.stats.search.as_deref().expect("searched");
         assert!(
             m.bits >= 48,
@@ -1769,13 +1780,13 @@ mod tests {
     #[test]
     #[ignore]
     fn low_snr_mode_locks_where_normal_mode_cannot() {
-        // About −4 dB a bit (45 dB under the noise): the normal searches
+        // About −3 dB a bit: the normal searches
         // top out at 192 bits, the peak (~1.5 dB) under their threshold;
         // low-SNR mode's 384-bit searches, looser threshold (1.3 dB) find
-        // and hold it. (Frames decode down to about −42 dB, ~1 dB a bit.)
-        let (normal, _) = weak_cid(-45.0, false);
+        // and hold it. (Frames decode down to about 0 dB a bit.)
+        let (normal, _) = weak_cid(-2.9, false);
         assert!(!normal.stats.acquired, "normal mode locked");
-        let (low, _) = weak_cid(-45.0, true);
+        let (low, _) = weak_cid(-2.9, true);
         assert!(low.stats.acquired, "{} searches", low.stats.searches);
         assert_eq!(low.stats.search.as_deref().map(|m| m.bits), Some(384));
         assert!(

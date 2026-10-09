@@ -295,7 +295,7 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                          kchip/s), lock at a looser threshold (down to 1.3 dB — a false \
                          lock in about one search in a hundred, which the tracker drops), \
                          and track with gentle loops and a Costas loop throughout. Frames \
-                         decode down to about 1 dB a bit.",
+                         decode down to about −0.5 dB a bit.",
                     )
                     .clicked()
                 {
