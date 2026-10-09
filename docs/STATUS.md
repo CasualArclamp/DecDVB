@@ -927,3 +927,18 @@ of the radio. It is now an engine command (`Engine::set_fft_size`, like DC
 removal): the front-end thread swaps its spectrum and block length between
 blocks, drops rows of the old width and starts the smoothed spectrum again;
 the source, the HackRF and the VFOs carry on untouched.
+
+## Station names from SAP, and an SDP that names the wrong payload (2026-10-09)
+
+A live DVB-S2 radio multiplex announces each station by SAP (224.2.127.254)
+with SDP lines ended by a bare CR; the parser now splits on CR or LF, so the
+`s=` names show (and bare SDP sent to any port counts as an announcement;
+a stream takes the announcement for its group and port, else the only one
+for its group, else the only one for its port). The same SDPs say
+`m=audio … RTP/AVP 14` (MPEG audio) while the packets are payload type 99:
+ADTS AAC behind an RTP header extension. Trusting the SDP made the player
+strip RFC 2250's 4 bytes from every packet and look for MPEG audio, so the
+named stations went silent. An announcement now describes a stream only for
+the payload type the packets carry (`SdpInfo::for_pt`): otherwise it names
+the stream and the codec comes from the bytes, and the external-player relay
+serves the ADTS over HTTP rather than handing over the misleading SDP.

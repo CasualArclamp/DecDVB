@@ -106,7 +106,14 @@ fn local_sdp(s: &AudioStream, port: u16) -> String {
 impl AudioRelay {
     /// Start playing `s`; an SDP file, if one is needed, goes in `dir`.
     pub fn start(s: &AudioStream, dir: &Path) -> io::Result<AudioRelay> {
-        let described = s.sdp.is_some() || matches!(s.pt, Some(0..=34));
+        // Described: an SDP for the payload type the packets carry (the
+        // scanner drops the SDP's payload type when it names another), or a
+        // static payload type.
+        let described = s
+            .sdp
+            .as_ref()
+            .is_some_and(|d| d.pt.is_some() && d.pt == s.pt)
+            || matches!(s.pt, Some(0..=34));
         let mode_target = if s.rtp && described {
             let port = free_port_pair()?;
             let sock = UdpSocket::bind("127.0.0.1:0")?;
@@ -270,6 +277,17 @@ mod tests {
         assert!(text.contains("audio/mpeg"));
         let body = got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         assert_eq!(&got[body..body + 4], &frame[..4]);
+    }
+
+    #[test]
+    fn an_sdp_for_another_payload_type_does_not_describe_the_stream() {
+        // Announced as type 14, sent as type 99 ADTS: served over HTTP as
+        // the ADTS it is, not relayed with an SDP the player would follow.
+        let sdp = SdpInfo::parse("v=0\rs=Newstalk_ZB\rm=audio 10001 RTP/AVP 14\r").for_pt(99);
+        let mut s = stream(true, Some(99), Codec::AacAdts, None);
+        s.sdp = Some(sdp);
+        let r = AudioRelay::start(&s, &std::env::temp_dir()).unwrap();
+        assert!(matches!(r.target, PlayTarget::Http(_)), "{:?}", r.target);
     }
 
     #[test]

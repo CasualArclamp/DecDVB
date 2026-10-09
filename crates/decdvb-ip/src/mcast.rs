@@ -135,6 +135,19 @@ pub struct SdpInfo {
 impl SdpInfo {
     /// Parse the parts of an SDP that matter here (first media only).
     pub fn parse(text: &str) -> SdpInfo {
+        SdpInfo::parse_for(text, None)
+    }
+
+    /// The same announcement read for payload type `pt`, the one the packets
+    /// actually carry: its rtpmap and fmtp if the media line lists it, and no
+    /// payload type or encoding at all if it does not (the SDP then names the
+    /// stream but does not describe it).
+    pub fn for_pt(&self, pt: u8) -> SdpInfo {
+        SdpInfo::parse_for(&self.raw, Some(pt))
+    }
+
+    /// Parse, describing payload type `want` (`None`: the first listed).
+    fn parse_for(text: &str, want: Option<u8>) -> SdpInfo {
         let mut s = SdpInfo {
             raw: text.to_string(),
             ..Default::default()
@@ -158,11 +171,18 @@ impl SdpInfo {
                     }
                 }
                 "m" if s.media.is_none() => {
-                    // m=audio 5004 RTP/AVP 96
+                    // m=audio 5004 RTP/AVP 96 97 — media, port, protocol,
+                    // then the payload types offered (RFC 4566 §5.14).
                     let mut f = v.split_whitespace();
                     s.media = f.next().map(str::to_string);
                     s.port = f.next().and_then(|p| p.split('/').next()?.parse().ok());
-                    s.pt = f.nth(1).and_then(|p| p.parse().ok());
+                    // `skip(1)` steps over the protocol; `filter_map` keeps
+                    // the fields that parse as numbers.
+                    let listed: Vec<u8> = f.skip(1).filter_map(|p| p.parse().ok()).collect();
+                    s.pt = match want {
+                        Some(pt) => listed.contains(&pt).then_some(pt),
+                        None => listed.first().copied(),
+                    };
                 }
                 "a" => {
                     if let Some(r) = v.strip_prefix("rtpmap:")
@@ -506,7 +526,14 @@ impl McastScanner {
             .flows
             .iter()
             .map(|(&(group, port), f)| {
-                let sdp = self.announcement_for(group, port);
+                // An encoder may announce one payload type and send another
+                // (a radio multiplex announced MPEG audio as type 14 and sent
+                // ADTS as type 99): then the SDP names the stream, but its
+                // codec is taken from the packets.
+                let sdp = self.announcement_for(group, port).map(|s| match f.pt {
+                    Some(pt) if f.rtp && s.pt != Some(pt) => s.for_pt(pt),
+                    _ => s,
+                });
                 let sniffed = f
                     .sniffed
                     .iter()
@@ -674,9 +701,12 @@ mod tests {
     #[test]
     fn sap_with_bare_cr_lines_names_the_station() {
         // As sent on a live DVB-S2 radio multiplex: SAP to 224.2.127.254,
-        // SDP lines ended by a bare CR.
+        // SDP lines ended by a bare CR, announcing payload type 14 (MPEG
+        // audio) — while the packets are type 99, ADTS behind an RTP header
+        // extension.
         let mut s = McastScanner::new();
-        let sdp = "v=0\ro=- 1 47 IN IP4 192.168.1.11\rs=Newstalk_ZB\ri=Newstalk_ZB\r                   a=X-PID:1001\rm=audio 10001 RTP/AVP 14\rc=IN IP4 230.0.0.1\ra=bitrate:0\r";
+        let sdp = "v=0\ro=- 1 47 IN IP4 192.168.1.11\rs=Newstalk_ZB\ri=Newstalk_ZB\r\
+                   a=X-PID:1001\rm=audio 10001 RTP/AVP 14\rc=IN IP4 230.0.0.1\ra=bitrate:0\r";
         feed(
             &mut s,
             &udp_v4(
@@ -687,10 +717,12 @@ mod tests {
                 &sap_packet([192, 168, 1, 11], 47, sdp),
             ),
         );
+        let adts = [0xFF, 0xF1, 0x50, 0x80, 0x02, 0x1F, 0xFC, 0, 0, 0];
         for k in 0..10u16 {
-            let mut payload = vec![0u8; 4];
-            payload.extend_from_slice(&silent_mp2_frame());
-            let rtp = rtp_packet(14, k, k as u32 * 2160, 0x99, &payload);
+            let mut rtp = rtp_packet(99, k, k as u32 * 1024, 0x99, &[]);
+            rtp[0] |= 0x10; // a header extension: profile, one word
+            rtp.extend_from_slice(&[0x56, 0x85, 0, 1, 0, 0, 0, 3]);
+            rtp.extend_from_slice(&adts);
             feed(
                 &mut s,
                 &udp_v4([10, 152, 26, 11], [230, 0, 0, 1], 4000, 10001, &rtp),
@@ -699,7 +731,22 @@ mod tests {
         let v = s.streams();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].name(), "Newstalk_ZB");
-        assert_eq!(v[0].sdp.as_ref().unwrap().pt, Some(14));
+        assert_eq!(v[0].pt, Some(99));
+        assert_eq!(v[0].codec, Codec::AacAdts);
+        // The announcement no longer claims to describe the packets.
+        assert_eq!(v[0].sdp.as_ref().unwrap().pt, None);
+        assert_eq!(s.stations()[0].2.pt, Some(14));
+    }
+
+    #[test]
+    fn sdp_for_a_listed_payload_type_takes_its_rtpmap() {
+        let s = SdpInfo::parse("v=0\nm=audio 6000 RTP/AVP 14 96\na=rtpmap:96 MP4A-LATM/48000/2\n");
+        assert_eq!(s.pt, Some(14));
+        assert_eq!(s.codec(), Codec::MpegAudio);
+        let t = s.for_pt(96);
+        assert_eq!(t.pt, Some(96));
+        assert_eq!(t.codec(), Codec::AacLatm);
+        assert_eq!(s.for_pt(99).codec(), Codec::Unknown);
     }
 
     #[test]
