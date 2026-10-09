@@ -779,10 +779,15 @@ pub fn identify_in(x: &[Iq], rate: f64, bandwidth: Option<f64>) -> Identificatio
     let tpc = !is_s2
         && matches!(cst, ConstellationGuess::Bpsk | ConstellationGuess::Qpsk)
         && decdvb_modem::tpc2964::detect(&lock.symbols, cst == ConstellationGuess::Qpsk);
+    // Paradise Q-Flex FastLink: its sync word every 11 538 symbols.
+    let fastlink = !is_s2
+        && !tpc
+        && cst == ConstellationGuess::Qpsk
+        && decdvb_modem::fastlink::detect(&lock.symbols);
     // 9. Not DVB-S2 nor TPC 2964: does anything repeat frame by frame? A
     //    header or pilots every frame fingerprint a framing — proprietary
     //    ones included — even with no decoder for it.
-    if !is_s2 && !tpc && id.carrier_locked {
+    if !is_s2 && !tpc && !fastlink && id.carrier_locked {
         id.frame_structure = crate::period::find_period(&lock.symbols, 16, 200_000);
     }
     id.verdict = if is_s2 {
@@ -806,6 +811,11 @@ pub fn identify_in(x: &[Iq], rate: f64, bandwidth: Option<f64>) -> Identificatio
                      (NovelSat NS4 offers 2 %)",
                     cst.label()
                 ),
+                _ if fastlink => {
+                    "QPSK, Paradise Q-Flex FastLink framing (sync word every 11 538 symbols: \
+                     rate 0.710, four 5760-bit LDPC codewords a frame)"
+                        .into()
+                }
                 _ if tpc => format!(
                     "{}, TPC 2964 unique word every 2964 bits — Intelsat IESS-315 turbo code",
                     cst.label()

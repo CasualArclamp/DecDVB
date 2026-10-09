@@ -16,6 +16,7 @@ pub mod conv;
 pub mod dandi;
 pub mod dvbs;
 pub mod e1;
+pub mod fastlink;
 pub mod interleave;
 pub mod payload;
 pub mod rs;

@@ -699,6 +699,7 @@ pub(crate) struct FecWorker {
     /// frames (TS) must start over.
     gap: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+    lossless: bool,
 }
 
 impl FecWorker {
@@ -719,7 +720,15 @@ impl FecWorker {
             output,
             gap,
             join: Some(join),
+            lossless: false,
         }
+    }
+
+    /// Wait for the thread instead of dropping input when it is behind (a
+    /// file played as fast as possible).
+    pub fn lossless(mut self, on: bool) -> Self {
+        self.lossless = on;
+        self
     }
 
     /// Queue a frame; drop it (counted) if the thread is behind.
@@ -738,6 +747,12 @@ impl FecWorker {
     }
 
     fn send(&self, input: FecInput) {
+        if self.lossless {
+            if let Some(tx) = &self.tx {
+                let _ = tx.send(input);
+            }
+            return;
+        }
         if let Some(tx) = &self.tx
             && let Err(TrySendError::Full(_)) = tx.try_send(input)
         {

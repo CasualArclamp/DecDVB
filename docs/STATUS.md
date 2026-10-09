@@ -731,3 +731,26 @@ Q-Flex.
   symbols (~10 %), no header DecDVB knows — FastLink or Paradise TPC; open.
 - With several D&I++ timeslots the byte order (alternating) is assumed, not
   confirmed.
+
+## Q-Flex FastLink, blind (2026-10-09)
+
+Rory sent his Q-Flex's settings (FastLink, QPSK, 0.710, 128.5 kbit/s,
+closed network + ESC, Drop-Insert TS1, 95 017 sym/s) and a 6.9-minute
+capture. Demodulated losslessly (file playback now waits for slow VFOs and
+FEC threads instead of dropping when not real time — `decdvb decode --fast`
+keeps every symbol, 18× real time).
+
+- Frame: 18-symbol sync word every 11 538 symbols (3527 found, slip-free),
+  then 23 040 bits = four 5760-bit slots.
+- GF(2) rank of thousands of slots (and their differences): 4110 / 4109 once
+  the ~8 % with bit errors are weeded out by checks from the other half —
+  a **(5760, 4096)-ish LDPC code** with a fixed scrambling offset on the code
+  bits; 13 positions per slot lie in no check (outside the code), 2 are
+  always 0. 4 × 4096 / 23 076 = 0.7100, the menu's rate.
+- Sparse checks by random-permutation RREF of the dual: 1251 of weight 16,
+  ~180 heavier (24–28): an irregular LDPC; bit degrees spread evenly along
+  the slot, so the coded bits are interleaved.
+- **Identify** names the framing (`decdvb-modem::fastlink`: sync word under
+  any QPSK orientation, three frames running). Reading the data still needs
+  the data positions, their order and the data scrambler; the recovered
+  checks are kept out of the repo for now.

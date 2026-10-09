@@ -254,6 +254,7 @@ pub(crate) enum VfoMsg {
 /// The engine's handle on a running VFO.
 pub(crate) struct VfoHandle {
     tx: SyncSender<VfoMsg>,
+    lossless: bool,
     pub status: Arc<Mutex<VfoStatus>>,
     pub settings: VfoSettings,
     dropped: Arc<AtomicU64>,
@@ -264,12 +265,17 @@ pub(crate) struct VfoHandle {
 }
 
 impl VfoHandle {
-    /// Queue a block; drop it (and count) if the worker is behind.
+    /// Queue a block; drop it (and count) if the worker is behind — or,
+    /// lossless, wait for it.
     pub fn offer(&self, block: &Arc<Vec<Iq>>) {
         if !self.settings.enabled {
             return;
         }
-        if let Err(TrySendError::Full(_)) = self.tx.try_send(VfoMsg::Block(Arc::clone(block))) {
+        if self.lossless {
+            let _ = self.tx.send(VfoMsg::Block(Arc::clone(block)));
+        } else if let Err(TrySendError::Full(_)) =
+            self.tx.try_send(VfoMsg::Block(Arc::clone(block)))
+        {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -297,7 +303,9 @@ impl VfoHandle {
 /// Blocks a worker may have queued before new ones are dropped.
 const QUEUE_DEPTH: usize = 8;
 
-pub(crate) fn spawn(in_rate: f64, settings: VfoSettings) -> VfoHandle {
+/// `lossless`: wait for the worker rather than dropping blocks (a file
+/// played as fast as possible).
+pub(crate) fn spawn(in_rate: f64, settings: VfoSettings, lossless: bool) -> VfoHandle {
     let (tx, rx) = mpsc::sync_channel(QUEUE_DEPTH);
     let status = Arc::new(Mutex::new(VfoStatus::default()));
     let dropped = Arc::new(AtomicU64::new(0));
@@ -311,11 +319,16 @@ pub(crate) fn spawn(in_rate: f64, settings: VfoSettings) -> VfoHandle {
         let settings = settings.clone();
         std::thread::Builder::new()
             .name(format!("vfo-{}", settings.name))
-            .spawn(move || Worker::new(in_rate, settings, status, dropped).run(rx, mailbox, stop))
+            .spawn(move || {
+                let mut w = Worker::new(in_rate, settings, status, dropped);
+                w.lossless = lossless;
+                w.run(rx, mailbox, stop)
+            })
             .expect("spawning a VFO thread")
     };
     VfoHandle {
         tx,
+        lossless,
         status,
         settings,
         dropped,
@@ -410,6 +423,8 @@ struct Worker {
     modcods: BTreeMap<u8, u64>,
     last_modcod: Option<u8>,
     identification: Option<Identification>,
+    /// Wait for the FEC thread rather than dropping its input.
+    lossless: bool,
 }
 
 impl Worker {
@@ -441,6 +456,7 @@ impl Worker {
             modcods: BTreeMap::new(),
             last_modcod: None,
             identification: None,
+            lossless: false,
         }
     }
 
@@ -692,7 +708,8 @@ impl Worker {
                                 .set_offset(self.settings.offset_hz + id.center_offset_hz);
                             self.frames.clear();
                             d.process(&shifted, &mut self.frames);
-                            let w = FecWorker::spawn(rs, fec_output(&self.settings, &self.ddc));
+                            let w = FecWorker::spawn(rs, fec_output(&self.settings, &self.ddc))
+                                .lossless(self.lossless);
                             for f in self.frames.drain(..) {
                                 w.offer(f);
                             }
@@ -749,7 +766,8 @@ impl Worker {
                             shift(&mut shifted, out_rate, id.center_offset_hz);
                             self.ddc
                                 .set_offset(self.settings.offset_hz + id.center_offset_hz);
-                            let w = FecWorker::spawn(rs, fec_output(&self.settings, &self.ddc));
+                            let w = FecWorker::spawn(rs, fec_output(&self.settings, &self.ddc))
+                                .lossless(self.lossless);
                             self.syms.clear();
                             d.process(&shifted, &mut self.syms);
                             offer_symbols(&w, *kind, modulation, &self.syms);

@@ -104,6 +104,9 @@ enum Cmd {
 pub struct Engine {
     shared: Arc<Shared>,
     cmd: Sender<Cmd>,
+    /// A file played as fast as it can be: VFOs are waited for rather than
+    /// dropping blocks, so nothing is lost (`decdvb decode --fast`).
+    lossless: bool,
     thread: Option<JoinHandle<()>>,
     next_id: VfoId,
     sample_rate: f64,
@@ -113,6 +116,7 @@ impl Engine {
     /// Start reading `source`.
     pub fn start(source: Box<dyn IqSource>, opts: EngineOptions) -> Engine {
         let sample_rate = source.sample_rate();
+        let lossless = !opts.realtime && !source.is_live();
         let shared = Arc::new(Shared {
             front: Mutex::new(FrontStatus {
                 sample_rate,
@@ -135,6 +139,7 @@ impl Engine {
         Engine {
             shared,
             cmd,
+            lossless,
             thread: Some(thread),
             next_id: 1,
             sample_rate,
@@ -175,7 +180,7 @@ impl Engine {
     pub fn add_vfo(&mut self, settings: VfoSettings) -> VfoId {
         let id = self.next_id;
         self.next_id += 1;
-        let handle = vfo::spawn(self.sample_rate, settings);
+        let handle = vfo::spawn(self.sample_rate, settings, self.lossless);
         self.shared.vfos.lock().unwrap().insert(id, handle);
         id
     }
