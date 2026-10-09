@@ -2,6 +2,11 @@
 //! — the same VFO the GUI runs, fed from the file, with a status line every
 //! couple of seconds and a full report at the end (structure found, payload,
 //! E1 timeslots, text, frame structure).
+//!
+//! With `--hackrf <MHz>` the source is the HackRF instead (receive only, its
+//! antenna power forced off): a status line every 30 s, a report at the end
+//! (`--seconds`) — for watching a carrier unattended, e.g. a FastLink link
+//! with `--record-on-activity` until a voice channel speaks.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -12,7 +17,16 @@ use decdvb_engine::{DecoderKind, Engine, EngineOptions, SourceState, VfoSettings
 use decdvb_io::{IqFileReader, IqSource, format_from_path};
 
 pub struct DecodeArgs {
-    pub file: PathBuf,
+    pub file: Option<PathBuf>,
+    /// Live: the HackRF's centre frequency, MHz, and its gains.
+    pub hackrf: Option<f64>,
+    pub lna: u16,
+    pub vga: u16,
+    pub amp: bool,
+    /// Stop after this long.
+    pub seconds: Option<f64>,
+    /// fastlink: record while a TDM channel is active.
+    pub record_on_activity: bool,
     pub format: Option<SampleFormat>,
     pub rate: Option<f64>,
     pub decoder: String,
@@ -62,26 +76,68 @@ fn modulation_by_name(name: &str) -> Result<Modulation> {
     })
 }
 
+/// The HackRF at `mhz`, `rate` samples a second.
+#[cfg(feature = "hackrf")]
+fn hackrf_source(a: &DecodeArgs, mhz: f64, rate: f64) -> Result<Box<dyn IqSource>> {
+    use decdvb_io::{HackRfGains, HackRfSettings, HackRfSource};
+    let src = HackRfSource::open(HackRfSettings {
+        center_hz: (mhz * 1e6).round() as u64,
+        sample_rate: rate.round() as u32,
+        gains: HackRfGains {
+            amp: a.amp,
+            lna_db: a.lna,
+            vga_db: a.vga,
+        }
+        .snapped(),
+    })?;
+    Ok(Box::new(src))
+}
+
+#[cfg(not(feature = "hackrf"))]
+fn hackrf_source(_: &DecodeArgs, _: f64, _: f64) -> Result<Box<dyn IqSource>> {
+    bail!("this build has no HackRF support (the `hackrf` feature)")
+}
+
 pub fn decode(a: DecodeArgs) -> Result<()> {
-    let fmt = a
-        .format
-        .or_else(|| format_from_path(&a.file))
-        .context("cannot tell the sample format from the extension — pass --format")?;
-    let rate = a
-        .rate
-        .or_else(|| crate::rate_from_name(&a.file))
-        .context("cannot tell the sample rate from the file name — pass --rate")?;
     let kind = decoder_by_name(&a.decoder)?;
-    let reader = IqFileReader::open(&a.file, fmt, rate, 1 << 16)
-        .with_context(|| format!("opening {}", a.file.display()))?;
-    println!("decoding {} at {:.3} MS/s", reader.describe(), rate / 1e6);
+    let live = a.hackrf.is_some();
+    let (source, rate): (Box<dyn IqSource>, f64) = match (a.hackrf, &a.file) {
+        (Some(mhz), _) => {
+            let rate = a.rate.unwrap_or(2e6);
+            let src = hackrf_source(&a, mhz, rate)?;
+            println!(
+                "live from the HackRF at {mhz:.4} MHz, {:.3} MS/s, LNA {} dB, VGA {} dB{} \
+                 (receive only)",
+                rate / 1e6,
+                a.lna,
+                a.vga,
+                if a.amp { ", amp on" } else { "" }
+            );
+            (src, rate)
+        }
+        (None, Some(file)) => {
+            let fmt = a
+                .format
+                .or_else(|| format_from_path(file))
+                .context("cannot tell the sample format from the extension — pass --format")?;
+            let rate = a
+                .rate
+                .or_else(|| crate::rate_from_name(file))
+                .context("cannot tell the sample rate from the file name — pass --rate")?;
+            let reader = IqFileReader::open(file, fmt, rate, 1 << 16)
+                .with_context(|| format!("opening {}", file.display()))?;
+            println!("decoding {} at {:.3} MS/s", reader.describe(), rate / 1e6);
+            (Box::new(reader), rate)
+        }
+        (None, None) => bail!("give a capture, or --hackrf <MHz>"),
+    };
 
     // Real time by default: a VFO that falls behind drops blocks, and a
     // decoder fed with holes reports them as faults of the signal.
     let mut eng = Engine::start(
-        Box::new(reader),
+        source,
         EngineOptions {
-            realtime: !a.fast,
+            realtime: !a.fast || live,
             loop_file: false,
             ..Default::default()
         },
@@ -104,8 +160,13 @@ pub fn decode(a: DecodeArgs) -> Result<()> {
     s.clock_ppm = a.clock_ppm;
     s.psk_bits = a.bits;
     if let Some(dir) = &a.out {
-        s.record = true;
+        // Record throughout, or (--record-on-activity) only while a channel
+        // of a FastLink's multiplex is active.
+        s.record = !a.record_on_activity;
+        s.record_on_activity = a.record_on_activity;
         s.record_dir = dir.clone();
+    } else if a.record_on_activity {
+        bail!("--record-on-activity needs --out");
     }
     if a.e1_record.is_some() && a.out.is_none() {
         bail!("--e1-record needs --out");
@@ -126,11 +187,21 @@ pub fn decode(a: DecodeArgs) -> Result<()> {
             ended_at = Some(Instant::now());
         }
         let st = eng.vfo_status(id);
-        if last_line.elapsed() >= Duration::from_secs(2) {
+        let every = Duration::from_secs(if live { 30 } else { 2 });
+        if last_line.elapsed() >= every {
             if let Some(st) = &st {
-                println!("[{:5.1} s] {}", t0.elapsed().as_secs_f64(), st.message);
+                let rec = st
+                    .fec
+                    .as_ref()
+                    .filter(|_| a.record_on_activity)
+                    .map(|f| format!(" · {} recordings", f.raw_triggered))
+                    .unwrap_or_default();
+                println!("[{:5.1} s] {}{rec}", t0.elapsed().as_secs_f64(), st.message);
             }
             last_line = Instant::now();
+        }
+        if a.seconds.is_some_and(|s| t0.elapsed().as_secs_f64() >= s) && ended_at.is_none() {
+            ended_at = Some(Instant::now());
         }
         // After the end, give the FEC thread a moment to drain.
         if ended_at.is_some_and(|t| t.elapsed() >= Duration::from_secs(3)) {
@@ -250,58 +321,10 @@ fn report(st: &VfoStatus) {
         );
     }
     if let Some(p) = &f.payload {
-        println!(
-            "payload: {} ({} frames looked at; HDLC {} good / {} bad; TS {})",
-            p.found.as_deref().unwrap_or("not recognised"),
-            p.probed,
-            p.hdlc_good,
-            p.hdlc_bad,
-            p.ts_packets
-        );
-        if let Some(e) = &p.paradise {
-            println!(
-                "  paradise framing: {}, {} groups, {} FAW errors, {} losses, ESC busy {:.1} %",
-                if e.locked { "aligned" } else { "searching" },
-                e.groups,
-                e.faw_errors,
-                e.losses,
-                100.0 * e.esc_busy as f64 / e.groups.max(1) as f64
-            );
-        }
-        if let Some(e) = &p.ibs {
-            let hex = |v: &[u8; 4]| v.map(|b| format!("{b:02x}")).join(" ");
-            println!(
-                "  ibs framing: {}, {} frames, {} misaligned, {} losses, overhead cycle {}, service bits {}",
-                if e.locked { "aligned" } else { "searching" },
-                e.frames,
-                e.misaligned,
-                e.losses,
-                hex(&e.cycle),
-                hex(&e.varying)
-            );
-        }
+        print_payload(p);
     }
     if let Some(t) = &f.tdm {
-        println!(
-            "tdm 257: {} · {} frames (2 ms) · {} alignment-bit errors · {} losses · side data {}",
-            if t.locked { "aligned" } else { "searching" },
-            t.frames,
-            t.faw_errors,
-            t.losses,
-            t.side_data
-                .iter()
-                .map(|b| char::from(b'0' + b))
-                .collect::<String>()
-        );
-        for (c, ch) in t.channels.iter().enumerate() {
-            println!(
-                "  channel {c:2} (bit {c:2} of each word): {:12} changes 20 ms {:5.1} % · 4 ms {:5.1} % · ones {:4.1} %",
-                ch.state.label(),
-                100.0 * ch.change_20ms,
-                100.0 * ch.change_4ms,
-                100.0 * ch.ones
-            );
-        }
+        print_tdm(t);
     }
     if let Some(e) = &f.e1 {
         println!(
@@ -400,5 +423,63 @@ fn print_byte_text(what: &str, t: &decdvb_engine::ByteTextView) {
     }
     for s in t.recent.iter().take(10) {
         println!("  … {s}");
+    }
+}
+
+/// The payload stage's report.
+pub(crate) fn print_payload(p: &decdvb_modem::payload::PayloadStats) {
+    println!(
+        "payload: {} ({} frames looked at; HDLC {} good / {} bad; TS {})",
+        p.found.as_deref().unwrap_or("not recognised"),
+        p.probed,
+        p.hdlc_good,
+        p.hdlc_bad,
+        p.ts_packets
+    );
+    if let Some(e) = &p.paradise {
+        println!(
+            "  paradise framing: {}, {} groups, {} FAW errors, {} losses, ESC busy {:.1} %",
+            if e.locked { "aligned" } else { "searching" },
+            e.groups,
+            e.faw_errors,
+            e.losses,
+            100.0 * e.esc_busy as f64 / e.groups.max(1) as f64
+        );
+    }
+    if let Some(e) = &p.ibs {
+        let hex = |v: &[u8; 4]| v.map(|b| format!("{b:02x}")).join(" ");
+        println!(
+            "  ibs framing: {}, {} frames, {} misaligned, {} losses, overhead cycle {}, service bits {}",
+            if e.locked { "aligned" } else { "searching" },
+            e.frames,
+            e.misaligned,
+            e.losses,
+            hex(&e.cycle),
+            hex(&e.varying)
+        );
+    }
+}
+
+/// The 257-bit TDM multiplex's report.
+pub(crate) fn print_tdm(t: &decdvb_modem::tdm257::TdmStats) {
+    println!(
+        "tdm 257: {} · {} frames (2 ms) · {} alignment-bit errors · {} losses · side data {}",
+        if t.locked { "aligned" } else { "searching" },
+        t.frames,
+        t.faw_errors,
+        t.losses,
+        t.side_data
+            .iter()
+            .map(|b| char::from(b'0' + b))
+            .collect::<String>()
+    );
+    for (c, ch) in t.channels.iter().enumerate() {
+        println!(
+            "  channel {c:2} (bit {c:2} of each word): {:12} changes 20 ms {:5.1} % · 4 ms {:5.1} % · ones {:4.1} %",
+            ch.state.label(),
+            100.0 * ch.change_20ms,
+            100.0 * ch.change_4ms,
+            100.0 * ch.ones
+        );
     }
 }

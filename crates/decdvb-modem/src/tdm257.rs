@@ -159,6 +159,10 @@ pub struct TdmRx {
     meters: Vec<Meter>,
     bits_in: usize,
     pub stats: TdmStats,
+    /// Keep every aligned frame in `frames_out` (for analysis).
+    pub keep_frames: bool,
+    /// The frames kept: 257 bits (0/1) each, the alignment bit first.
+    pub frames_out: Vec<u8>,
 }
 
 impl Default for TdmRx {
@@ -177,6 +181,8 @@ impl TdmRx {
             meters: vec![Meter::new(); CHANNELS],
             bits_in: 0,
             stats: TdmStats::default(),
+            keep_frames: false,
+            frames_out: Vec::new(),
         }
     }
 
@@ -271,6 +277,10 @@ impl TdmRx {
             self.stats.losses += 1;
             self.held.drain(..at + 1);
             return;
+        }
+        if self.keep_frames {
+            self.frames_out
+                .extend_from_slice(&self.held[at..at + FRAME]);
         }
         let payload = &self.held[at + 1..at + FRAME];
         for w in 0..WORDS {

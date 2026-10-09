@@ -322,6 +322,8 @@ decdvb scene                      # write the 8 MS/s test scene above
 decdvb cid                        # a DVB-S2 carrier with a DVB-CID under it
 decdvb test-signals tests         # both, into tests/ (see tests/README.md)
 decdvb mcast recording.ts --decode --record out   # the radio in a .ts (MPE)
+decdvb payload fastlink.bin --tdm-out frames.bin  # a modem .bin through the payload stage
+decdvb decode --hackrf 1635.0 --decoder fastlink --offset 640e3 --bandwidth 200e3   --out dir --record-on-activity     # watch a FastLink live, record when a channel speaks
 decdvb modcods                    # the DVB-S2 MODCOD table
 ```
 

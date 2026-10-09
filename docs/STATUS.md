@@ -1290,3 +1290,16 @@ against ffmpeg decoding the same frames: AAC-LC 225.0.0.2:6002 and HE-AAC
 225.0.0.20:6020 both agree to about 78 dB SNR after the first second, the
 HE-AAC over the full band (11–16 kHz at −30.6 dB of the total against
 ffmpeg's −30.2 dB). All five HE-AAC streams report SBR at 44.1 kHz.
+
+## CLI: live HackRF decoding, data recordings re-read (2026-10-10)
+
+`decdvb decode --hackrf <MHz> [--rate] [--lna] [--vga] [--amp] [--seconds]`
+runs any decoder live (receive only, antenna power off; a status line every
+30 s), and `--record-on-activity` (with `--out`) leaves a FastLink VFO
+recording only while its multiplex is busy — an unattended watch for
+speech. `decdvb payload file.bin [--frame-bits] [--tdm-out]` runs a modem
+data recording through the payload stage again and writes the TDM
+multiplex's aligned frames (`TdmRx::keep_frames`). The 19:54 FastLink
+recording (39 s) is like the others: Paradise aligned, TDM aligned with no
+errors, codec channels 0–2 idle; its 20 ms state word reads 11110 (as
+QFLEX_2's did; qflex_3's 01101).

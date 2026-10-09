@@ -7,6 +7,7 @@
 mod cidgen;
 mod decode;
 mod mcast;
+mod payload;
 mod scene;
 
 use std::path::PathBuf;
@@ -95,6 +96,9 @@ enum Command {
         #[arg(default_value = "tests")]
         dir: PathBuf,
     },
+    /// Run a modem data recording (.bin) through the payload stage again:
+    /// format, Paradise framing, the TDM multiplex inside.
+    Payload(payload::PayloadArgs),
     /// List the multicast radio in a recorded transport stream (IP from MPE):
     /// what each stream is, now-playing messages; decode or record them.
     Mcast(mcast::McastArgs),
@@ -110,9 +114,32 @@ enum Command {
         #[arg(long, default_value_t = 30.0)]
         timeout: f64,
     },
-    /// Run one decoder over a capture and report what it finds.
+    /// Run one decoder over a capture — or live from the HackRF — and report
+    /// what it finds.
     Decode {
-        file: PathBuf,
+        /// The capture (not needed with --hackrf).
+        file: Option<PathBuf>,
+        /// Live from the HackRF instead: its centre frequency, MHz (as it
+        /// tunes: L-band behind an LNB). Receive only, antenna power off.
+        #[arg(long)]
+        hackrf: Option<f64>,
+        /// HackRF IF (LNA) gain, dB: 0–40 in 8 dB steps.
+        #[arg(long, default_value_t = 24)]
+        lna: u16,
+        /// HackRF baseband (VGA) gain, dB: 0–62 in 2 dB steps.
+        #[arg(long, default_value_t = 20)]
+        vga: u16,
+        /// HackRF RF amplifier on (+14 dB).
+        #[arg(long)]
+        amp: bool,
+        /// Stop after this many seconds (live runs otherwise go on until
+        /// stopped).
+        #[arg(long)]
+        seconds: Option<f64>,
+        /// fastlink: record the data while a TDM channel is active, with
+        /// the 10 s before (needs --out).
+        #[arg(long)]
+        record_on_activity: bool,
         #[arg(long, value_parser = parse_format)]
         format: Option<SampleFormat>,
         /// Sample rate; taken from the file name (…_320000Sps…) when omitted.
@@ -226,6 +253,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Mcast(a) => mcast::run(&a),
+        Command::Payload(a) => payload::run(&a),
         Command::Scan {
             file,
             format,
@@ -234,6 +262,12 @@ fn main() -> Result<()> {
         } => scan(file, format, rate, timeout),
         Command::Decode {
             file,
+            hackrf,
+            lna,
+            vga,
+            amp,
+            seconds,
+            record_on_activity,
             format,
             rate,
             decoder,
@@ -250,6 +284,12 @@ fn main() -> Result<()> {
             bits,
         } => decode::decode(decode::DecodeArgs {
             file,
+            hackrf,
+            lna,
+            vga,
+            amp,
+            seconds,
+            record_on_activity,
             format,
             rate,
             decoder,
