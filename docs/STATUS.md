@@ -1108,3 +1108,31 @@ differ in one bit). APSK and 8QAM keep their labels. GUI: "Numbering" under
 the PSK constellation; CLI: `decode --decoder psk --labels natural|gray`.
 Checked on the 10 kBd QPSK capture: Gray is a fixed relabelling of the
 standard labels (0→0, 1→2, 2→1, 3→3).
+
+## Q-Flex: record on activity; DVB-CID: weak ones (2026-10-09)
+
+Q-Flex: the second capture (QFLEX_2, 14 s) is the same — codec channels 0–2
+idle, no speech — but its alignment channel's 20 ms word reads 11110 where
+qflex_3's read 01101: it carries state, not a fixed marker. With no speech
+on record, the way on is to catch some: the FastLink VFO has "Auto-record:
+when a TDM channel goes active" (`VfoSettings::record_on_activity`). The FEC
+thread keeps the last 10 s of data while not recording, starts a
+`…-fastlink-active-….bin` with that pre-trigger when any channel goes
+Active, and stops 10 s after the last activity (`FecStats::raw_triggered`
+counts them).
+
+DVB-CID: on Rory's live 16APSK host the strongest cell of a 96-bit search
+(2.2 dB, under the 2.7 dB threshold) sat at −3418 Hz while Identify's
+(unlocked, power-line) residual put the carrier at −3621 Hz — 203 Hz apart,
+where a CID belongs; under a 1 % chance for noise in an 8.4 kHz span. So a
+real CID ~10 dB under the specified level. For those:
+- a 192-bit search level (threshold 1.9 dB);
+- unlocked hosts searched wide enough to take in Identify's residual too;
+- found at 96 bits or deeper, tracking is gentler (FLL gain 0.01, DLL 0.05)
+  and keeps lock down to a 1 dB power/noise ratio (a leaky counter: below
+  counts up, above counts down twice as fast);
+- the acquisition's frequency is interpolated between half-bin cells;
+- the unique word is looked for on the four copies summed (6 dB better; a
+  chance match fails the CRC).
+Test (ignored, `--release`): a CID 41 dB under the noise (~1.4 dB a bit)
+is found by a deeper search, tracked, and its frame decoded.

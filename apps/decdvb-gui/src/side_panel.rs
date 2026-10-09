@@ -279,6 +279,18 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                 ui.end_row();
             }
 
+            if s.decoder == DecoderKind::FastLink {
+                ui.label("Auto-record");
+                ui.checkbox(&mut s.record_on_activity, "when a TDM channel goes active")
+                    .on_hover_text(
+                        "Write the decoded data to a .bin in the output folder whenever a \
+                         channel of the multiplex inside starts changing from one 20 ms \
+                         frame to the next (speech), the 10 s before included, until it \
+                         has been quiet for 10 s. Leave it running to catch a transmission.",
+                    );
+                ui.end_row();
+            }
+
             if s.decoder == DecoderKind::Identify {
                 ui.label("Text");
                 ui.checkbox(&mut s.find_text, "look for text in the bits")
@@ -1835,7 +1847,7 @@ fn fastlink_card(ui: &mut Ui, c: &CarrierState, st: &VfoStatus) {
         payload_rows(ui, f);
     });
     if let Some(m) = f.and_then(|f| f.tdm.as_ref()) {
-        tdm_card(ui, m);
+        tdm_card(ui, m, f.map(|f| f.raw_triggered));
     }
 }
 
@@ -1843,7 +1855,7 @@ fn fastlink_card(ui: &mut Ui, c: &CarrierState, st: &VfoStatus) {
 /// then the sixteen 8 kbit/s channels (bit n of each 16-bit word) as bars —
 /// the share of bits changed since 20 ms before: an idle codec channel sits
 /// at zero, speech should stand up near half.
-fn tdm_card(ui: &mut Ui, t: &decdvb_engine::TdmStats) {
+fn tdm_card(ui: &mut Ui, t: &decdvb_engine::TdmStats, triggered: Option<u64>) {
     use decdvb_engine::TdmChannelState as S;
     let good = Color32::from_rgb(110, 220, 110);
     let wait = Color32::from_rgb(240, 200, 80);
@@ -1871,6 +1883,15 @@ fn tdm_card(ui: &mut Ui, t: &decdvb_engine::TdmStats) {
         ui.end_row();
     });
     let active = t.channels.iter().filter(|c| c.state == S::Active).count();
+    if let Some(n) = triggered.filter(|&n| n > 0) {
+        ui.label(
+            RichText::new(format!(
+                "{n} recording(s) started on activity — see Data file"
+            ))
+            .small()
+            .color(good),
+        );
+    }
     let w = ui.available_width();
     let (painter, area) = scope_panel(
         ui,

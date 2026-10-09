@@ -697,7 +697,10 @@ const PROFILE_POINTS: usize = 512;
 /// despreads to ~8 dB a bit, plenty), then, after three searches finding
 /// nothing, 48 and 96 — each doubling lowers the level noise can reach,
 /// and so the threshold, by 1–1.2 dB.
-const ACQ_LEVELS: [usize; 3] = [24, 48, 96];
+const ACQ_LEVELS: [usize; 4] = [24, 48, 96, 192];
+/// Levels from here on are deep: the CID found this way is weak (about 0
+/// dB a bit), so tracking holds on with gentler loops and a lower floor.
+const DEEP: usize = 2;
 const ACQ_ESCALATE: u32 = 3;
 /// How far either side of ±220 Hz to look, by default.
 pub const ACQ_SPAN_HZ: f64 = 1500.0;
@@ -760,6 +763,9 @@ pub struct CidRx {
     level: usize,
     fails: u32,
     span_hz: f64,
+    /// The half-bit frequency estimate, averaged (it resolves the quiet
+    /// detector's ambiguity; one bit's is too noisy for a weak CID).
+    coarse_avg: f64,
     pub stats: CidStats,
 }
 
@@ -792,6 +798,7 @@ impl CidRx {
             level: 0,
             fails: 0,
             span_hz: ACQ_SPAN_HZ,
+            coarse_avg: 0.0,
             stats: CidStats::default(),
         }
     }
@@ -909,7 +916,19 @@ impl CidRx {
         let (cell, lag) = (best / l2, best % l2);
         let half = cell / (2 * k_max as usize + 1);
         let k = (cell % (2 * k_max as usize + 1)) as isize - k_max;
-        let freq = (k as f64 + 0.5 * half as f64) * bin;
+        let mut freq = (k as f64 + 0.5 * half as f64) * bin;
+        // Between the half-bin cells: a parabola through the peak and its
+        // neighbours in frequency (a weak CID's loop must start close).
+        let n = 2 * k_max as usize + 1;
+        let j = 2 * (k + k_max) as usize + half;
+        if j > 0 && j + 1 < 2 * n {
+            let at = |j: usize| f64::from(acc[((j % 2) * n + j / 2) * l2 + lag]);
+            let (ym, y0, yp) = (at(j - 1), at(j), at(j + 1));
+            let den = ym - 2.0 * y0 + yp;
+            if den < 0.0 {
+                freq += (0.5 * (ym - yp) / den).clamp(-0.5, 0.5) * 0.5 * bin;
+            }
+        }
         // A bit starts at sample `2·lag` (four per chip) in the block.
         self.track = Some((2 * lag, 0.0, freq, 0.0, Iq::new(0.0, 0.0)));
         self.stats.acquired = true;
@@ -919,6 +938,7 @@ impl CidRx {
         self.noise = 0.0;
         self.disp = Iq::new(0.0, 0.0);
         self.epl_avg = [0.0; 3];
+        self.coarse_avg = 0.0;
         self.stats.live = CidLive::default();
         true
     }
@@ -980,10 +1000,16 @@ impl CidRx {
             0.95 * self.noise + 0.05 * nn
         };
         self.stats.snr_db = 10.0 * (self.power / self.noise.max(1e-30)).log10();
-        self.weak = if self.power < 2.0 * self.noise {
+        // Below the floor counts up, above it counts down twice as fast: a
+        // weak CID's ratio wanders under the floor now and then, noise's
+        // stays there. (Found deep, the floor is 1 dB: a CID ~0 dB a bit
+        // sits near 2.)
+        let deep = self.level >= DEEP;
+        let floor = if deep { 1.25 } else { 2.0 };
+        self.weak = if self.power < floor * self.noise {
             self.weak + 1
         } else {
-            0
+            self.weak.saturating_sub(2)
         };
         if self.weak > LOST_BITS {
             self.track = None;
@@ -1032,18 +1058,23 @@ impl CidRx {
         } else {
             0.0
         };
+        self.coarse_avg = 0.9 * self.coarse_avg + 0.1 * coarse_hz;
+        let gain = if deep { 0.01 } else { 0.1 };
         if prev.norm_sqr() > 0.0 {
             let d = p * prev.conj();
             let fine_hz = f64::from((d * d).arg()) / 2.0 / (std::f64::consts::TAU * bit_s);
             let amb = 1.0 / (2.0 * bit_s);
-            let err_hz = fine_hz + amb * ((coarse_hz - fine_hz) / amb).round();
-            freq += 0.1 * err_hz;
+            let err_hz = fine_hz + amb * ((self.coarse_avg - fine_hz) / amb).round();
+            freq += gain * err_hz;
+            // The correction just made is no longer error.
+            self.coarse_avg -= gain * err_hz;
         } else {
             freq += 0.02 * coarse_hz;
         }
         // Timing: early against late, a quarter chip either side.
         let (ea, la) = (e.norm(), l.norm());
-        let mut terr = terr + 0.2 * f64::from((ea - la) / (ea + la).max(1e-30));
+        let dll = if deep { 0.05 } else { 0.2 };
+        let mut terr = terr + dll * f64::from((ea - la) / (ea + la).max(1e-30));
         let mut next = t + l4;
         if terr > 0.5 {
             next -= 1;
@@ -1126,14 +1157,19 @@ impl CidRx {
                     if self.soft.len() < span {
                         return;
                     }
+                    // The unique word on the four copies summed (6 dB better
+                    // than each alone, which a weak CID needs); a chance
+                    // match fails the frame's CRC.
                     let uw_at = |p: usize| {
-                        let v = self.soft[p..p + UW_BITS]
-                            .iter()
-                            .fold(0u32, |a, &s| (a << 1) | u32::from(hard(s)));
+                        let v = (0..UW_BITS).fold(0u32, |a, i| {
+                            let sum: f32 =
+                                (0..REPEAT).map(|r| self.soft[p + r * FRAME_BITS + i]).sum();
+                            (a << 1) | u32::from(hard(sum))
+                        });
                         (v ^ UW).count_ones().min((v ^ !UW & UW_MASK).count_ones()) <= 3
                     };
                     let last = self.soft.len() - span;
-                    match (0..=last).find(|&p| (0..REPEAT).all(|r| uw_at(p + r * FRAME_BITS))) {
+                    match (0..=last).find(|&p| uw_at(p)) {
                         Some(p) => p,
                         None => {
                             // Keep the tail where a frame could still start.
@@ -1431,6 +1467,103 @@ mod tests {
         }
         rx.push(&block, &mut out);
         (rx, out)
+    }
+
+    /// Heavy (a minute in a debug build): run with `--ignored --release`.
+    #[test]
+    #[ignore]
+    fn finds_and_reads_a_cid_near_0_db_a_bit() {
+        // About 1.4 dB a bit after despreading (41 dB under the noise in
+        // the band): the 24-bit search cannot see it, a deeper one can;
+        // tracking holds at that level and the frame decodes from its four
+        // copies summed.
+        let guid = 0x0006_B0FF_FF01_AC07;
+        let frame = |second, a| {
+            build_frame(
+                guid,
+                [
+                    Field {
+                        content_id: a,
+                        info: 0x00_1234,
+                    },
+                    Field {
+                        content_id: 2,
+                        info: 0x00_5678,
+                    },
+                ],
+                second,
+            )
+        };
+        let mut chips = Vec::new();
+        let mut diff = 0;
+        spread(
+            &[
+                frame(false, 1),
+                frame(true, 3),
+                frame(false, 4),
+                frame(true, 5),
+            ],
+            &mut diff,
+            &mut chips,
+        );
+        let chip_rate = 224e3;
+        let fs = SPS as f64 * chip_rate;
+        let f0 = 180.0;
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        let mut gauss = move || {
+            let mut a = 0.0f32;
+            for _ in 0..4 {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                a += (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+            }
+            a * 1.732
+        };
+        let amp = 10f32.powf(-41.0 / 20.0);
+        let skip = 500 * CHIPS * SPS + 999;
+        let mut rx = CidRx::new(chip_rate);
+        let mut out = Vec::new();
+        let mut block = Vec::with_capacity(100_000);
+        for n in skip..(chips.len() + 4 * CHIPS) * SPS {
+            let c = match chips.get(n / SPS) {
+                Some(1) => -amp,
+                Some(_) => amp,
+                None => 0.0,
+            };
+            let ph = std::f64::consts::TAU * f0 * n as f64 / fs;
+            block.push(
+                Iq::new(c * ph.cos() as f32, c * ph.sin() as f32)
+                    + Iq::new(gauss(), gauss()) * std::f32::consts::FRAC_1_SQRT_2,
+            );
+            if block.len() == 100_000 {
+                rx.push(&block, &mut out);
+                block.clear();
+            }
+        }
+        rx.push(&block, &mut out);
+        let m = rx.stats.search.as_deref().expect("searched");
+        assert!(
+            m.bits >= 48,
+            "found at {} bits: {:?}",
+            m.bits,
+            rx.stats.snr_db
+        );
+        assert!(rx.stats.acquired, "{} searches", rx.stats.searches);
+        assert!(
+            (rx.stats.offset_hz - f0).abs() < 5.0,
+            "{} Hz",
+            rx.stats.offset_hz
+        );
+        assert!(
+            !out.is_empty(),
+            "no frame at {:.1} dB ({} bits, {} bad frames, sync {:?})",
+            rx.stats.snr_db,
+            rx.stats.bits,
+            rx.stats.bad_frames,
+            (rx.stats.live.uw_copies, rx.stats.live.aligned)
+        );
+        assert!(out.iter().all(|f| f.guid == guid));
     }
 
     #[test]

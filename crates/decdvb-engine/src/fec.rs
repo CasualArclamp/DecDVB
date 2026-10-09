@@ -347,6 +347,8 @@ pub struct FecStats {
     /// The raw data file (TPC 2964, while recording) and its bytes.
     pub raw_file: Option<(PathBuf, u64)>,
     pub raw_active: bool,
+    /// Recordings started by activity in the TDM multiplex.
+    pub raw_triggered: u64,
     /// Text in a modem's data while what they carry is not known (TPC
     /// 2964), every reading of the bits at once.
     pub text: Option<decdvb_modem::text::TextView>,
@@ -687,6 +689,9 @@ pub struct GseView {
 pub struct FecOutput {
     /// Write IP packets to a PCAP file.
     pub record: bool,
+    /// A modem's data: record them, the last 10 s included, while a channel
+    /// of the TDM multiplex inside is active (and 10 s after).
+    pub record_on_activity: bool,
     pub dir: PathBuf,
     /// For file names.
     pub name: String,
@@ -1353,6 +1358,10 @@ impl Drop for TsStage {
     }
 }
 
+/// Data kept from before a recording started on activity: 10 s at the
+/// Q-Flex's 136.5 kbit/s.
+const PRE_TRIGGER: usize = 171_000;
+
 /// A modem's data as they come, to a `.bin` file while recording.
 #[derive(Default)]
 struct RawFile {
@@ -1360,13 +1369,25 @@ struct RawFile {
     path: Option<PathBuf>,
     bytes: u64,
     error: Option<String>,
+    /// The latest data while not recording, for a recording started by
+    /// activity to begin before it.
+    pre: std::collections::VecDeque<u8>,
+    /// Recordings started by activity.
+    triggered: u64,
 }
 
 impl RawFile {
-    fn follow(&mut self, o: &FecOutput, what: &str) {
+    /// Record if asked, or (`active`) while the multiplex inside is busy.
+    fn follow(&mut self, o: &FecOutput, what: &str, active: bool) {
         use std::io::Write;
-        match (o.record, self.file.is_some()) {
+        let on_activity = !o.record && o.record_on_activity && active;
+        match (o.record || on_activity, self.file.is_some()) {
             (true, false) if self.error.is_none() => {
+                let what = if on_activity {
+                    format!("{what}-active")
+                } else {
+                    what.to_string()
+                };
                 let stamp = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -1383,6 +1404,14 @@ impl RawFile {
                 }
                 self.path = Some(path);
                 self.bytes = 0;
+                if on_activity {
+                    self.triggered += 1;
+                    // The moments before the trigger: speech starts before
+                    // the meter calls it.
+                    let pre: Vec<u8> = self.pre.drain(..).collect();
+                    self.write(&pre);
+                }
+                self.pre.clear();
             }
             (false, true) => {
                 if let Some(mut f) = self.file.take() {
@@ -1396,6 +1425,12 @@ impl RawFile {
 
     fn write(&mut self, data: &[u8]) {
         use std::io::Write;
+        if self.file.is_none() {
+            self.pre.extend(data);
+            let over = self.pre.len().saturating_sub(PRE_TRIGGER);
+            self.pre.drain(..over);
+            return;
+        }
         if let Some(f) = &mut self.file {
             match f.write_all(data) {
                 Ok(()) => self.bytes += data.len() as u64,
@@ -1460,6 +1495,7 @@ fn run(
     let mut tpc: Option<decdvb_modem::tpc2964::TpcRx> = None;
     let mut fastlink: Option<decdvb_modem::fastlink::FastLinkRx> = None;
     let mut tdm: Option<decdvb_modem::tdm257::TdmRx> = None;
+    let mut tdm_active_until = 0u64;
     let mut viterbi: Option<decdvb_modem::dvbs::ViterbiRx> = None;
     let mut tpc_frames = Vec::new();
     let mut payload: Option<decdvb_modem::payload::PayloadRx> = None;
@@ -1517,7 +1553,20 @@ fn run(
                 };
                 let pay = payload.get_or_insert_with(|| PayloadRx::new(block));
                 let o = output.lock().unwrap().clone();
-                raw.follow(&o, tag);
+                // Activity in the TDM multiplex (any channel changing from
+                // one 20 ms frame to the next), held 10 s (5000 frames).
+                let tdm_busy = tdm.as_ref().is_some_and(|t| {
+                    t.stats.locked
+                        && t.stats
+                            .channels
+                            .iter()
+                            .any(|c| c.state == decdvb_modem::tdm257::ChannelState::Active)
+                });
+                let frames = tdm.as_ref().map_or(0, |t| t.stats.frames);
+                if tdm_busy {
+                    tdm_active_until = frames + 5000;
+                }
+                raw.follow(&o, tag, frames < tdm_active_until);
                 for data in &tpc_frames {
                     payload_out.clear();
                     pay.push(data, &mut payload_out);
@@ -1626,6 +1675,7 @@ fn run(
                     s.e1 = Some(stage.view(st));
                 }
                 s.raw_file = raw.path.clone().map(|p| (p, raw.bytes));
+                s.raw_triggered = raw.triggered;
                 s.raw_active = raw.file.is_some();
                 if let Some(stage) = &mut ts {
                     s.ts = Some(stage.view());

@@ -158,6 +158,9 @@ pub struct VfoSettings {
     pub find_text: bool,
     /// Generic PSK: how the symbols written to the .bin are numbered.
     pub symbol_labels: crate::psk::SymbolLabels,
+    /// Q-Flex FastLink: record the data whenever a channel of the TDM
+    /// multiplex inside goes active (the 10 s before included).
+    pub record_on_activity: bool,
     /// Write the decoder's output to a file: symbols (generic PSK) or IP
     /// packets as PCAP (DVB-S2 → GSE/IP). Off by default — the decoder shows
     /// what it finds until recording is asked for.
@@ -201,6 +204,7 @@ impl VfoSettings {
             psk_modulation: None,
             find_text: true,
             symbol_labels: crate::psk::SymbolLabels::Standard,
+            record_on_activity: false,
             record: false,
             gse_variant: None,
             // Local only: a player on this machine. Point them elsewhere on
@@ -885,7 +889,16 @@ impl Worker {
                                     Some(f) if id.carrier_locked => {
                                         (id.center_offset_hz + f, decdvb_modem::cid::ACQ_SPAN_HZ)
                                     }
-                                    _ => (id.center_offset_hz, 4000.0),
+                                    // Not locked: Identify's centre, the span
+                                    // wide enough to take in its residual
+                                    // estimate too (a power-line guess, often
+                                    // right: on a live 16APSK carrier the CID
+                                    // sat 203 Hz from it).
+                                    _ => (
+                                        id.center_offset_hz,
+                                        id.carrier_offset_hz
+                                            .map_or(4000.0, |f| (f.abs() + 1500.0).max(4000.0)),
+                                    ),
                                 };
                                 let w = crate::cid::CidWorker::spawn(
                                     out_rate,
@@ -1396,6 +1409,7 @@ fn fec_output(s: &VfoSettings, ddc: &Ddc) -> FecOutput {
                     | DecoderKind::FastLink
                     | DecoderKind::Viterbi
             ),
+        record_on_activity: s.record_on_activity && s.decoder == DecoderKind::FastLink,
         dir: s.record_dir.clone(),
         name: s.name.clone(),
         carrier_hz: ddc.offset_hz(),
