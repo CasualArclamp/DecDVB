@@ -10,6 +10,8 @@
 //! - **mpeg4-generic in RTP** (RFC 3640): AU headers and access units, the
 //!   AudioSpecificConfig in the SDP.
 //! - **PCM in RTP** (RFC 3551): L16/L24/L8, and G.711 µ-law and A-law.
+//! - **Opus in RTP** (RFC 7587): one Opus packet a payload (recorded, not
+//!   decoded here).
 
 use decdvb_ip::mcast::rtp_payload;
 use decdvb_ip::{AudioStream, Codec};
@@ -32,6 +34,8 @@ pub enum Unit {
     },
     /// MPEG-TS bytes (recorded, not played).
     Ts(Vec<u8>),
+    /// One Opus packet (RFC 7587 §4.2) — recorded, not played.
+    Opus(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +64,7 @@ enum Kind {
         channels: u16,
     },
     Ts,
+    Opus,
 }
 
 /// Turns one stream's UDP payloads into [`Unit`]s.
@@ -152,7 +157,8 @@ impl Depacketizer {
                 )
             }
             Codec::Ts => (Kind::Ts, format!("MPEG-TS in {transport}")),
-            Codec::Opus => return Err("Opus is not decoded here: use VLC".into()),
+            Codec::Opus if s.rtp => (Kind::Opus, "Opus in RTP".to_string()),
+            Codec::Opus => return Err("Opus outside RTP is not understood".into()),
             Codec::Unknown => return Err("the codec is not known".into()),
         };
         let mpa_header =
@@ -171,6 +177,11 @@ impl Depacketizer {
     /// MPEG-TS streams are recorded but not played.
     pub fn is_ts(&self) -> bool {
         matches!(self.kind, Kind::Ts)
+    }
+
+    /// Opus is recorded but not decoded here.
+    pub fn is_opus(&self) -> bool {
+        matches!(self.kind, Kind::Opus)
     }
 
     /// One UDP payload; finished units go to `out`.
@@ -256,6 +267,11 @@ impl Depacketizer {
                 }
             }
             Kind::Ts => out.push(Unit::Ts(payload.to_vec())),
+            Kind::Opus => {
+                if !payload.is_empty() {
+                    out.push(Unit::Opus(payload.to_vec()));
+                }
+            }
         }
     }
 }
@@ -444,7 +460,12 @@ mod tests {
 
     #[test]
     fn unplayable_streams_say_why() {
-        assert!(Depacketizer::new(&stream(true, Some(96), Codec::Opus, None)).is_err());
+        assert!(Depacketizer::new(&stream(false, None, Codec::Opus, None)).is_err());
         assert!(Depacketizer::new(&stream(true, Some(96), Codec::AacRfc3640, None)).is_err());
+        // Opus in RTP is taken apart (to record), though not played.
+        let s = stream(true, Some(96), Codec::Opus, None);
+        assert!(Depacketizer::new(&s).unwrap().is_opus());
+        let e = crate::AudioPlayer::start(&s, crate::OutputKind::Null).err();
+        assert!(e.is_some_and(|e| e.contains("VLC")));
     }
 }

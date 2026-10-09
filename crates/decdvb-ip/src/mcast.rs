@@ -11,6 +11,15 @@
 //! - **SAP** (RFC 2974, port 9875) announcements carry SDP (RFC 8866) that
 //!   name the streams and say exactly what they are; a stream so described
 //!   is taken at its word.
+//! - **Unannounced RTP** in a dynamic payload type is described from its
+//!   own packets when it can be: RFC 3640 AAC by its RTP clock rate (from
+//!   RTCP sender reports, else timed against the signal), the clock ticks
+//!   an access unit spans (1024: AAC-LC; 2048: HE-AAC, SBR doubling the
+//!   rate) and its first syntax element (SCE: mono; CPE: stereo); Opus
+//!   (RFC 7587) by packets that parse as Opus under a steady TOC byte. The
+//!   SDP so made plays in the app and in external players alike.
+//! - **Now playing**: `<nowplaying>` XML messages (title, artist, station)
+//!   sent alongside the audio are read out.
 //!
 //! After the VK2SWL DVB-S/S2 multicast audio receiver, which does this from
 //! MPE in a transport stream; here IP may come from GSE or MPE alike.
@@ -100,14 +109,8 @@ impl Codec {
             Codec::MpegAudio // 11-bit sync, a layer, a valid bitrate
         } else if b[0] == 0x47 && b.len().is_multiple_of(188) {
             Codec::Ts
-        } else if b[..2] == [0x00, 0x10] {
-            // RFC 3640: 16 bits of AU headers (one 13-bit size + 3-bit index).
-            let au = (u16::from_be_bytes([b[2], b[3]]) >> 3) as usize;
-            if au + 4 == b.len() {
-                Codec::AacRfc3640
-            } else {
-                Codec::Unknown
-            }
+        } else if rfc3640_aus(b).is_some() {
+            Codec::AacRfc3640
         } else {
             Codec::Unknown
         }
@@ -130,6 +133,8 @@ pub struct SdpInfo {
     pub fmtp: Option<String>,
     /// The SDP itself.
     pub raw: String,
+    /// Made here from the stream's packets, not announced.
+    pub inferred: bool,
 }
 
 impl SdpInfo {
@@ -344,6 +349,213 @@ struct Flow {
     sniffed: BTreeMap<u8, u32>,
     win_bytes: u64,
     rate_bps: f64,
+    /// The last payload's first byte (Opus's TOC byte holds steady).
+    first: Option<u8>,
+    /// The last RTP timestamp, and the access units that packet held
+    /// (RFC 3640).
+    ts: Option<u32>,
+    aus: Option<u32>,
+    /// RTP clock ticks per access unit, as seen between packets, tallied.
+    au_ticks: BTreeMap<u32, u32>,
+    /// Channels: from the first AU's first syntax element, or Opus's TOC.
+    channels: Option<u8>,
+    /// The RTP clock timed against the signal: when the measurement began,
+    /// the last packet's time, and the timestamps' advance (unwrapped)
+    /// since, for streams without RTCP.
+    t0: Option<f64>,
+    t_last: f64,
+    ts_adv: u64,
+}
+
+/// One sender's RTCP sender reports (RFC 3550 §6.4.1): the first and the
+/// latest (NTP time in seconds, RTP timestamp) pair — two clocks read at
+/// one instant, so between them they give the RTP clock's rate.
+#[derive(Debug, Clone, Copy)]
+struct SenderClock {
+    first: (f64, u32),
+    last: (f64, u32),
+}
+
+/// What one now-playing message says (`<nowplaying><title>…</title>
+/// <artist>…</artist><station>…</station><media_type>…</media_type>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NowPlaying {
+    pub station: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    /// SONG, UNSPECIFIED, … as sent.
+    pub kind: Option<String>,
+    /// Where the messages come from.
+    pub group: IpAddr,
+    pub port: u16,
+}
+
+/// RTP clock rates a measurement snaps to (RFC 3551 and the AAC rates).
+const CLOCK_RATES: [u32; 13] = [
+    8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 90000, 96000,
+];
+
+/// `measured` snapped to the nearest standard rate, if within `tol` (a
+/// fraction) of it.
+fn snap_rate(measured: f64, tol: f64) -> Option<u32> {
+    CLOCK_RATES
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            (measured - *a as f64)
+                .abs()
+                .total_cmp(&(measured - *b as f64).abs())
+        })
+        .filter(|r| (measured / *r as f64 - 1.0).abs() <= tol)
+}
+
+/// The access-unit sizes of an RFC 3640 payload in AAC-hbr mode — 13-bit
+/// sizes and 3-bit indices (RFC 3640 §3.3.6) — if they account for every
+/// byte of it.
+fn rfc3640_aus(b: &[u8]) -> Option<Vec<usize>> {
+    let bits = u16::from_be_bytes([*b.first()?, *b.get(1)?]) as usize;
+    if bits == 0 || !bits.is_multiple_of(16) {
+        return None;
+    }
+    let n = bits / 16;
+    // `collect` into `Option<Vec<_>>` gives `None` if any size is missing.
+    let sizes: Vec<usize> = (0..n)
+        .map(|i| {
+            let h = b.get(2 + 2 * i..4 + 2 * i)?;
+            Some((u16::from_be_bytes([h[0], h[1]]) >> 3) as usize)
+        })
+        .collect::<Option<_>>()?;
+    (2 + 2 * n + sizes.iter().sum::<usize>() == b.len()).then_some(sizes)
+}
+
+/// An Opus frame length (RFC 6716 §3.2.1): one byte, or two from 252 up.
+/// The length and the bytes it took.
+fn opus_len(b: &[u8]) -> Option<(usize, usize)> {
+    let l0 = *b.first()? as usize;
+    if l0 < 252 {
+        Some((l0, 1))
+    } else {
+        Some((l0 + 4 * *b.get(1)? as usize, 2))
+    }
+}
+
+/// Whether `b` parses as one Opus packet (RFC 6716 §3.2): its frame-count
+/// code, frame lengths and padding add up to its length, and it holds at
+/// most 120 ms of audio.
+fn opus_packet_ok(b: &[u8]) -> bool {
+    let Some(&toc) = b.first() else {
+        return false;
+    };
+    let config = toc >> 3;
+    // Frame duration in 2.5 ms units (§3.1, Table 2): SILK, hybrid, CELT.
+    let d25 = match config {
+        0..=11 => [4, 8, 16, 24][(config % 4) as usize],
+        12..=15 => [4, 8][(config % 2) as usize],
+        _ => [1, 2, 4, 8][(config % 4) as usize],
+    };
+    let rest = &b[1..];
+    match toc & 3 {
+        // One frame; two equal frames.
+        0 => rest.len() <= 1275,
+        1 => rest.len().is_multiple_of(2) && rest.len() / 2 <= 1275,
+        // Two frames, the first's length coded.
+        2 => opus_len(rest).is_some_and(|(l, h)| l <= rest.len() - h),
+        // A frame count byte: VBR, padding, count; then padding lengths,
+        // frame lengths (VBR), frames and padding.
+        _ => {
+            let Some(&fc) = rest.first() else {
+                return false;
+            };
+            let m = (fc & 0x3F) as usize;
+            if m == 0 || m * d25 > 48 {
+                return false;
+            }
+            let mut at = 1;
+            let mut pad = 0;
+            if fc & 0x40 != 0 {
+                loop {
+                    let Some(&p) = rest.get(at) else {
+                        return false;
+                    };
+                    at += 1;
+                    if p == 255 {
+                        pad += 254;
+                    } else {
+                        pad += p as usize;
+                        break;
+                    }
+                }
+            }
+            let mut used = 0;
+            if fc & 0x80 != 0 {
+                for _ in 1..m {
+                    let Some((l, h)) = rest.get(at..).and_then(opus_len) else {
+                        return false;
+                    };
+                    at += h;
+                    used += l;
+                }
+            }
+            let Some(frames) = rest.len().checked_sub(at + pad) else {
+                return false;
+            };
+            if fc & 0x80 != 0 {
+                used <= frames && frames - used <= 1275
+            } else {
+                frames.is_multiple_of(m) && frames / m <= 1275
+            }
+        }
+    }
+}
+
+/// An AudioSpecificConfig (ISO/IEC 14496-3 §1.6.2.1): AAC-LC at `rate`, or
+/// with `sbr` HE-AAC signalled explicitly (object type 5, §1.6.5: the core
+/// at half `rate`, the output at `rate`); 960-sample frames if `short`.
+fn aac_config(rate: u32, channels: u8, sbr: bool, short: bool) -> Option<Vec<u8>> {
+    // Sampling frequency index (§1.6.3.4, Table 1.18).
+    const RATES: [u32; 13] = [
+        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
+    ];
+    let index = |r: u32| RATES.iter().position(|&x| x == r).map(|i| i as u64);
+    let mut fields: Vec<(u64, u32)> = Vec::new();
+    if sbr {
+        if !rate.is_multiple_of(2) {
+            return None;
+        }
+        fields.extend([
+            (5, 5),                // audioObjectType: SBR
+            (index(rate / 2)?, 4), // the core's sampling frequency index
+            (channels as u64, 4),  // channelConfiguration
+            (index(rate)?, 4),     // extensionSamplingFrequencyIndex
+            (2, 5),                // the core's audioObjectType: AAC-LC
+        ]);
+    } else {
+        fields.extend([(2, 5), (index(rate)?, 4), (channels as u64, 4)]);
+    }
+    // GASpecificConfig (§4.4.1): frameLengthFlag, dependsOnCoreCoder,
+    // extensionFlag.
+    fields.extend([(short as u64, 1), (0, 1), (0, 1)]);
+    let n: u32 = fields.iter().map(|f| f.1).sum();
+    let bits = fields.iter().fold(0u64, |acc, &(v, w)| acc << w | v);
+    let bytes = n.div_ceil(8);
+    let bits = bits << (bytes * 8 - n);
+    Some((0..bytes).rev().map(|k| (bits >> (8 * k)) as u8).collect())
+}
+
+/// The text of `<name>…</name>` in `x`, entities undone.
+fn xml_tag(x: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let a = x.find(&open)? + open.len();
+    let b = a + x[a..].find(&format!("</{name}>"))?;
+    let v = x[a..b]
+        .trim()
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
+    Some(v).filter(|v| !v.is_empty())
 }
 
 /// A stream for display and playback.
@@ -379,6 +591,12 @@ pub struct McastScanner {
     pub announced: BTreeMap<(IpAddr, u16), SdpInfo>,
     pub sap_packets: u64,
     win_secs: f64,
+    /// Signal time, seconds (from `tick`).
+    now: f64,
+    /// RTCP sender reports, by SSRC.
+    rtcp: BTreeMap<u32, SenderClock>,
+    /// The latest now-playing message, by station.
+    playing: BTreeMap<String, NowPlaying>,
 }
 
 /// Flows kept at most (a link carrying thousands is not radio).
@@ -435,6 +653,44 @@ impl McastScanner {
         if dport == SAP_PORT {
             return;
         }
+        // RTCP sender reports (RFC 3550 §6.4.1): version 2, packet type 200.
+        if payload.len() >= 28 && payload[0] >> 6 == 2 && payload[1] == 200 {
+            let word = |i: usize| u32::from_be_bytes(payload[i..i + 4].try_into().unwrap());
+            let sr = (word(8) as f64 + word(12) as f64 / 4_294_967_296.0, word(16));
+            let ssrc = word(4);
+            if let Some(c) = self.rtcp.get_mut(&ssrc) {
+                c.last = sr;
+            } else if self.rtcp.len() < MAX_FLOWS {
+                self.rtcp.insert(
+                    ssrc,
+                    SenderClock {
+                        first: sr,
+                        last: sr,
+                    },
+                );
+            }
+            return;
+        }
+        if let Some(at) = payload
+            .get(..payload.len().min(16))
+            .and_then(|h| h.windows(12).position(|w| w == b"<nowplaying>"))
+        {
+            let x = String::from_utf8_lossy(&payload[at..]);
+            if let Some(station) = xml_tag(&x, "station")
+                && (self.playing.len() < 64 || self.playing.contains_key(&station))
+            {
+                let np = NowPlaying {
+                    station: station.clone(),
+                    title: xml_tag(&x, "title"),
+                    artist: xml_tag(&x, "artist"),
+                    kind: xml_tag(&x, "media_type"),
+                    group: info.dst,
+                    port: dport,
+                };
+                self.playing.insert(station, np);
+            }
+            return;
+        }
         let key = (info.dst, dport);
         if !self.flows.contains_key(&key) && self.flows.len() >= MAX_FLOWS {
             return;
@@ -446,6 +702,7 @@ impl McastScanner {
         f.win_bytes += payload.len() as u64;
 
         // RTP: version 2, a steady SSRC, sequence numbers counting up.
+        let prev_seq = f.seq;
         let looks_rtp = payload.len() >= 12
             && payload[0] >> 6 == 2
             && !(72..=76).contains(&(payload[1] & 0x7F)); // not RTCP
@@ -473,11 +730,147 @@ impl McastScanner {
         if c == Codec::Unknown && f.rtp && f.pt == Some(14) && body.len() > 4 {
             c = Codec::sniff(&body[4..]); // RFC 2250's 4-byte MPA header
         }
+        if c == Codec::Unknown
+            && f.rtp
+            && f.pt.is_some_and(|p| p >= 96)
+            && f.first == body.first().copied()
+            && opus_packet_ok(body)
+        {
+            c = Codec::Opus;
+            f.channels = Some(if body[0] & 0x04 != 0 { 2 } else { 1 });
+        }
+        f.first = body.first().copied();
+        if f.rtp && payload.len() >= 12 {
+            // The RTP clock: timestamps' advance against the signal's time,
+            // and the ticks an access unit spans.
+            let ts = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+            let seq = u16::from_be_bytes([payload[2], payload[3]]);
+            let d = f.ts.map(|last| ts.wrapping_sub(last));
+            match d {
+                // Forward, by under three minutes at 96 kHz.
+                Some(d) if d < 1 << 24 => {
+                    f.ts_adv += u64::from(d);
+                    f.t_last = self.now;
+                    if let Some(n) = f.aus.filter(|&n| n > 0)
+                        && prev_seq.is_some_and(|s| s.wrapping_add(1) == seq)
+                        && d > 0
+                        && d.is_multiple_of(n)
+                    {
+                        *f.au_ticks.entry(d / n).or_default() += 1;
+                    }
+                }
+                // The first, or a jump: measure afresh.
+                _ => {
+                    f.t0 = Some(self.now);
+                    f.t_last = self.now;
+                    f.ts_adv = 0;
+                }
+            }
+            f.ts = Some(ts);
+            f.aus = None;
+            if c == Codec::AacRfc3640
+                && let Some(sizes) = rfc3640_aus(body)
+            {
+                f.aus = Some(sizes.len() as u32);
+                // The first raw_data_block's first element (ISO/IEC
+                // 14496-3 §4.4.2.1): 0 a single channel, 1 a channel pair.
+                match body.get(2 + 2 * sizes.len()).map(|b| b >> 5) {
+                    Some(0) => f.channels = Some(1),
+                    Some(1) => f.channels = Some(2),
+                    _ => {}
+                }
+            }
+        }
         *f.sniffed.entry(codec_index(c)).or_default() += 1;
+    }
+
+    /// A flow's RTP clock rate: from its sender's RTCP reports over 1.5 s
+    /// or more, else its timestamps against the signal over 4 s or more.
+    fn clock_rate(&self, f: &Flow) -> Option<u32> {
+        let rtcp = f.ssrc.and_then(|s| self.rtcp.get(&s)).and_then(|c| {
+            let dt = c.last.0 - c.first.0;
+            (dt >= 1.5)
+                .then(|| snap_rate(c.last.1.wrapping_sub(c.first.1) as f64 / dt, 0.01))
+                .flatten()
+        });
+        rtcp.or_else(|| {
+            let dt = f.t_last - f.t0?;
+            (dt >= 4.0)
+                .then(|| snap_rate(f.ts_adv as f64 / dt, 0.03))
+                .flatten()
+        })
+    }
+
+    /// An SDP for an unannounced RTP stream in a dynamic payload type,
+    /// made from what its packets show, once they show enough.
+    fn described(&self, group: IpAddr, port: u16, f: &Flow, codec: Codec) -> Option<SdpInfo> {
+        let pt = f.pt.filter(|&p| f.rtp && p >= 96)?;
+        let stereo = |ch: u8| if ch == 1 { "mono" } else { "stereo" };
+        let (encoding, fmtp, what) = match codec {
+            // RFC 7587 §7: always opus/48000/2, whatever is sent.
+            Codec::Opus => {
+                let ch = f.channels.unwrap_or(2);
+                (
+                    "opus/48000/2".to_string(),
+                    format!("stereo={0}; sprop-stereo={0}", u8::from(ch == 2)),
+                    format!("Opus · {}", stereo(ch)),
+                )
+            }
+            Codec::AacRfc3640 => {
+                let rate = self.clock_rate(f)?;
+                let ch = f.channels?;
+                let ticks = f
+                    .au_ticks
+                    .iter()
+                    .max_by_key(|(_, n)| **n)
+                    .map(|(t, _)| *t)?;
+                let (sbr, short) = match ticks {
+                    1024 => (false, false),
+                    960 => (false, true),
+                    2048 => (true, false),
+                    1920 => (true, true),
+                    _ => return None,
+                };
+                let config = aac_config(rate, ch, sbr, short)?;
+                let hex: String = config.iter().map(|b| format!("{b:02x}")).collect();
+                (
+                    format!("mpeg4-generic/{rate}/{ch}"),
+                    format!(
+                        "streamtype=5; profile-level-id={}; mode=AAC-hbr; config={hex}; \
+                         sizelength=13; indexlength=3; indexdeltalength=3",
+                        if sbr { 44 } else { 41 }
+                    ),
+                    format!(
+                        "{} · {:.1} kHz · {}",
+                        if sbr { "HE-AAC" } else { "AAC-LC" },
+                        rate as f64 / 1000.0,
+                        stereo(ch)
+                    ),
+                )
+            }
+            _ => return None,
+        };
+        let ip = if group.is_ipv4() { "IP4" } else { "IP6" };
+        let raw = format!(
+            "v=0\r\no=- 0 0 IN {ip} {src}\r\ns=-\r\n\
+             i=Not announced: described from its packets ({what})\r\n\
+             c=IN {ip} {group}\r\nt=0 0\r\nm=audio {port} RTP/AVP {pt}\r\n\
+             a=rtpmap:{pt} {encoding}\r\na=fmtp:{pt} {fmtp}\r\n",
+            src = f.src.unwrap_or(group),
+        );
+        let mut s = SdpInfo::parse(&raw);
+        s.inferred = true;
+        Some(s)
+    }
+
+    /// The latest now-playing message from each station, by name.
+    pub fn now_playing(&self) -> Vec<NowPlaying> {
+        self.playing.values().cloned().collect()
     }
 
     /// Signal time passed: update the flow rates once a second's worth is in.
     pub fn tick(&mut self, secs: f64) {
+        self.now += secs;
         self.win_secs += secs;
         if self.win_secs < 1.0 {
             return;
@@ -534,13 +927,20 @@ impl McastScanner {
                     Some(pt) if f.rtp && s.pt != Some(pt) => s.for_pt(pt),
                     _ => s,
                 });
+                // Opus has no sync word, so it must hold for half the
+                // packets, not just win the tally.
                 let sniffed = f
                     .sniffed
                     .iter()
-                    .filter(|(c, _)| **c != codec_index(Codec::Unknown))
+                    .filter(|(c, n)| match CODECS[**c as usize] {
+                        Codec::Unknown => false,
+                        Codec::Opus => **n as u64 * 2 >= f.packets,
+                        _ => true,
+                    })
                     .max_by_key(|(_, n)| **n)
                     .map(|(&c, _)| CODECS[c as usize])
                     .unwrap_or(Codec::Unknown);
+                let sdp = sdp.or_else(|| self.described(group, port, f, sniffed));
                 let codec = match (&sdp, f.rtp) {
                     (Some(s), _) if s.codec() != Codec::Unknown => s.codec(),
                     (_, true) if sniffed == Codec::Unknown => {
@@ -758,5 +1158,173 @@ mod tests {
         assert_eq!(s.pt, Some(96));
         assert_eq!(s.group, Some("239.0.0.9".parse().unwrap()));
         assert_eq!(s.codec(), Codec::AacLatm);
+    }
+
+    /// An RFC 3640 payload of `aus` access units of `size` bytes, each
+    /// starting with a channel-pair element (as a stereo raw_data_block).
+    fn rfc3640(aus: usize, size: usize) -> Vec<u8> {
+        let mut p = ((aus * 16) as u16).to_be_bytes().to_vec();
+        for _ in 0..aus {
+            p.extend_from_slice(&((size as u16) << 3).to_be_bytes());
+        }
+        for _ in 0..aus {
+            let mut au = vec![0x5Au8; size];
+            au[0] = 0x21; // ID_CPE, tag 0, common window
+            p.extend_from_slice(&au);
+        }
+        p
+    }
+
+    /// An RTCP sender report: `ssrc`, NTP time `t` s, RTP timestamp `ts`.
+    fn sender_report(ssrc: u32, t: f64, ts: u32) -> Vec<u8> {
+        let mut p = vec![0x80, 200, 0, 6];
+        p.extend_from_slice(&ssrc.to_be_bytes());
+        p.extend_from_slice(&((3_000_000_000.0 + t) as u32).to_be_bytes());
+        p.extend_from_slice(&((t.fract() * 4_294_967_296.0) as u32).to_be_bytes());
+        p.extend_from_slice(&ts.to_be_bytes());
+        p.extend_from_slice(&[0; 8]);
+        p
+    }
+
+    const SRC: [u8; 4] = [192, 168, 1, 89];
+
+    #[test]
+    fn describes_unannounced_he_aac_from_its_rtcp() {
+        // As a radio multiplex sends it: four 2048-tick AUs a packet at a
+        // 44.1 kHz RTP clock (HE-AAC), RTCP every five seconds, no SAP.
+        let mut s = McastScanner::new();
+        let ssrc = 0x48AB_581F;
+        for k in 0..120u32 {
+            let ts = 0x17BB_51B4u32.wrapping_add(k * 8192);
+            let rtp = rtp_packet(96, k as u16, ts, ssrc, &rfc3640(4, 540));
+            feed(&mut s, &udp_v4(SRC, [225, 0, 0, 20], 6020, 6020, &rtp));
+            if k % 27 == 0 {
+                let t = k as f64 * 8192.0 / 44100.0;
+                let sr = sender_report(ssrc, t, ts);
+                feed(&mut s, &udp_v4(SRC, [225, 0, 0, 20], 6021, 6021, &sr));
+            }
+            s.tick(8192.0 / 44100.0 * 0.97); // our clock a little off
+        }
+        let v = s.streams();
+        assert_eq!(v.len(), 1, "RTCP makes no stream of its own");
+        let a = &v[0];
+        assert_eq!(a.codec, Codec::AacRfc3640);
+        let d = a.sdp.as_ref().expect("described from the packets");
+        assert!(d.inferred);
+        assert_eq!(d.encoding.as_deref(), Some("mpeg4-generic/44100/2"));
+        let fmtp = d.fmtp.as_deref().unwrap();
+        assert!(fmtp.contains("config=2b920800"), "{fmtp}");
+        assert!(
+            d.info
+                .as_deref()
+                .unwrap()
+                .contains("HE-AAC · 44.1 kHz · stereo")
+        );
+        assert_eq!(d.group, Some("225.0.0.20".parse().unwrap()));
+        assert_eq!(d.port, Some(6020));
+    }
+
+    #[test]
+    fn times_an_rtp_clock_without_rtcp() {
+        // Eight 1024-tick AUs a packet (AAC-LC) at 44.1 kHz, no RTCP.
+        let mut s = McastScanner::new();
+        for k in 0..40u32 {
+            let rtp = rtp_packet(96, k as u16, k * 8192, 7, &rfc3640(8, 280));
+            feed(&mut s, &udp_v4(SRC, [225, 0, 0, 2], 6002, 6002, &rtp));
+            s.tick(8192.0 / 44100.0);
+            let early = s.streams().first().is_none_or(|a| a.sdp.is_none());
+            assert!(k > 20 || early, "{k}: too soon to say");
+        }
+        let a = &s.streams()[0];
+        let d = a.sdp.as_ref().expect("timed after four seconds");
+        assert_eq!(d.encoding.as_deref(), Some("mpeg4-generic/44100/2"));
+        assert!(d.fmtp.as_deref().unwrap().contains("config=1210"));
+    }
+
+    #[test]
+    fn finds_unannounced_opus() {
+        // Five 20 ms CELT frames (TOC 0xFF), CBR, 7 bytes of padding.
+        let mut opus = vec![0xFF, 0x45, 0x07];
+        opus.extend((0..5 * 248 + 7).map(|i| (i * 31) as u8));
+        assert!(opus_packet_ok(&opus));
+        let mut s = McastScanner::new();
+        for k in 0..20u32 {
+            let rtp = rtp_packet(96, k as u16, k * 4800, 9, &opus);
+            feed(&mut s, &udp_v4(SRC, [225, 0, 0, 20], 6012, 6012, &rtp));
+        }
+        let a = &s.streams()[0];
+        assert_eq!(a.codec, Codec::Opus);
+        let d = a.sdp.as_ref().unwrap();
+        assert_eq!(d.encoding.as_deref(), Some("opus/48000/2"));
+        assert!(d.fmtp.as_deref().unwrap().contains("stereo=1"));
+
+        // Random bytes in a dynamic payload type are not Opus.
+        let mut s = McastScanner::new();
+        let mut x = 0x1234_5678u32;
+        for k in 0..200u32 {
+            let p: Vec<u8> = (0..300)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                })
+                .collect();
+            let rtp = rtp_packet(96, k as u16, k * 960, 9, &p);
+            feed(&mut s, &udp_v4(SRC, [225, 0, 0, 9], 6000, 6000, &rtp));
+        }
+        assert!(s.streams().is_empty());
+    }
+
+    #[test]
+    fn opus_framing() {
+        assert!(opus_packet_ok(&[0x78, 1, 2, 3])); // code 0
+        assert!(opus_packet_ok(&[0x79, 1, 2])); // code 1: two equal frames
+        assert!(!opus_packet_ok(&[0x79, 1, 2, 3]));
+        assert!(opus_packet_ok(&[0x7A, 2, 9, 9, 8])); // code 2: 2 then 1
+        assert!(!opus_packet_ok(&[0x7A, 9, 9, 9]));
+        // Code 3, VBR, three frames of 1, 2 and 3 bytes.
+        assert!(opus_packet_ok(&[0x7B, 0x83, 1, 2, 7, 8, 8, 9, 9, 9]));
+        // Seven 20 ms frames: 140 ms, more than a packet may hold.
+        assert!(!opus_packet_ok(&[0xFB, 0x07, 0, 0, 0, 0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn audio_specific_configs() {
+        assert_eq!(aac_config(44100, 2, false, false).unwrap(), [0x12, 0x10]);
+        assert_eq!(aac_config(48000, 2, false, false).unwrap(), [0x11, 0x90]);
+        assert_eq!(aac_config(48000, 1, false, true).unwrap(), [0x11, 0x8C]);
+        assert_eq!(
+            aac_config(44100, 2, true, false).unwrap(),
+            [0x2B, 0x92, 0x08, 0x00]
+        );
+        assert_eq!(aac_config(44100, 2, true, false).map(|c| c.len()), Some(4));
+        assert!(aac_config(44000, 2, false, false).is_none());
+    }
+
+    #[test]
+    fn reads_now_playing_messages() {
+        let mut s = McastScanner::new();
+        let x = "<nowplaying><title>Livin&apos; In The City</title><artist>John Butler \
+                 Trio</artist><station>RblCNQ</station><media_type>SONG</media_type>\
+                 <metadata></metadata></nowplaying>";
+        feed(
+            &mut s,
+            &udp_v4(SRC, [225, 0, 0, 98], 1915, 1915, x.as_bytes()),
+        );
+        let y = "<nowplaying><station>BrzMNC</station><media_type>UNSPECIFIED</media_type>\
+                 </nowplaying>";
+        feed(
+            &mut s,
+            &udp_v4(SRC, [225, 0, 0, 98], 1915, 1915, y.as_bytes()),
+        );
+        let n = s.now_playing();
+        assert_eq!(n.len(), 2);
+        assert_eq!(n[0].station, "BrzMNC");
+        assert_eq!(n[0].title, None);
+        assert_eq!(n[1].title.as_deref(), Some("Livin' In The City"));
+        assert_eq!(n[1].artist.as_deref(), Some("John Butler Trio"));
+        assert_eq!(n[1].kind.as_deref(), Some("SONG"));
+        assert!(s.streams().is_empty());
     }
 }

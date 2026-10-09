@@ -6,6 +6,7 @@
 
 mod cidgen;
 mod decode;
+mod mcast;
 mod scene;
 
 use std::path::PathBuf;
@@ -94,6 +95,9 @@ enum Command {
         #[arg(default_value = "tests")]
         dir: PathBuf,
     },
+    /// List the multicast radio in a recorded transport stream (IP from MPE):
+    /// what each stream is, now-playing messages; decode or record them.
+    Mcast(mcast::McastArgs),
     /// Survey a capture: find every carrier and identify each one blind.
     Scan {
         file: PathBuf,
@@ -221,6 +225,7 @@ fn main() -> Result<()> {
             println!("{}", cidgen::summary(&a, cycle));
             Ok(())
         }
+        Command::Mcast(a) => mcast::run(&a),
         Command::Scan {
             file,
             format,

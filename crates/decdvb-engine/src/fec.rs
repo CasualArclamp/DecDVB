@@ -34,9 +34,10 @@ use decdvb_frame::pi2bpsk::pi2_soft;
 use decdvb_frame::vlsnr::{self as vl, Slot};
 use decdvb_frame::{BBHEADER_LEN, BbHeader, BbHeaderError, PlsInfo, StreamFormat, bb_scramble};
 use decdvb_gse::{GseIp, IpPacket, Source, Variant, VariantReport};
-use decdvb_ip::mcast::udp_payload;
+use decdvb_ip::mcast::{NowPlaying, udp_payload};
 use decdvb_ip::{
-    AudioRelay, AudioStream, Flow, IpInfo, IpStats, McastScanner, PcapWriter, PlayTarget,
+    AudioRelay, AudioStream, Codec, Flow, IpInfo, IpStats, McastScanner, PcapWriter, PlayTarget,
+    Reassembler,
 };
 use decdvb_ts::{
     MpeExtractor, MpeStats, TS_LEN, TcpSink, TsAnalyser, TsDeframer, TsFile, TsReport, UdpSink,
@@ -663,6 +664,11 @@ pub struct GseView {
     pub link: Option<String>,
     /// Multicast audio streams found, by address.
     pub audio: Vec<AudioStream>,
+    /// Now-playing messages, the latest from each station.
+    pub now_playing: Vec<NowPlaying>,
+    /// IPv4 fragments seen, datagrams rebuilt from them, and datagrams
+    /// given up (a piece lost).
+    pub fragments: (u64, u64, u64),
     pub sap_packets: u64,
     /// Stations announced (SAP or bare SDP): group, port and what the SDP
     /// says — their names, whether or not their streams are seen.
@@ -850,6 +856,8 @@ struct IpStage {
     hdlc: Option<(u64, decdvb_modem::payload::Fcs)>,
     /// Text in the payloads.
     text: decdvb_modem::text::ByteText,
+    /// IPv4 fragments put back together.
+    frags: Reassembler,
 }
 
 impl IpStage {
@@ -869,6 +877,7 @@ impl IpStage {
             mpe: None,
             hdlc: None,
             text: decdvb_modem::text::ByteText::new(),
+            frags: Reassembler::new(),
             gse: GseIp::new(),
             stats: IpStats::default(),
             packets: Vec::new(),
@@ -994,11 +1003,34 @@ impl IpStage {
         self.mpe = Some(stats.clone());
     }
 
-    /// One IP packet, wherever it came from.
+    /// One IP packet, wherever it came from. The statistics and the PCAP
+    /// take packets as sent (Wireshark reassembles for itself); what reads
+    /// the payloads takes whole datagrams, fragments put back together.
     fn ip(&mut self, data: &[u8], info: &IpInfo) {
-        self.text.push_unit(ip_payload(data, info));
         self.stats.add(info);
         self.win.0 += data.len() as f64;
+        if let Some(w) = &mut self.pcap
+            && let Err(e) = w.write(SystemTime::now(), data)
+        {
+            self.error = Some(e.to_string());
+            self.pcap = None;
+        }
+        // `Cow`: borrowed when the packet was whole, owned when rebuilt.
+        let Some(whole) = self.frags.push(data, info) else {
+            return;
+        };
+        let rebuilt;
+        let (data, info) = match &whole {
+            std::borrow::Cow::Borrowed(d) => (*d, info),
+            std::borrow::Cow::Owned(d) => match decdvb_ip::parse(d) {
+                Some(i) => {
+                    rebuilt = i;
+                    (d.as_slice(), &rebuilt)
+                }
+                None => return,
+            },
+        };
+        self.text.push_unit(ip_payload(data, info));
         self.mcast.packet(data, info);
         if (self.audio_want.is_some() || self.record_want.is_some())
             && let Some((payload, _, dport)) = udp_payload(data, info)
@@ -1017,12 +1049,6 @@ impl IpStage {
             {
                 r.packet(payload);
             }
-        }
-        if let Some(w) = &mut self.pcap
-            && let Err(e) = w.write(SystemTime::now(), data)
-        {
-            self.error = Some(e.to_string());
-            self.pcap = None;
         }
     }
 
@@ -1077,6 +1103,12 @@ impl IpStage {
                 format!("HDLC ({fcs}) · {n} frames with IP")
             }),
             audio: self.audio.clone(),
+            now_playing: self.mcast.now_playing(),
+            fragments: (
+                self.frags.fragments,
+                self.frags.reassembled,
+                self.frags.dropped,
+            ),
             sap_packets: self.mcast.sap_packets,
             stations: self.mcast.stations(),
             audio_playing: self.audio_want,
@@ -1103,12 +1135,15 @@ impl IpStage {
     }
 
     /// The stream at `want`, once it has been heard enough to know how it
-    /// is carried.
+    /// is carried — for RFC 3640 AAC and Opus, once there is an SDP for it
+    /// (announced, or made from its packets after a few seconds).
     fn heard(&self, want: SocketAddr) -> Option<AudioStream> {
-        self.mcast
-            .streams()
-            .into_iter()
-            .find(|a| a.group == want.ip() && a.port == want.port() && a.packets >= 8)
+        self.mcast.streams().into_iter().find(|a| {
+            a.group == want.ip()
+                && a.port == want.port()
+                && a.packets >= 8
+                && (a.sdp.is_some() || !matches!(a.codec, Codec::AacRfc3640 | Codec::Opus))
+        })
     }
 
     /// Close the recording, keeping its name and size for display.
@@ -1835,6 +1870,71 @@ mod tests {
     use decdvb_frame::StreamFormat;
     use decdvb_mod::{FrameSpec, PlFramer, Shaper, TsBbFramer};
     use std::f64::consts::TAU;
+
+    #[test]
+    fn ip_stage_reassembles_fragmented_rtp_aac() {
+        use decdvb_ip::frag::fragment;
+        use decdvb_ip::mcast::rtp_packet;
+        use decdvb_ip::packet::udp_v4;
+        // As a radio multiplex sends it over MPE: RFC 3640 AAC, four 2048-
+        // tick AUs a packet (HE-AAC at 44.1 kHz), each 2.2 kB RTP packet in
+        // two IPv4 fragments, RTCP sender reports alongside, no SAP.
+        let mut st = IpStage::new();
+        let au = |n: usize| {
+            let mut p = ((n * 16) as u16).to_be_bytes().to_vec();
+            for _ in 0..n {
+                p.extend_from_slice(&(540u16 << 3).to_be_bytes());
+            }
+            for _ in 0..n {
+                p.push(0x21); // a channel pair element
+                p.extend_from_slice(&[0x5A; 539]);
+            }
+            p
+        };
+        let src = [192, 168, 1, 89];
+        let group = [225, 0, 0, 20];
+        for k in 0..60u32 {
+            let rtp = rtp_packet(96, k as u16, k * 8192, 0x48AB, &au(4));
+            let mut d = udp_v4(src, group, 6020, 6020, &rtp);
+            d[4..6].copy_from_slice(&(k as u16).to_be_bytes()); // IP id
+            let sum = decdvb_ip::packet::checksum(&{
+                let mut h = d[..20].to_vec();
+                h[10..12].copy_from_slice(&[0, 0]);
+                h
+            });
+            d[10..12].copy_from_slice(&sum.to_be_bytes());
+            let f = fragment(&d, 1500);
+            assert_eq!(f.len(), 2);
+            for p in &f {
+                st.ip(p, &decdvb_ip::parse(p).unwrap());
+            }
+            if k % 25 == 0 {
+                let t = k as f64 * 8192.0 / 44100.0;
+                let mut sr = vec![0x80, 200, 0, 6, 0, 0, 0x48, 0xAB];
+                sr.extend_from_slice(&((3e9 + t) as u32).to_be_bytes());
+                sr.extend_from_slice(&((t.fract() * 4_294_967_296.0) as u32).to_be_bytes());
+                sr.extend_from_slice(&(k * 8192).to_be_bytes());
+                sr.extend_from_slice(&[0; 8]);
+                let p = udp_v4(src, group, 6021, 6021, &sr);
+                st.ip(&p, &decdvb_ip::parse(&p).unwrap());
+            }
+            st.tick(8192.0 / 44100.0);
+        }
+        let v = st.view();
+        assert_eq!(v.fragments, (120, 60, 0));
+        assert_eq!(
+            v.packets,
+            120 + 3,
+            "link statistics count fragments as sent"
+        );
+        assert_eq!(v.audio.len(), 1);
+        let a = &v.audio[0];
+        assert_eq!(a.codec, Codec::AacRfc3640);
+        let sdp = a.sdp.as_ref().expect("described from the packets");
+        assert!(sdp.fmtp.as_deref().unwrap().contains("config=2b920800"));
+        // Heard enough to play.
+        assert!(st.heard(SocketAddr::new(a.group, a.port)).is_some());
+    }
 
     /// A real DVB-S2 signal: `schedule` frames, shaped at 4 samples per
     /// symbol, offset by `cycles` per symbol, at `esn0_db`.

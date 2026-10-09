@@ -590,6 +590,7 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
     // usually after on a carrier that has them.
     if let Some(g) = st.fec.as_ref().and_then(|f| f.gse.as_ref()) {
         audio_card(ui, g, v.id, v.settings.audio_external, &mut actions);
+        now_playing_card(ui, g);
     }
     // A demodulating VFO leads with its own state and constellation; how it
     // acquired (Identify's view) folds away below.
@@ -2154,6 +2155,51 @@ fn fec_card(ui: &mut Ui, f: &FecStats) {
     });
 }
 
+/// What the stations say is playing, from `<nowplaying>` messages in the IP:
+/// station, artist and title, and what kind of item it is.
+fn now_playing_card(ui: &mut Ui, g: &GseView) {
+    if g.now_playing.is_empty() {
+        return;
+    }
+    let from = &g.now_playing[0];
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new(format!("Now playing ({})", g.now_playing.len()))
+        .id_salt("now_playing")
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::Grid::new("now_playing_grid")
+                .num_columns(3)
+                .striped(true)
+                .show(ui, |ui| {
+                    for n in &g.now_playing {
+                        ui.label(RichText::new(&n.station).strong().monospace());
+                        let what = match (&n.artist, &n.title) {
+                            (Some(a), Some(t)) => format!("{a} – {t}"),
+                            (None, Some(t)) => t.clone(),
+                            (Some(a), None) => a.clone(),
+                            (None, None) => "—".into(),
+                        };
+                        ui.label(what);
+                        ui.label(
+                            RichText::new(n.kind.as_deref().unwrap_or("").to_lowercase())
+                                .small()
+                                .weak(),
+                        );
+                        ui.end_row();
+                    }
+                });
+            ui.label(
+                RichText::new(format!(
+                    "from {}:{} · stations are named by their own codes, not \
+                     linked to the streams above",
+                    from.group, from.port
+                ))
+                .small()
+                .weak(),
+            );
+        });
+}
+
 /// Multicast audio found in the IP, by address: name (from SAP), codec and
 /// rate, with play (in the app, or in VLC/PotPlayer) and record buttons.
 /// `external` is whether the stream asked for plays in an external player.
@@ -2570,6 +2616,23 @@ fn gse_card(ui: &mut Ui, g: &GseView) {
         if g.ip_bps > 0.0 {
             ui.label("IP rate");
             ui.label(format::bitrate(g.ip_bps));
+            ui.end_row();
+        }
+        let (frags, rebuilt, lost) = g.fragments;
+        if frags > 0 {
+            ui.label("Fragments");
+            ui.label(format!(
+                "{frags} IPv4 fragments → {rebuilt} datagrams{}",
+                if lost > 0 {
+                    format!(" · {lost} incomplete")
+                } else {
+                    String::new()
+                }
+            ))
+            .on_hover_text(
+                "Datagrams larger than the link's MTU arrive in pieces (RFC 791); \
+                 they are put back together before the audio and text are read",
+            );
             ui.end_row();
         }
         if !g.protocols.is_empty() {

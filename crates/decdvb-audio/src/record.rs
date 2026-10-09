@@ -6,7 +6,8 @@
 //! - AAC of any carriage (ADTS, LATM, RFC 3640) as ADTS: `.aac`, which every
 //!   player opens and which keeps HE-AAC's SBR and PS data intact;
 //! - PCM as 16-bit `.wav`;
-//! - MPEG-TS as `.ts`.
+//! - MPEG-TS as `.ts`;
+//! - Opus in Ogg (RFC 7845): `.opus`.
 
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
@@ -26,6 +27,8 @@ pub struct AudioRecorder {
     path: Option<PathBuf>,
     /// WAV: (sample rate, channels, data bytes) for the header.
     wav: Option<(u32, u16, u64)>,
+    /// Ogg Opus: the page writer.
+    ogg: Option<OggOpus>,
     units: Vec<Unit>,
     /// Bytes written.
     pub bytes: u64,
@@ -43,6 +46,7 @@ impl AudioRecorder {
             file: None,
             path: None,
             wav: None,
+            ogg: None,
             units: Vec::new(),
             bytes: 0,
             error: None,
@@ -81,6 +85,7 @@ impl AudioRecorder {
             Unit::Aac(..) => "aac",
             Unit::Pcm { .. } => "wav",
             Unit::Ts(_) => "ts",
+            Unit::Opus(_) => "opus",
         };
         std::fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
         let path = self.dir.join(format!("{}.{ext}", self.stem));
@@ -90,6 +95,18 @@ impl AudioRecorder {
             w.write_all(&wav_header(*rate, *channels, 0))
                 .map_err(|e| e.to_string())?;
             self.wav = Some((*rate, *channels, 0));
+        }
+        if let Unit::Opus(p) = u {
+            // Stereo by the first packet's TOC byte (RFC 6716 §3.1).
+            let channels = if p[0] & 0x04 != 0 { 2 } else { 1 };
+            let mut ogg = OggOpus {
+                serial: std::process::id() ^ 0x0D_EC_D7_B5,
+                seq: 0,
+                granule: 0,
+            };
+            w.write_all(&ogg.headers(channels))
+                .map_err(|e| e.to_string())?;
+            self.ogg = Some(ogg);
         }
         self.file = Some(w);
         self.path = Some(path);
@@ -124,6 +141,11 @@ impl AudioRecorder {
                 }
                 b.len()
             }
+            Unit::Opus(p) => {
+                let page = self.ogg.as_mut().map(|o| o.packet(p)).unwrap_or_default();
+                w.write_all(&page).map_err(|e| e.to_string())?;
+                page.len()
+            }
         };
         self.bytes += n as u64;
         Ok(())
@@ -148,6 +170,104 @@ impl Drop for AudioRecorder {
     fn drop(&mut self) {
         let _ = self.finish();
     }
+}
+
+/// Samples (at 48 kHz) in an Opus packet: its frames times their length
+/// (RFC 6716 §3.1–3.2).
+fn opus_samples(p: &[u8]) -> u64 {
+    let Some(&toc) = p.first() else {
+        return 0;
+    };
+    let config = toc >> 3;
+    // Frame length in 48 kHz samples (§3.1, Table 2): SILK, hybrid, CELT.
+    let frame = match config {
+        0..=11 => [480, 960, 1920, 2880][(config % 4) as usize],
+        12..=15 => [480, 960][(config % 2) as usize],
+        _ => [120, 240, 480, 960][(config % 4) as usize],
+    };
+    let frames = match toc & 3 {
+        0 => 1,
+        1 | 2 => 2,
+        _ => p.get(1).map_or(0, |c| c & 0x3F) as u64,
+    };
+    frame * frames
+}
+
+/// Ogg Opus (RFC 7845): the ID and comment headers, then each packet in a
+/// page of its own, its granule position the samples so far at 48 kHz.
+struct OggOpus {
+    serial: u32,
+    seq: u32,
+    granule: u64,
+}
+
+impl OggOpus {
+    /// The ID header (§5.1) and comment header (§5.2), a page each.
+    fn headers(&mut self, channels: u8) -> Vec<u8> {
+        let mut head = b"OpusHead".to_vec();
+        head.push(1); // version
+        head.push(channels);
+        head.extend_from_slice(&0u16.to_le_bytes()); // pre-skip: not known
+        head.extend_from_slice(&48_000u32.to_le_bytes()); // input rate
+        head.extend_from_slice(&0i16.to_le_bytes()); // output gain
+        head.push(0); // channel mapping family 0: mono or stereo
+        let mut tags = b"OpusTags".to_vec();
+        let vendor = b"DecDVB";
+        tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        tags.extend_from_slice(vendor);
+        tags.extend_from_slice(&0u32.to_le_bytes()); // no comments
+        let mut out = self.page(&head, 0x02, 0); // beginning of stream
+        out.extend(self.page(&tags, 0, 0));
+        out
+    }
+
+    /// One audio packet's page.
+    fn packet(&mut self, p: &[u8]) -> Vec<u8> {
+        self.granule += opus_samples(p);
+        self.page(p, 0, self.granule)
+    }
+
+    /// A page holding one packet (Ogg, RFC 3533 §6): lacing values of 255
+    /// then the remainder, so the packet must be under 255 × 255 bytes.
+    fn page(&mut self, packet: &[u8], flags: u8, granule: u64) -> Vec<u8> {
+        if packet.len() >= 255 * 255 {
+            return Vec::new();
+        }
+        let mut lacing = vec![255u8; packet.len() / 255];
+        lacing.push((packet.len() % 255) as u8);
+        let mut h = Vec::with_capacity(27 + lacing.len() + packet.len());
+        h.extend_from_slice(b"OggS");
+        h.push(0); // version
+        h.push(flags);
+        h.extend_from_slice(&granule.to_le_bytes());
+        h.extend_from_slice(&self.serial.to_le_bytes());
+        h.extend_from_slice(&self.seq.to_le_bytes());
+        h.extend_from_slice(&[0; 4]); // CRC, filled in below
+        h.push(lacing.len() as u8);
+        h.extend_from_slice(&lacing);
+        h.extend_from_slice(packet);
+        let crc = ogg_crc(&h);
+        h[22..26].copy_from_slice(&crc.to_le_bytes());
+        self.seq += 1;
+        h
+    }
+}
+
+/// Ogg's page CRC (RFC 3533 §6): CRC-32, polynomial 0x04C11DB7, MSB first,
+/// starting from zero with no final inversion.
+fn ogg_crc(b: &[u8]) -> u32 {
+    let mut c = 0u32;
+    for &x in b {
+        c ^= u32::from(x) << 24;
+        for _ in 0..8 {
+            c = if c & 0x8000_0000 != 0 {
+                (c << 1) ^ 0x04C1_1DB7
+            } else {
+                c << 1
+            };
+        }
+    }
+    c
 }
 
 /// A 44-byte PCM WAV header for `data` bytes of 16-bit audio.
@@ -230,6 +350,52 @@ mod tests {
         let h = crate::es::AdtsHeader::parse(&b).unwrap();
         assert_eq!(h.frame_len, 7 + au.len());
         assert_eq!(&b[7..7 + au.len()], &au[..]);
+    }
+
+    #[test]
+    fn opus_goes_into_ogg() {
+        let d = dir("opus");
+        let mut r = AudioRecorder::start(&stream(true, Some(96), Codec::Opus), &d, "o").unwrap();
+        // Five 20 ms CELT frames (TOC 0xFF: stereo, code 3), CBR.
+        let mut p = vec![0xFF, 0x05];
+        p.extend_from_slice(&[0x11; 5 * 100]);
+        for k in 0..3u16 {
+            r.packet(&rtp_packet(96, k, k as u32 * 4800, 1, &p));
+        }
+        let path = r.path().unwrap().to_path_buf();
+        drop(r);
+        let b = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(path.extension().unwrap(), "opus");
+        // Pages: OpusHead, OpusTags, then three of audio.
+        let mut at = 0;
+        let mut pages = Vec::new();
+        while at < b.len() {
+            assert_eq!(&b[at..at + 4], b"OggS");
+            let mut page = b[at..].to_vec();
+            let n = page[26] as usize;
+            let body: usize = page[27..27 + n].iter().map(|&l| l as usize).sum();
+            page.truncate(27 + n + body);
+            let crc = u32::from_le_bytes(page[22..26].try_into().unwrap());
+            page[22..26].copy_from_slice(&[0; 4]);
+            assert_eq!(ogg_crc(&page), crc);
+            let granule = u64::from_le_bytes(page[6..14].try_into().unwrap());
+            pages.push((page[27 + n..].to_vec(), granule));
+            at += page.len();
+        }
+        assert_eq!(pages.len(), 5);
+        assert_eq!(&pages[0].0[..8], b"OpusHead");
+        assert_eq!(pages[0].0[9], 2, "stereo");
+        assert_eq!(&pages[1].0[..8], b"OpusTags");
+        assert_eq!(pages[2].0, p);
+        assert_eq!(pages[4].1, 3 * 4800);
+    }
+
+    #[test]
+    fn ogg_crc_matches_a_known_page() {
+        // CRC-32/POSIX (cksum) without its final inversion: the check
+        // value 0x765E7680 inverted.
+        assert_eq!(ogg_crc(b"123456789"), 0x89A1_897F);
     }
 
     #[test]

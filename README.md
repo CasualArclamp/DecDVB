@@ -48,7 +48,7 @@ TPC 2964 carrier). Every carrier was found and identified blind.*
 | **GSE → IP → PCAP** + live IP stats; GSE variant detected from the data | ✅ |
 | **MPEG-TS**: services, PIDs, errors; `.ts` file, UDP, TCP/HTTP to VLC or PotPlayer | ✅ |
 | **TS analyser** (EBSPro-style): PIDs, services, now/next, network, tables | ✅ |
-| **Multicast audio** from GSE or MPE: SAP/SDP names, codecs; play in the app (volume, pause) or VLC/PotPlayer; record to file | ✅ |
+| **Multicast audio** from GSE or MPE: SAP/SDP names, codecs; unannounced RTP AAC and Opus described from their packets; IPv4 fragments reassembled; now-playing messages; play in the app (volume, pause) or VLC/PotPlayer; record to file | ✅ checked on a recording of a live MPE radio multiplex |
 | Modulator (HackRF TX / IQ file) | M6 |
 
 ## Using it
@@ -133,16 +133,25 @@ Satellite links carry radio as IP multicast — in GSE, or in MPE inside a
 transport stream (both are read). Any DVB-S2 IP or TS VFO lists the audio
 streams it finds under **Multicast audio**: named from SAP/SDP announcements
 where there are any, with codec (AAC in ADTS, LATM/LOAS or RFC 3640, MPEG
-audio, PCM), bitrate and RTP payload type, listed by address.
+audio, PCM, Opus), bitrate and RTP payload type, listed by address.
+
+Streams with no announcement are described from their own packets: RFC 3640
+AAC by its RTP clock rate (from RTCP sender reports, else timed against the
+signal), the clock ticks an access unit spans (1024: AAC-LC; 2048: HE-AAC)
+and its first element (mono or stereo); Opus by packets that parse as Opus.
+IPv4 fragments are put back together first — a multiplex packing several
+AUs into a 2.3 kB RTP packet sends each as two. `<nowplaying>` messages
+(title, artist, station) are listed under **Now playing**.
 
 - **▶ Play** decodes it in DecDVB: MPEG audio layers I–III, AAC-LC (from
   ADTS, LATM/LOAS or RFC 3640) and PCM/G.711, with **⏸ Pause** (resumes
   live), **⏹ Stop**, a level meter, and the volume slider and 🔊 mute at the
   top of the list (app-wide, remembered). HE-AAC plays its AAC-LC core —
-  band-limited; open it in VLC for the full sound. Opus is not decoded here.
+  band-limited; open it in VLC for the full sound. Opus is not decoded here
+  (record it, or open it in VLC).
 - **⏺ Record** saves the stream to the output folder as broadcast, with no
   re-encoding: `.mp2`/`.mp3`, `.aac` (ADTS, any AAC carriage, HE-AAC intact),
-  `.wav` for PCM, `.ts` for TS in UDP.
+  `.wav` for PCM, `.ts` for TS in UDP, `.opus` (Ogg) for Opus.
 - **… → Open in VLC / PotPlayer**: an RTP stream with a description is
   relayed to a local port and the player is given an SDP file (so it decodes
   HE-AAC, LATM and the rest itself); a bare elementary stream is served at a
@@ -313,6 +322,7 @@ decdvb scan capture_8Msps.cs8     # find every carrier and identify each
 decdvb scene                      # write the 8 MS/s test scene above
 decdvb cid                        # a DVB-S2 carrier with a DVB-CID under it
 decdvb test-signals tests         # both, into tests/ (see tests/README.md)
+decdvb mcast recording.ts --decode --record out   # the radio in a .ts (MPE)
 decdvb modcods                    # the DVB-S2 MODCOD table
 ```
 

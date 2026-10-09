@@ -1224,3 +1224,35 @@ over carried to the next block; the mode is fixed when a recording starts;
 the name ends -bits). Checked on the 10 kBd QPSK capture: 60 209 symbols →
 15 052 bytes, equal to the Gray labels unpacked. Also fixed: four tooltips
 whose line continuations had been lost (long runs of spaces in the text).
+
+## MPE radio: fragments, unannounced AAC and Opus, now playing (2026-10-10)
+
+A live DVB-S2 TS carrier (867 kbit/s, MPE on PID 0x0020) carries eight
+radio streams to 225.0.0.x with no SAP: none was listed. Its RTP packets
+hold four or eight AAC access units, 2.3 kB, so each crosses the 1500-byte
+MTU as two IPv4 fragments — and only the first, cut short, was being read.
+
+- `decdvb-ip::frag::Reassembler` (RFC 791 §3.2): keyed by source,
+  destination, protocol and id; pieces in any order; a datagram whose pieces
+  stop is dropped after 4096 packets, 64 held at most. The IP stage counts
+  and records packets as sent (Wireshark reassembles itself) and reads
+  payloads — text, multicast, audio — from whole datagrams.
+- The scanner describes unannounced RTP in a dynamic payload type: RFC 3640
+  by any number of 13/3-bit AU headers summing to the payload; the RTP clock
+  from RTCP sender reports (NTP against RTP over ≥ 1.5 s, snapped within
+  1 %) or its timestamps against signal time (≥ 4 s, within 3 %); AU ticks
+  1024/960 → AAC-LC, 2048/1920 → HE-AAC (explicit SBR signalling, object
+  type 5, ISO/IEC 14496-3 §1.6.5); the first element SCE/CPE → mono/stereo.
+  Opus (RFC 7587) by packets that parse under RFC 6716 §3.2 with a steady
+  TOC byte, in at least half the packets. The SDP made (`SdpInfo::inferred`)
+  feeds the in-app decoder and the external player alike.
+- Opus records to Ogg Opus (RFC 7845, a page a packet); it is not decoded in
+  the app.
+- `<nowplaying>` XML (title, artist, station, media_type) is read into a
+  **Now playing** list; its station codes are not tied to the streams.
+- `decdvb mcast file.ts [--decode] [--record dir] [--ts-rate bps]`.
+
+On the recording (24.8 s): two AAC-LC and five HE-AAC streams at 44.1 kHz
+stereo and one Opus at 48 kHz, all from RTCP; the seven AAC decode with 0
+errors; ffmpeg reads the .aac as HE-AAC/LC and the .opus as 24.7 s of
+stereo Opus; the HE-AAC SDP, replayed over RTP into ffmpeg, decodes.

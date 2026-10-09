@@ -1,8 +1,9 @@
-//! IP out of DVB-S2: packet validation, a PCAP writer, live statistics, the
-//! blind IPv4 search (see `docs/DESIGN.md` §6 and Appendix B), multicast
+//! IP out of DVB-S2: packet validation, IPv4 fragment reassembly (`frag`),
+//! a PCAP writer, live statistics, the blind IPv4 search (see `docs/DESIGN.md` §6 and Appendix B), multicast
 //! audio detection (`mcast`) and playback (`relay`), and a streaming server
 //! for media players (`serve`).
 
+pub mod frag;
 pub mod mcast;
 pub mod packet;
 pub mod pcap;
@@ -10,6 +11,7 @@ pub mod relay;
 pub mod serve;
 pub mod stats;
 
+pub use frag::Reassembler;
 pub use mcast::{AudioStream, Codec, McastScanner, SdpInfo};
 pub use packet::{IpInfo, blind_ipv4_search, parse};
 pub use pcap::PcapWriter;

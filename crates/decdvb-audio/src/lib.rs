@@ -9,7 +9,8 @@
 //! - [`record`]: the stream to a file as broadcast.
 //!
 //! HE-AAC plays as its AAC-LC core (Symphonia has no SBR); open the stream in
-//! VLC for full bandwidth. Opus is not decoded here.
+//! VLC for full bandwidth. Opus is not decoded here: it records to Ogg Opus
+//! and plays in VLC.
 
 pub mod aac;
 pub mod bits;

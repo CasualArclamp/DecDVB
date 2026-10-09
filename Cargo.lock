@@ -591,6 +591,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
+ "decdvb-audio",
  "decdvb-core",
  "decdvb-dsp",
  "decdvb-engine",
@@ -599,6 +600,7 @@ dependencies = [
  "decdvb-ip",
  "decdvb-mod",
  "decdvb-modem",
+ "decdvb-ts",
 ]
 
 [[package]]

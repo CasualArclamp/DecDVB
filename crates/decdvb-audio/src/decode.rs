@@ -77,6 +77,7 @@ impl Decoder {
                 Ok(())
             }
             Unit::Ts(_) => Err("MPEG-TS is recorded, not played".into()),
+            Unit::Opus(_) => Err("Opus is recorded, not played".into()),
         };
         match r {
             Ok(()) if !out.samples.is_empty() => {
