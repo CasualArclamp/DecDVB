@@ -104,7 +104,7 @@ enum Command {
         /// Sample rate; taken from the file name (…_320000Sps…) when omitted.
         #[arg(long)]
         rate: Option<f64>,
-        /// Decoder: id, ip, ts, dvbs, tpc, psk.
+        /// Decoder: id, ip, ts, dvbs, tpc, fastlink, psk.
         #[arg(long, default_value = "id")]
         decoder: String,
         /// VFO centre relative to the capture's centre, Hz.

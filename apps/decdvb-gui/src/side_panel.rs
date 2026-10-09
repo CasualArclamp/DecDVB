@@ -339,7 +339,8 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
 
             if s.decoder.outputs_ts() {
                 let ts = st.fec.as_ref().and_then(|f| f.ts.as_ref());
-                let tpc = s.decoder == DecoderKind::Tpc2964;
+                // A coded modem's raw data are recorded as well as the TS.
+                let tpc = matches!(s.decoder, DecoderKind::Tpc2964 | DecoderKind::FastLink);
                 ui.label(if tpc { "Record" } else { "TS file" });
                 ui.horizontal(|ui| {
                     let (label, tip) = match (s.record, tpc) {
@@ -593,10 +594,16 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
         }
     }
 
-    if v.settings.decoder == DecoderKind::Tpc2964
-        && let Some(c) = &st.carrier
+    if matches!(
+        v.settings.decoder,
+        DecoderKind::Tpc2964 | DecoderKind::FastLink
+    ) && let Some(c) = &st.carrier
     {
-        tpc_card(ui, c, &st);
+        if v.settings.decoder == DecoderKind::FastLink {
+            fastlink_card(ui, c, &st);
+        } else {
+            tpc_card(ui, c, &st);
+        }
         if let Some(e) = st.fec.as_ref().and_then(|f| f.e1.as_ref()) {
             e1_card(ui, e, v, &mut actions);
         }
@@ -936,7 +943,6 @@ fn tpc_card(ui: &mut Ui, c: &CarrierState, st: &VfoStatus) {
     ui.label(RichText::new("TPC 2964 (IESS-315)").strong());
     let f = st.fec.as_ref();
     let t = f.and_then(|f| f.tpc.as_ref());
-    let p = f.and_then(|f| f.payload.as_ref());
     egui::Grid::new("tpc").num_columns(2).show(ui, |ui| {
         carrier_rows(ui, c);
         if let Some(rs) = st.symbol_rate {
@@ -995,48 +1001,109 @@ fn tpc_card(ui: &mut Ui, c: &CarrierState, st: &VfoStatus) {
             );
             ui.end_row();
         }
-        if let Some(p) = p {
-            ui.label("Payload");
-            match &p.found {
-                Some(how) => {
-                    ui.label(how);
-                }
-                None => {
-                    ui.colored_label(
-                        wait,
-                        format!("not recognised yet ({} frames looked at)", p.probed),
-                    )
-                    .on_hover_text(
-                        "HDLC (IP) and MPEG-TS are tried under each descrambler. \
-                         Recording writes the data as they are meanwhile.",
-                    );
-                }
+        payload_rows(ui, f);
+    });
+}
+
+/// A coded modem's payload (TPC 2964, FastLink): what the data carry, their
+/// rate and the data file, as rows of the caller's grid.
+fn payload_rows(ui: &mut Ui, f: Option<&FecStats>) {
+    let wait = Color32::from_rgb(240, 200, 80);
+    if let Some(p) = f.and_then(|f| f.payload.as_ref()) {
+        ui.label("Payload");
+        match &p.found {
+            Some(how) => {
+                ui.label(how);
             }
-            ui.end_row();
-            if p.hdlc_good + p.hdlc_bad > 0 {
-                ui.label("HDLC");
-                ui.label(format!("{} frames · {} bad FCS", p.hdlc_good, p.hdlc_bad));
-                ui.end_row();
+            None => {
+                ui.colored_label(
+                    wait,
+                    format!("not recognised yet ({} frames looked at)", p.probed),
+                )
+                .on_hover_text(
+                    "HDLC (IP), MPEG-TS, E1 and D&I++ are tried under each descrambler. \
+                     Recording writes the data as they are meanwhile.",
+                );
             }
         }
-        if let Some(f) = f
-            && f.payload_bps > 0.0
-        {
-            ui.label("Data rate");
-            ui.label(format::bitrate(f.payload_bps));
+        ui.end_row();
+        if p.hdlc_good + p.hdlc_bad > 0 {
+            ui.label("HDLC");
+            ui.label(format!("{} frames · {} bad FCS", p.hdlc_good, p.hdlc_bad));
             ui.end_row();
         }
-        if let Some((path, bytes)) = f.and_then(|f| f.raw_file.as_ref()) {
-            ui.label("Data file");
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-            let txt = format!("{} ({})", name.unwrap_or_default(), format::bytes(*bytes));
-            if f.is_some_and(|f| f.raw_active) {
-                ui.colored_label(Color32::from_rgb(230, 90, 90), format!("● {txt}"));
-            } else {
-                ui.label(format!("{txt}, stopped"));
-            }
+    }
+    if let Some(f) = f
+        && f.payload_bps > 0.0
+    {
+        ui.label("Data rate");
+        ui.label(format::bitrate(f.payload_bps));
+        ui.end_row();
+    }
+    if let Some((path, bytes)) = f.and_then(|f| f.raw_file.as_ref()) {
+        ui.label("Data file");
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        let txt = format!("{} ({})", name.unwrap_or_default(), format::bytes(*bytes));
+        if f.is_some_and(|f| f.raw_active) {
+            ui.colored_label(Color32::from_rgb(230, 90, 90), format!("● {txt}"));
+        } else {
+            ui.label(format!("{txt}, stopped"));
+        }
+        ui.end_row();
+    }
+}
+
+/// A Q-Flex FastLink VFO: the carrier, the sync word, the LDPC decoder,
+/// and what the data carry.
+fn fastlink_card(ui: &mut Ui, c: &CarrierState, st: &VfoStatus) {
+    let good = Color32::from_rgb(110, 220, 110);
+    let wait = Color32::from_rgb(240, 200, 80);
+    ui.add_space(6.0);
+    ui.label(RichText::new("Q-Flex FastLink (QPSK 0.710)").strong());
+    let f = st.fec.as_ref();
+    let t = f.and_then(|f| f.fastlink.as_ref());
+    egui::Grid::new("fastlink").num_columns(2).show(ui, |ui| {
+        carrier_rows(ui, c);
+        if let Some(rs) = st.symbol_rate {
+            ui.label("Symbol rate");
+            ui.label(format::rate(rs));
             ui.end_row();
         }
+        ui.label("Sync word");
+        match t {
+            Some(t) if t.locked => ui.colored_label(
+                good,
+                format!(
+                    "every 11 538 symbols · {}{}",
+                    t.orientation.as_deref().unwrap_or("?"),
+                    if t.uw_misses > 0 {
+                        format!(" · {} missed", t.uw_misses)
+                    } else {
+                        String::new()
+                    }
+                ),
+            ),
+            _ => ui.colored_label(wait, "searching…"),
+        };
+        ui.end_row();
+        if let Some(t) = t.filter(|t| t.codewords > 0) {
+            ui.label("LDPC");
+            ui.colored_label(
+                if t.failed == 0 { good } else { wait },
+                format!(
+                    "{} codewords · {} failed · channel BER {:.1e}",
+                    t.codewords,
+                    t.failed,
+                    t.channel_ber()
+                ),
+            )
+            .on_hover_text(
+                "(2880, 2048) quasi-cyclic LDPC, eight codewords a frame, then the \
+                 frame's descrambler: all measured from a live Q-Flex carrier.",
+            );
+            ui.end_row();
+        }
+        payload_rows(ui, f);
     });
 }
 

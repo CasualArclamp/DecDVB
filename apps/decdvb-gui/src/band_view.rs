@@ -196,6 +196,22 @@ pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
                 (None, _) => format!("acq {:.0} %", st.progress * 100.0),
             }
         }
+        DecoderKind::FastLink => {
+            let t = st
+                .fec
+                .as_ref()
+                .and_then(|f| f.fastlink.as_ref().map(|t| (f, t)));
+            match (&st.carrier, t) {
+                (Some(c), Some((f, t))) if t.locked => format!(
+                    "{} FL · {}{}",
+                    if c.locked { "LOCK" } else { "no lock" },
+                    format::bitrate(f.payload_bps),
+                    if f.raw_active { " ● REC" } else { "" }
+                ),
+                (Some(c), _) => format!("{} · sync?", if c.locked { "LOCK" } else { "no lock" }),
+                (None, _) => format!("acq {:.0} %", st.progress * 100.0),
+            }
+        }
         DecoderKind::PskSymbols => match &st.carrier {
             Some(c) => {
                 let lock = if c.locked { "LOCK" } else { "no lock" };

@@ -41,6 +41,10 @@ pub enum DecoderKind {
     /// Intelsat IESS-315 turbo product code `tpc_2964` (BPSK/QPSK): frame
     /// structure, scrambling and payload (HDLC/IP or MPEG-TS) found blind.
     Tpc2964,
+    /// Teledyne Paradise Q-Flex FastLink (QPSK, rate 0.710): sync word,
+    /// LDPC decoding and descrambling as measured on a live carrier; the
+    /// data go to the same payload search as TPC 2964's.
+    FastLink,
     /// Generic PSK/APSK: lock any linearly modulated carrier and write its
     /// hard-decided symbols to a `.bin` file, one byte per symbol.
     PskSymbols,
@@ -51,12 +55,13 @@ pub enum DecoderKind {
 }
 
 impl DecoderKind {
-    pub const ALL: [DecoderKind; 8] = [
+    pub const ALL: [DecoderKind; 9] = [
         DecoderKind::Identify,
         DecoderKind::Dvbs2Ip,
         DecoderKind::Dvbs2Ts,
         DecoderKind::DvbsTs,
         DecoderKind::Tpc2964,
+        DecoderKind::FastLink,
         DecoderKind::PskSymbols,
         DecoderKind::IqRecord,
         DecoderKind::Spectrum,
@@ -69,6 +74,7 @@ impl DecoderKind {
             DecoderKind::Dvbs2Ts => "DVB-S2/S2X → MPEG-TS",
             DecoderKind::DvbsTs => "DVB-S → MPEG-TS",
             DecoderKind::Tpc2964 => "TPC 2964 (IESS-315) → IP / TS",
+            DecoderKind::FastLink => "Q-Flex FastLink (QPSK 0.710) → data",
             DecoderKind::PskSymbols => "Generic PSK → symbols (.bin)",
             DecoderKind::IqRecord => "IQ recorder",
             DecoderKind::Spectrum => "Spectrum only",
@@ -80,7 +86,10 @@ impl DecoderKind {
     pub fn outputs_ts(self) -> bool {
         matches!(
             self,
-            DecoderKind::Dvbs2Ts | DecoderKind::DvbsTs | DecoderKind::Tpc2964
+            DecoderKind::Dvbs2Ts
+                | DecoderKind::DvbsTs
+                | DecoderKind::Tpc2964
+                | DecoderKind::FastLink
         )
     }
 
@@ -93,6 +102,7 @@ impl DecoderKind {
                 | DecoderKind::Dvbs2Ts
                 | DecoderKind::DvbsTs
                 | DecoderKind::Tpc2964
+                | DecoderKind::FastLink
                 | DecoderKind::PskSymbols
         )
     }
@@ -104,6 +114,7 @@ impl DecoderKind {
             DecoderKind::Dvbs2Ts => "S2→TS",
             DecoderKind::DvbsTs => "S→TS",
             DecoderKind::Tpc2964 => "TPC",
+            DecoderKind::FastLink => "FL",
             DecoderKind::PskSymbols => "PSK",
             DecoderKind::IqRecord => "REC",
             DecoderKind::Spectrum => "SPEC",
@@ -491,7 +502,7 @@ impl Worker {
                 demod: None,
                 fec: None,
             },
-            DecoderKind::DvbsTs | DecoderKind::Tpc2964 => Decoder::Modem {
+            DecoderKind::DvbsTs | DecoderKind::Tpc2964 | DecoderKind::FastLink => Decoder::Modem {
                 kind: s.decoder,
                 buf: Vec::new(),
                 demod: None,
@@ -1052,6 +1063,8 @@ impl Worker {
                     );
                     st.message = if *kind == DecoderKind::Tpc2964 {
                         tpc_message(&lock, f.as_ref())
+                    } else if *kind == DecoderKind::FastLink {
+                        fastlink_message(&lock, f.as_ref())
                     } else {
                         match f.as_ref().and_then(|f| f.dvbs.as_ref().map(|v| (v, &f.ts))) {
                             Some((v, ts)) if v.rate.is_some() => {
@@ -1139,8 +1152,29 @@ fn offer_symbols(
     let s = syms.iter().map(|s| s.1).collect();
     match kind {
         DecoderKind::Tpc2964 => w.offer_tpc(s, modulation != decdvb_core::Modulation::Bpsk),
+        DecoderKind::FastLink => w.offer_fastlink(s),
         _ => w.offer_dvbs(s),
     }
+}
+
+/// A FastLink VFO's status line.
+fn fastlink_message(lock: &str, f: Option<&crate::fec::FecStats>) -> String {
+    let Some(t) = f.and_then(|f| f.fastlink.as_ref()).filter(|t| t.locked) else {
+        return format!("{lock} · looking for the FastLink sync word");
+    };
+    let payload = f
+        .and_then(|f| f.payload.as_ref())
+        .and_then(|p| p.found.as_deref())
+        .map_or("payload not recognised yet".to_string(), |p| {
+            p.split(',').next().unwrap_or(p).to_string()
+        });
+    format!(
+        "{lock} · {} frames · {} codewords ({} failed) · BER {:.1e} · {payload}",
+        t.frames,
+        t.codewords,
+        t.failed,
+        t.channel_ber()
+    )
 }
 
 /// A TPC 2964 VFO's status line.
@@ -1173,7 +1207,11 @@ fn tpc_message(lock: &str, f: Option<&crate::fec::FecStats>) -> String {
 
 fn fec_output(s: &VfoSettings, ddc: &Ddc) -> FecOutput {
     FecOutput {
-        record: s.record && matches!(s.decoder, DecoderKind::Dvbs2Ip | DecoderKind::Tpc2964),
+        record: s.record
+            && matches!(
+                s.decoder,
+                DecoderKind::Dvbs2Ip | DecoderKind::Tpc2964 | DecoderKind::FastLink
+            ),
         dir: s.record_dir.clone(),
         name: s.name.clone(),
         carrier_hz: ddc.offset_hz(),
@@ -1956,6 +1994,81 @@ mod tests {
         assert_eq!(t.cc_errors, 0);
         let p = &t.report.programmes[0];
         assert_eq!(p.name.as_deref(), Some("DecDVB test signal"));
+    }
+
+    #[test]
+    fn fastlink_vfo_decodes_the_ldpc_and_the_ip_in_it() {
+        use decdvb_mod::Shaper;
+        use decdvb_mod::fec::TestRadio;
+        use decdvb_modem::fastlink::{FRAME_DATA, modulate};
+        use decdvb_modem::payload::{SelfSyncScrambler, hdlc_frame};
+        // A FastLink carrier, 125 kBd at 40 kHz in a 500 kS/s band, its
+        // data a multicast radio over Cisco HDLC, self-synchronising
+        // scrambled.
+        let mut radio = TestRadio::new([239, 1, 2, 4], "FastLink radio");
+        let mut scrambler = SelfSyncScrambler::new(&[2, 3, 9, 12]);
+        let mut bits = Vec::new();
+        while bits.len() < 40 * FRAME_DATA {
+            let mut f = vec![0x0F, 0x00, 0x08, 0x00];
+            f.extend(radio.next_packet());
+            hdlc_frame(&f, &mut bits);
+        }
+        scrambler.scramble(&mut bits);
+        let mut syms = Vec::new();
+        // `as_chunks`: whole frames as fixed-size arrays (the tail is dropped).
+        for frame in bits.as_chunks::<FRAME_DATA>().0 {
+            modulate(frame, &mut syms);
+        }
+        // Tune in mid-frame.
+        let mut sh = Shaper::new(4, 0.35, 16);
+        let mut x = Vec::new();
+        sh.process(&syms[5000..], &mut x);
+        let w = std::f64::consts::TAU * 40_000.0 / 500_000.0;
+        for (n, v) in x.iter_mut().enumerate() {
+            let ph = w * n as f64 + 0.7;
+            *v *= Iq::new(ph.cos() as f32, ph.sin() as f32);
+        }
+        let settings = VfoSettings::new("F", 40_000.0, 190_000.0, DecoderKind::FastLink);
+        let status = Arc::new(Mutex::new(VfoStatus::default()));
+        let mut wk = Worker::new(
+            500_000.0,
+            settings,
+            status.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        feed(&mut wk, &x, 65_536);
+        let t0 = Instant::now();
+        let f = loop {
+            wk.publish(0);
+            let f = status.lock().unwrap().fec.clone();
+            if let Some(f) = f.filter(|f| f.gse.as_ref().is_some_and(|g| g.packets > 50)) {
+                break f;
+            }
+            if t0.elapsed().as_secs() >= 30 {
+                let st = status.lock().unwrap();
+                panic!(
+                    "no IP: {:?} / {:?} / {:?}",
+                    st.message,
+                    st.fec.as_ref().and_then(|f| f.fastlink.clone()),
+                    st.fec.as_ref().and_then(|f| f.payload.clone())
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let t = f.fastlink.expect("no FastLink stats");
+        assert!(t.locked, "{t:?}");
+        // A frame the demodulator's acquisition slips in is lost; none other.
+        assert!(t.failed <= 8 * t.slips, "{t:?}");
+        assert_eq!(t.uw_misses, 0, "{t:?}");
+        assert!(t.decoded >= 8, "{t:?}");
+        let found = f.payload.and_then(|p| p.found).expect("payload not found");
+        assert!(found.starts_with("HDLC (FCS-16)"), "{found}");
+        let g = f.gse.unwrap();
+        assert!(
+            g.audio
+                .iter()
+                .any(|a| a.group == "239.1.2.4".parse::<std::net::IpAddr>().unwrap())
+        );
     }
 
     #[test]

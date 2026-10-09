@@ -784,6 +784,40 @@ keeps every symbol, 18× real time).
   data positions and the data scrambler — or a capture with the Q-Flex
   sending a test pattern, which would give them directly.
 
+## FastLink decoded: the code, the layout and the scrambler (2026-10-09)
+
+Blind, from Rory's 6.9-minute Q-Flex capture (FastLink QPSK 0.710):
+
+- One codeword at a time this time (2880 bits, slot-wise differences with
+  bad words weeded out): rank exactly 2048, a dual of 832, every position
+  covered — the "13 positions in no check" were bit errors.
+- Random information-set reductions of that dual, a single codeword's,
+  converge in seconds: 640 checks of weight 10, all independent, pairwise
+  overlaps ≤ 2, in 10 classes of exactly 64; then 192 more of weight 18
+  outside their span. Bit degrees: 832 of 2, 2048 of 4 — an **irregular
+  repeat–accumulate LDPC**. The degree-2 bits chain all 832 checks into one
+  ring (an accumulator closing on a bit that is always 0); each data bit's
+  four checks sit at `x + 13·t` on the ring (13 = 832 / 64): 32 circulants
+  of 64, a DVB-S2-style address table (EN 302 307-1 §5.3.2).
+- Layout as sent: 416 units of (2 parity, 4 data) bits, then 384 data bits;
+  data rows of 32 (one bit per circulant), row `r` holding circulant row
+  `37·r mod 64`. A 32 × 4 table plus these rules rebuilds the measured
+  832 × 2880 matrix exactly. Every check has odd parity as received.
+- The data's fixed offset per frame position, read in the order sent, has
+  linear complexity 32 across all eight codewords: a frame-synchronous
+  scrambler `s[i] = s[i−2] ⊕ s[i−16] ⊕ s[i−18] ⊕ s[i−30] ⊕ s[i−32]` from
+  `0xAAA2A2A6` (two interleaved `x¹⁵ + x⁸ + 1` sequences, the even one
+  inverted). The data bits are therefore sent in their own order.
+- `decdvb-modem::fastlink` decodes it (layered normalised min-sum, odd
+  checks, slips of the timing or the carrier phase repaired), and the
+  **Q-Flex FastLink** VFO decoder / `decdvb decode --decoder fastlink` hands
+  the descrambled data to the payload search, text finder and data file.
+  Rory's capture: 783 of 784 codewords decode, channel BER 1.6 × 10⁻⁵.
+- What the data carry is next. They hold idle patterns much like the
+  CDM-600L timeslot's (1/3 ones, period-8 runs drifting slowly — the
+  128.5 kbit/s data rate is 257/256 of 128 kbit/s, so an overhead bit every
+  257 is likely); no HDLC.
+
 ## FFT size without a restart (2026-10-09)
 
 The waterfall's FFT size used to need **⟳ Apply** on a file and a restart

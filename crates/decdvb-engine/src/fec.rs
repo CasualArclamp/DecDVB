@@ -55,6 +55,8 @@ pub(crate) enum FecInput {
         symbols: Vec<Iq>,
         qpsk: bool,
     },
+    /// Carrier-locked QPSK symbols of a Q-Flex FastLink carrier.
+    FastLink(Vec<Iq>),
 }
 
 /// LLR quantization: steps per LLR unit (the decoder is happy from 2 to 8).
@@ -330,6 +332,8 @@ pub struct FecStats {
     pub dvbs: Option<decdvb_modem::dvbs::DvbsStats>,
     /// TPC 2964: frame sync, the structure found, decoding.
     pub tpc: Option<decdvb_modem::tpc2964::TpcStats>,
+    /// Q-Flex FastLink: frame sync and LDPC decoding.
+    pub fastlink: Option<decdvb_modem::fastlink::FastLinkStats>,
     /// What a modem's data carry (TPC 2964).
     pub payload: Option<decdvb_modem::payload::PayloadStats>,
     /// The raw data file (TPC 2964, while recording) and its bytes.
@@ -751,6 +755,11 @@ impl FecWorker {
     /// Queue a block of TPC 2964 symbols.
     pub fn offer_tpc(&self, symbols: Vec<Iq>, qpsk: bool) {
         self.send(FecInput::Tpc { symbols, qpsk });
+    }
+
+    /// Queue a block of Q-Flex FastLink symbols.
+    pub fn offer_fastlink(&self, symbols: Vec<Iq>) {
+        self.send(FecInput::FastLink(symbols));
     }
 
     fn send(&self, input: FecInput) {
@@ -1432,6 +1441,7 @@ fn run(
     let mut dvbs: Option<decdvb_modem::dvbs::DvbsRx> = None;
     let mut dvbs_out = Vec::new();
     let mut tpc: Option<decdvb_modem::tpc2964::TpcRx> = None;
+    let mut fastlink: Option<decdvb_modem::fastlink::FastLinkRx> = None;
     let mut tpc_frames = Vec::new();
     let mut payload: Option<decdvb_modem::payload::PayloadRx> = None;
     let mut payload_out = decdvb_modem::payload::PayloadOut::default();
@@ -1442,18 +1452,41 @@ fn run(
         let t0 = Instant::now();
         let f = match input {
             FecInput::Frame(f) => f,
-            FecInput::Tpc { symbols, qpsk } => {
-                // TPC 2964: frame sync and the code's structure found blind,
-                // turbo decoding, then the payload's format and scrambling.
+            // `name @ (A | B)` binds the whole input whichever it is.
+            modem @ (FecInput::Tpc { .. } | FecInput::FastLink(_)) => {
+                // A coded modem's data blocks: TPC 2964 (frame sync and the
+                // code's structure found blind, turbo decoding) or Q-Flex
+                // FastLink (measured LDPC code); then, for either, the
+                // payload's format and scrambling.
                 use decdvb_modem::payload::PayloadRx;
-                use decdvb_modem::tpc2964::{DATA, TpcRx};
-                let secs = symbols.len() as f64 / symbol_rate;
-                let rx = tpc.get_or_insert_with(|| TpcRx::new(qpsk));
                 tpc_frames.clear();
-                rx.push(&symbols, &mut tpc_frames);
-                let pay = payload.get_or_insert_with(|| PayloadRx::new(DATA));
+                // Data bits a block, the data rate, and the raw file's tag.
+                let (secs, block, data_bps, tag) = match modem {
+                    FecInput::Tpc { symbols, qpsk } => {
+                        use decdvb_modem::tpc2964::{DATA, FRAME, TpcRx};
+                        let rx = tpc.get_or_insert_with(|| TpcRx::new(qpsk));
+                        rx.push(&symbols, &mut tpc_frames);
+                        let bps =
+                            symbol_rate * if qpsk { 2.0 } else { 1.0 } * DATA as f64 / FRAME as f64;
+                        (symbols.len() as f64 / symbol_rate, DATA, bps, "tpc2964")
+                    }
+                    FecInput::FastLink(symbols) => {
+                        use decdvb_modem::fastlink::{FRAME_DATA, FRAME_SYMBOLS, FastLinkRx};
+                        let rx = fastlink.get_or_insert_with(FastLinkRx::new);
+                        rx.push(&symbols, &mut tpc_frames);
+                        let bps = symbol_rate * FRAME_DATA as f64 / FRAME_SYMBOLS as f64;
+                        (
+                            symbols.len() as f64 / symbol_rate,
+                            FRAME_DATA,
+                            bps,
+                            "fastlink",
+                        )
+                    }
+                    _ => unreachable!("matched above"),
+                };
+                let pay = payload.get_or_insert_with(|| PayloadRx::new(block));
                 let o = output.lock().unwrap().clone();
-                raw.follow(&o, "tpc2964");
+                raw.follow(&o, tag);
                 for data in &tpc_frames {
                     payload_out.clear();
                     pay.push(data, &mut payload_out);
@@ -1486,9 +1519,7 @@ fn run(
                         // Timeslots carried: the data rate — the symbol rate
                         // through the code — is n × 64 kbit/s × 46/45 (the
                         // D&I++ overhead).
-                        let bps = symbol_rate * if qpsk { 2.0 } else { 1.0 } * DATA as f64
-                            / decdvb_modem::tpc2964::FRAME as f64;
-                        let n = (bps * 45.0 / 46.0 / 64e3).round().clamp(1.0, 31.0) as u8;
+                        let n = (data_bps * 45.0 / 46.0 / 64e3).round().clamp(1.0, 31.0) as u8;
                         let stage = e1.get_or_insert_with(E1Stage::new);
                         stage.follow(&o);
                         stage.dandi_bytes(n, &payload_out.dandi);
@@ -1514,7 +1545,7 @@ fn run(
                 let used = t0.elapsed().as_secs_f64();
                 busy = 0.95 * busy + 0.05 * (used / secs.max(1e-9));
                 win_secs += secs;
-                win_bits += (tpc_frames.len() * DATA) as f64;
+                win_bits += (tpc_frames.len() * block) as f64;
                 let mut s = stats.lock().unwrap();
                 s.load = busy as f32;
                 if win_secs >= 2.0 {
@@ -1523,7 +1554,8 @@ fn run(
                 } else if s.payload_bps == 0.0 && win_secs > 0.2 {
                     s.payload_bps = win_bits / win_secs;
                 }
-                s.tpc = Some(rx.stats.clone());
+                s.tpc = tpc.as_ref().map(|r| r.stats.clone());
+                s.fastlink = fastlink.as_ref().map(|r| r.stats.clone());
                 s.payload = Some(pay.stats.clone());
                 s.text = tpc_text.as_ref().map(|t| t.view());
                 if let Some(stage) = &mut e1 {

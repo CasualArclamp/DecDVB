@@ -99,6 +99,7 @@ fn decoder_by_name(name: &str) -> Option<decdvb_engine::DecoderKind> {
         "ts" => Dvbs2Ts,
         "dvbs" => DvbsTs,
         "tpc" | "tpc2964" => Tpc2964,
+        "fastlink" | "fl" => FastLink,
         "psk" => PskSymbols,
         "rec" | "iq" => IqRecord,
         "spec" | "spectrum" => Spectrum,

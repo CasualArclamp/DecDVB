@@ -31,6 +31,7 @@ TPC 2964 carrier). Every carrier was found and identified blind.*
 | Carrier recovery: a locked constellation and MER, for Identify and DVB-S2 VFOs | ✅ |
 | **DVB-S → MPEG-TS** (EN 300 421): code rate, rotation and inversion found blind; Viterbi, RS, the same TS outputs | ✅ |
 | **TPC 2964 → IP / TS / voice** (Intelsat IESS-315 turbo product code, BPSK/QPSK): frame structure, scrambling and payload found from the signal; HDLC → IP, MPEG-TS, E1 and Comtech D&I++ voice | ✅ confirmed on a live Comtech CDM-600L carrier |
+| **Q-Flex FastLink → data** (Paradise, QPSK 0.710): sync word, the (2880, 2048) LDPC code and the frame scrambler, all measured from a live carrier; the data go to the same payload search and text finder | ✅ decodes a live Q-Flex (payload format not yet known) |
 | **E1 voice**: G.704 E1 or Comtech Drop & Insert++ timeslots, G.711 A-law — levels per channel, listen, record `.wav` | ✅ |
 | **Generic PSK/APSK/QAM → symbols** (`.bin`, one byte per symbol), BPSK…32APSK and 8/16/64QAM, for non-DVB carriers | ✅ |
 | Narrow carriers: VFOs down to 500 Hz, ~10 kBd SCPC carriers lock | ✅ |
@@ -269,9 +270,11 @@ looks for fingerprints of proprietary waveforms:
   from 0, then 2 blocks of 36 every 1476"*) — a fingerprint of a framing even
   when no specification is public.
 
-Paradise FastLink, Comtech VersaFEC and the TPC/LDPC modes of SCPC modems
-publish no sync word or frame layout, so they can only be recognised by
-such measurements; captures of them would let DecDVB name them. A carrier too slow to show three frames in the first look is marked
+Comtech VersaFEC and the TPC/LDPC modes of SCPC modems publish no sync
+word or frame layout, so they can only be recognised by such measurements;
+captures of them would let DecDVB name them. Paradise FastLink was worked
+out that way from a capture of a Q-Flex (QPSK 0.710): Identify names it, and
+the **Q-Flex FastLink** decoder decodes it. A carrier too slow to show three frames in the first look is marked
 *provisional* while it listens longer. Between identifications it keeps
 demodulating with what it found, so the constellation and MER stay live.
 

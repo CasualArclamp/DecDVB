@@ -32,6 +32,7 @@ fn decoder_by_name(name: &str) -> Result<DecoderKind> {
         "ts" => DecoderKind::Dvbs2Ts,
         "dvbs" => DecoderKind::DvbsTs,
         "tpc" | "tpc2964" => DecoderKind::Tpc2964,
+        "fastlink" | "fl" => DecoderKind::FastLink,
         "psk" => DecoderKind::PskSymbols,
         other => bail!("unknown decoder `{other}` (id, ip, ts, dvbs, tpc, psk)"),
     })
@@ -157,6 +158,20 @@ fn report(st: &VfoStatus) {
             t.structure.as_deref().unwrap_or("not identified"),
             t.fit * 100.0,
             t.frames,
+            t.decoded,
+            t.failed,
+            t.channel_ber(),
+            t.slips,
+            t.uw_misses
+        );
+    }
+    if let Some(t) = &f.fastlink {
+        println!(
+            "fastlink: sync {}, {}, {} frames, {} codewords ({} decoded, {} failed), BER {:.2e}, {} slips, {} sync misses",
+            if t.locked { "found" } else { "not found" },
+            t.orientation.as_deref().unwrap_or("-"),
+            t.frames,
+            t.codewords,
             t.decoded,
             t.failed,
             t.channel_ber(),
