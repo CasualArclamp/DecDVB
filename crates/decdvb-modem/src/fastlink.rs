@@ -3,12 +3,14 @@
 //! (FastLink, QPSK, rate 0.710, 95 017 sym/s, closed network plus ESC):
 //!
 //! - a frame of 11 538 symbols: an 18-symbol sync word, then 11 520 symbols
-//!   = 23 040 coded bits = four 5760-bit codeword slots;
-//! - each slot holds an LDPC codeword of 4096 data bits (rank of thousands
-//!   of received slots, cleaned of the few with bit errors): 4 × 4096 data
-//!   bits in 23 076 symbols' worth of bits is the "0.710" of the menu;
-//! - the code's checks are mostly of weight 16, its bits interleaved, and a
-//!   fixed scrambling offset lies on the code bits.
+//!   = 23 040 coded bits = eight 2880-bit LDPC codewords;
+//! - 2048 data bits a codeword (GF(2) rank of thousands of received
+//!   codewords, cleaned of the few with bit errors; the parity checks found
+//!   in one 2880-bit half map onto the other's): 8 × 2048 data bits in
+//!   23 076 symbols' worth of bits is the menu's "0.710";
+//! - the checks are mostly of weight 16, the bits interleaved (no
+//!   block-cyclic structure in the order sent, nor under a row–column
+//!   interleaver), and a fixed scrambling offset lies on the code bits.
 //!
 //! Enough to recognise the framing (this module); not yet enough to read the
 //! data, which needs the data positions, their order and the data
@@ -32,9 +34,10 @@ const UW: [(bool, bool); 18] = {
 /// Symbols per frame (QPSK, rate 0.710).
 pub const FRAME_SYMBOLS: usize = 11_538;
 pub const UW_SYMBOLS: usize = 18;
-/// Coded bits per codeword slot, and the data bits in each.
-pub const SLOT_BITS: usize = 5760;
-pub const DATA_BITS: usize = 4096;
+/// Codewords per frame; coded and data bits in each.
+pub const CODEWORDS: usize = 8;
+pub const CODEWORD_BITS: usize = 2880;
+pub const DATA_BITS: usize = 2048;
 /// UW symbols allowed wrong.
 const UW_ERRORS: usize = 2;
 

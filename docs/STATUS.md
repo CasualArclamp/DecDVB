@@ -754,3 +754,10 @@ keeps every symbol, 18× real time).
   any QPSK orientation, three frames running). Reading the data still needs
   the data positions, their order and the data scrambler; the recovered
   checks are kept out of the repo for now.
+- Refined: the checks of one 2880-bit half of a 5760-bit slot map onto the
+  other's (shift by 2880: 269 of 300) — the code is **(2880, 2048)**, eight
+  codewords a frame (2048/2880 = 0.711). Its order sent shows no
+  block-cyclic structure, nor after undoing any row–column interleaver of
+  2880; bit degrees vary with position mod 16. Next: the interleaver, the
+  data positions and the data scrambler — or a capture with the Q-Flex
+  sending a test pattern, which would give them directly.

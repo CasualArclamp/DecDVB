@@ -813,7 +813,7 @@ pub fn identify_in(x: &[Iq], rate: f64, bandwidth: Option<f64>) -> Identificatio
                 ),
                 _ if fastlink => {
                     "QPSK, Paradise Q-Flex FastLink framing (sync word every 11 538 symbols: \
-                     rate 0.710, four 5760-bit LDPC codewords a frame)"
+                     rate 0.710, eight 2880-bit LDPC codewords a frame)"
                         .into()
                 }
                 _ if tpc => format!(
