@@ -10,10 +10,21 @@
 //! (140 ms). All of this was found blind on one capture (STATUS.md, "The
 //! Q-Flex's 128.5 kbit/s"); no specification is known.
 //!
+//! Each channel runs in 4 ms subframes of four octets, `D(n) D(n−1) S S`
+//! (measured, STATUS.md "Q-Flex channels: 4 ms subframes"): one new data
+//! octet, the previous one again, and a status octet twice — so 2 kbit/s
+//! of new data a channel. Idle codec channels cycle five data octets
+//! (a 40-bit frame every 20 ms); on the signalling channels S is 00 or FF.
+//! A channel's subframes slip against the TDM frame now and then: each
+//! source has its own clock.
+//!
 //! The receiver finds the frame by the alignment word, then meters every
 //! channel: idle codec channels repeat a 160-bit (20 ms) frame, pattern
 //! channels a 32-bit (4 ms) one, and speech should show as a channel that
-//! stops repeating.
+//! stops repeating. Speech changes only the data half of each subframe —
+//! about a quarter of the bits from one 20 ms to the next — so a channel
+//! once seen idle as a codec counts as active as soon as it departs from
+//! its idle frame at all.
 
 /// Frame and payload bits, words a frame, channels.
 pub const FRAME: usize = 257;
@@ -31,6 +42,15 @@ const LOSE: u32 = 5;
 const CODEC_LAG: usize = 160;
 const PATTERN_LAG: usize = 32;
 const WINDOW: usize = 4000;
+/// Changed at 20 ms: under this an idle codec, over the other active —
+/// for any channel, and (much lower) for one seen idle as a codec.
+const IDLE_CHANGE: f32 = 0.01;
+const ACTIVE_CHANGE: f32 = 0.25;
+const CODEC_ACTIVE_CHANGE: f32 = 0.05;
+/// Bits a channel must have spent idle as a codec (10 s in all) before its
+/// departures count as speech: the signalling channels pass through the
+/// idle-codec reading only now and then.
+const CODEC_PROOF: usize = 80_000;
 
 /// What a channel is doing over the last half second.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -95,6 +115,10 @@ struct Meter {
     /// Per bit in the window: (differs at 20 ms, differs at 4 ms, is one).
     flags: Vec<u8>,
     sums: [u32; 3],
+    /// Bits spent idle as a codec, and where the last view was; past
+    /// `CODEC_PROOF`, the channel's frame departing is speech.
+    idle_bits: usize,
+    viewed_at: usize,
 }
 
 impl Meter {
@@ -105,6 +129,8 @@ impl Meter {
             filled: 0,
             flags: vec![0; WINDOW],
             sums: [0; 3],
+            idle_bits: 0,
+            viewed_at: 0,
         }
     }
 
@@ -124,7 +150,7 @@ impl Meter {
         self.filled += 1;
     }
 
-    fn view(&self) -> ChannelView {
+    fn view(&mut self) -> ChannelView {
         let n = self.filled.clamp(1, WINDOW) as f32;
         let [c20, c4, ones] = self.sums.map(|s| s as f32 / n);
         let state = if self.filled < WINDOW {
@@ -133,13 +159,17 @@ impl Meter {
             ChannelState::Fixed(u8::from(ones > 0.5))
         } else if c4 < 0.01 {
             ChannelState::Pattern
-        } else if c20 < 0.01 {
+        } else if c20 < IDLE_CHANGE {
+            self.idle_bits += self.filled - self.viewed_at;
             ChannelState::IdleCodec
-        } else if c20 > 0.25 {
+        } else if c20 > ACTIVE_CHANGE
+            || (self.idle_bits >= CODEC_PROOF && c20 > CODEC_ACTIVE_CHANGE)
+        {
             ChannelState::Active
         } else {
             ChannelState::Varying
         };
+        self.viewed_at = self.filled;
         ChannelView {
             state,
             change_20ms: c20,
@@ -212,7 +242,7 @@ impl TdmRx {
                 *at -= keep_from;
             }
         }
-        for (v, m) in self.stats.channels.iter_mut().zip(&self.meters) {
+        for (v, m) in self.stats.channels.iter_mut().zip(&mut self.meters) {
             *v = m.view();
         }
     }
@@ -348,6 +378,60 @@ mod tests {
         assert_eq!(st(12), ChannelState::Fixed(0));
         assert_eq!(st(15), ChannelState::Active);
         assert_eq!(s.side_data.len(), 35);
+    }
+
+    /// A codec channel as the multiplex carries it: 4 ms subframes
+    /// `D(n) D(n−1) S S`, MSB first; `data(n)` gives D(n).
+    fn codec_channel(subframes: usize, data: impl Fn(usize) -> u8, s: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        for n in 0..subframes {
+            let prev = if n == 0 { 0xFF } else { data(n - 1) };
+            for o in [data(n), prev, s, s] {
+                out.extend((0..8).rev().map(|k| (o >> k) & 1));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn speech_in_an_idle_codec_channel_is_active() {
+        // Channel 0: 12 s idle (the five-octet silence frame), then 1 s of
+        // speech-like data: D octets with a random high nibble (codec
+        // frames keep some bits steady) — about an eighth of the bits
+        // change at 20 ms, half the generic threshold.
+        let idle = [0xFF, 0xFE, 0xF3, 0xCE, 0xBB];
+        let mut x = 0x9E37_79B9u32;
+        let speech: Vec<u8> = (0..250)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x as u8 & 0xF0) | 0x0B
+            })
+            .collect();
+        let quiet = codec_channel(3000, |n| idle[n % 5], 0x03);
+        let talk = codec_channel(250, |n| speech[n], 0x03);
+        let ch0: Vec<u8> = quiet.into_iter().chain(talk).collect();
+        // Into frames: channel 0 is bit 0 of each word; the rest fixed 0.
+        let frames = ch0.len() / WORDS;
+        let mut bits = Vec::new();
+        for f in 0..frames {
+            bits.push(if f % 2 == 0 { FAW[(f / 2) % 7] } else { 0 });
+            for w in 0..WORDS {
+                bits.push(ch0[f * WORDS + w]);
+                bits.extend(std::iter::repeat_n(0, CHANNELS - 1));
+            }
+        }
+        let mut rx = TdmRx::new();
+        let mut seen = Vec::new();
+        for chunk in bits.chunks(257 * 50) {
+            rx.push(chunk);
+            seen.push(rx.stats.channels[0].state);
+        }
+        assert!(seen.contains(&ChannelState::IdleCodec), "{seen:?}");
+        let last = rx.stats.channels[0];
+        assert_eq!(last.state, ChannelState::Active, "{last:?}");
+        assert!(last.change_20ms < ACTIVE_CHANGE, "{last:?}");
     }
 
     #[test]

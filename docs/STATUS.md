@@ -1303,3 +1303,53 @@ multiplex's aligned frames (`TdmRx::keep_frames`). The 19:54 FastLink
 recording (39 s) is like the others: Paradise aligned, TDM aligned with no
 errors, codec channels 0–2 idle; its 20 ms state word reads 11110 (as
 QFLEX_2's did; qflex_3's 01101).
+
+## Q-Flex channels: 4 ms subframes, and two calls on record (2026-10-10)
+
+Re-reading the multiplex channel by channel (`decdvb payload … --tdm-out`,
+scripts in the scratchpad):
+
+- Every channel (one bit position of the 16-bit words, 8 kbit/s) runs in
+  4 ms subframes of four octets, `W1 W2 S S`: 16 data bits, then a status
+  octet sent twice. The subframes slip a bit against the TDM frame now and
+  then (channel 0: about every 10 s, ~12 ppm): each source has its own
+  clock, so a channel decoder must follow its own subframe phase (the
+  doubled S finds it).
+- S: on channels 6–15 it is 00 or FF, changing every 0.1–0.8 s — the
+  signalling seen before, now per channel; on 0–5 it is a byte with two
+  bits set that rotates every ~10 s.
+- In silence the codec channels' data cycle five octets (a 40-bit pattern
+  over 20 ms, read in 16-bit steps): channels 0 and 2 the same (FF FE F3 CE
+  BB), 1 and 15 others; their rhythm, a 0 every fifth bit, is that of the
+  CDM-600L's E1 TS1 sub-rate streams too (same voice equipment behind both
+  modems, it seems).
+- **Calls**: in qflex_3 at ~380–420 s and in the 19:54 FastLink recording
+  at ~18.5–32 s, channels 0, 1, 2 and 15 leave their silence frames at the
+  same instant and carry changing data in talk spurts with pauses. Four
+  distinct streams (no two agree beyond chance at any lag), 16 data bits
+  each per 4 ms — 4 kbit/s a channel, 16 kbit/s in all. Over talk spurts
+  the data have a 20 ms (5-subframe) frame: channels 1 and 15 hold a fixed
+  0 about every fifth bit (and 15 a per-call flag at the last bit of each
+  subframe: 1 in one call, 0 in the other); 0 and 2 have no fixed bits.
+  Not G.729 (pitch parity) and not G.726-16 (no interleave decodes to
+  anything speech-like through ffmpeg). The codec is still unknown.
+- The old activity meter (> 25 % of bits changed at 20 ms) missed these
+  calls: speech changes only the data half of a subframe (~25 %, often
+  less). `TdmRx` now remembers a channel proven an idle codec (10 s idle
+  in all) and calls it active once it departs from its silence frame by
+  5 %: on qflex_3 channels 0–2 now read active for the call only (~10 s;
+  15, whose status octet toggles like the signalling channels', more). The
+  auto-record trigger uses it. `decdvb payload` prints each channel's
+  active time.
+
+ESC (the Paradise overhead's 22 bits a group, ~4.4 kbit/s): idle 0;
+packets start on an ESC octet (group bit 1 or 14), their FAW/CTRL bits
+included; lengths in families ~825, ~1118, ~1270, ~1930 bits (±7), sent in
+a repeating three-message cycle with gaps of 1.1–2.2 s — the modems' M&C
+polling; single bits at multiframe (64-group) boundaries between. Not HDLC
+in any bit order, polarity or NRZI reading, not sampled async, not text
+under any shift; near-identical repeats rule out encryption. Its coding is
+still unknown. `decdvb payload --esc-out` writes the bits.
+
+None of Rory's 102–128 kBd QPSK symbol recordings carries the FastLink
+unique word under any label assignment.

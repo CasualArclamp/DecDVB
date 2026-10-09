@@ -23,6 +23,10 @@ pub struct PayloadArgs {
     /// Write the TDM multiplex's aligned frames here.
     #[arg(long)]
     pub tdm_out: Option<PathBuf>,
+    /// Write the Paradise ESC bits here (0/1 bytes, 22 a group, in the
+    /// order the deframer takes them).
+    #[arg(long)]
+    pub esc_out: Option<PathBuf>,
 }
 
 pub fn run(a: &PayloadArgs) -> Result<()> {
@@ -36,13 +40,22 @@ pub fn run(a: &PayloadArgs) -> Result<()> {
     let mut out = PayloadOut::default();
     let mut tdm = TdmRx::new();
     tdm.keep_frames = a.tdm_out.is_some();
-    let mut esc_bits = 0usize;
+    let mut esc = Vec::new();
+    // Modem frames during which each TDM channel read as active.
+    let mut active = [0usize; decdvb_modem::tdm257::CHANNELS];
+    let mut metered = 0usize;
     for frame in bits.chunks_exact(a.frame_bits) {
         out.clear();
         pay.push(frame, &mut out);
-        esc_bits += out.esc.len();
+        esc.extend_from_slice(&out.esc);
         if matches!(pay.format(), Some(Format::ParadiseEsc)) && !out.inner.is_empty() {
             tdm.push(&out.inner);
+            metered += 1;
+            for (n, c) in active.iter_mut().zip(&tdm.stats.channels) {
+                if c.state == decdvb_modem::tdm257::ChannelState::Active {
+                    *n += 1;
+                }
+            }
         }
     }
     println!(
@@ -53,11 +66,32 @@ pub fn run(a: &PayloadArgs) -> Result<()> {
         bits.len() as f64 / 128e3
     );
     crate::decode::print_payload(&pay.stats);
-    if esc_bits > 0 {
-        println!("  ESC: {esc_bits} bits");
+    if !esc.is_empty() {
+        let ones = esc.iter().filter(|&&b| b == 1).count();
+        println!("  ESC: {} bits, {ones} ones", esc.len());
+    }
+    if let Some(p) = &a.esc_out {
+        std::fs::write(p, &esc).with_context(|| format!("writing {}", p.display()))?;
+        println!("wrote {} ESC bits to {}", esc.len(), p.display());
     }
     if tdm.stats.frames > 0 || tdm.stats.locked {
         crate::decode::print_tdm(&tdm.stats);
+        let secs = a.frame_bits as f64 / 134_925.0;
+        let busy: Vec<String> = active
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(c, n)| format!("channel {c} {:.1} s", *n as f64 * secs))
+            .collect();
+        println!(
+            "  active (of {:.1} s metered): {}",
+            metered as f64 * secs,
+            if busy.is_empty() {
+                "none".to_string()
+            } else {
+                busy.join(", ")
+            }
+        );
     }
     if let Some(p) = &a.tdm_out {
         std::fs::write(p, &tdm.frames_out).with_context(|| format!("writing {}", p.display()))?;
