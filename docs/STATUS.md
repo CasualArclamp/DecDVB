@@ -1073,3 +1073,26 @@ and a self-synchronising descrambler commute.
   decoding, self-synchronising descrambler, taps 3, 20"; 3 turns followed,
   channel BER 0; IBS aligned, 381 frames, 1 loss (before the first turn was
   followed). The data are idle throughout.
+
+## DVB-CID: the right centre, deeper searches, a frequency-loop false lock (2026-10-09)
+
+Rory asked to lower the lock threshold: a live 1.048 MBd DVB-S2X carrier's
+search peaked at 3.9 dB against 4.8. That is the noise: ~1 M cells of a
+24-bit sum (Gamma(24) over its mean) top out near 3.8 dB, so a lower fixed
+threshold would lock on noise. What was wrong:
+- The search was centred on Identify's centre; that carrier's residual
+  offset (from the carrier lock) was −8.6 kHz, so a CID 220 Hz from the true
+  centre lay outside the ±1.7 kHz searched. The CID VFO now centres on
+  Identify's centre plus the residual when the carrier locked, and searches
+  ±4 kHz otherwise (`CidRx::with_span`).
+- Searches deepen: 24 bits, then after three empty searches 48, then 96.
+  The threshold is computed for the bits and cells (Chernoff bound on the
+  largest of the cells, one false lock in 10⁴ searches): 4.9, 3.7, 2.7 dB
+  (`CidSearch::bits` shows the depth).
+- Moving the centre exposed a tracking bug: the frequency loop squared the
+  bit-to-bit phase step, which also locks half a cycle a bit away (±27 Hz
+  at 224 kchip/s): 3.9 dB lost and every bit inverted, so no frame (8.4 →
+  4.7 dB on the test capture). It now resolves that ambiguity with the phase
+  between the two halves of a bit (same data bit, unambiguous within ±1 bit
+  rate) and tracks with the quiet squared detector. Test: locks true at
+  +20, +97, +300, −150 Hz (+20 false-locked before).

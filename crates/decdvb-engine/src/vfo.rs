@@ -873,10 +873,22 @@ impl Worker {
                         let usable = !matches!(id.verdict, Verdict::NoSignal);
                         match rs.filter(|_| usable) {
                             Some(rs) => {
+                                // The host's centre: Identify's, plus the
+                                // residual its carrier lock measured (on a
+                                // live 1 MBd carrier that was 8.6 kHz — far
+                                // outside the CID search). Without a lock,
+                                // search wider.
+                                let (centre, span) = match id.carrier_offset_hz {
+                                    Some(f) if id.carrier_locked => {
+                                        (id.center_offset_hz + f, decdvb_modem::cid::ACQ_SPAN_HZ)
+                                    }
+                                    _ => (id.center_offset_hz, 4000.0),
+                                };
                                 let w = crate::cid::CidWorker::spawn(
                                     out_rate,
                                     self.settings.bandwidth_hz.min(out_rate),
-                                    id.center_offset_hz,
+                                    centre,
+                                    span,
                                     rs,
                                     self.lossless,
                                 );

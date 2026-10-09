@@ -57,11 +57,13 @@ pub(crate) struct CidWorker {
 
 impl CidWorker {
     /// A decoder for a VFO at `in_rate`, `vfo_bandwidth` wide, on a host
-    /// carrier of `symbol_rate` centred `center_hz` from the VFO's centre.
+    /// carrier of `symbol_rate` centred `center_hz` from the VFO's centre,
+    /// searching ±(220 Hz + `span_hz`) about it.
     pub fn spawn(
         in_rate: f64,
         vfo_bandwidth: f64,
         center_hz: f64,
+        span_hz: f64,
         symbol_rate: f64,
         lossless: bool,
     ) -> Self {
@@ -83,7 +85,7 @@ impl CidWorker {
                 let bw = (1.5 * rc).min(0.95 * in_rate);
                 let mut ddc = Ddc::new(in_rate, center_hz, bw);
                 let mut rs = Resampler::new(ddc.out_rate(), SPS as f64 * rc);
-                let mut cid = CidRx::new(rc);
+                let mut cid = CidRx::new(rc).with_span(span_hz);
                 let (mut mixed, mut at4, mut frames) = (Vec::new(), Vec::new(), Vec::new());
                 let to_chips = SPS as f64 * rc / in_rate;
                 while let Ok(msg) = rx.recv() {

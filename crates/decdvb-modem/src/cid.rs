@@ -663,9 +663,12 @@ impl CidLive {
 /// frequency, in dB over the mean of every cell searched.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CidSearch {
-    /// The strongest cell, and the level the search must reach to lock.
+    /// The strongest cell, and the level the search must reach to lock
+    /// (lower the more bits were summed).
     pub peak_db: f32,
     pub threshold_db: f32,
+    /// Bit periods summed.
+    pub bits: usize,
     /// The strongest cell's code phase (chips into the analysis block, at
     /// half-chip steps) and frequency (Hz from the host carrier's centre).
     pub code_phase: f64,
@@ -690,15 +693,37 @@ const MAP_ROWS: usize = 64;
 const MAP_HALF_WIDTH: i64 = 24;
 const PROFILE_POINTS: usize = 512;
 
-/// Bit periods gathered for a search; how far either side of ±220 Hz to
-/// look; the search's threshold (peak over mean of the accumulated
-/// correlation power).
-// (24 bit periods: a CID 27.5 dB under its host despreads to ~8 dB a bit;
-// noise alone tops 3× the mean in one of the ~2 M cells about once in
-// 10⁵ searches.)
-const ACQ_BITS: usize = 24;
-const ACQ_SPAN_HZ: f64 = 1500.0;
-const ACQ_THRESHOLD: f32 = 3.0;
+/// Bit periods a search gathers: 24 first (a CID 27.5 dB under its host
+/// despreads to ~8 dB a bit, plenty), then, after three searches finding
+/// nothing, 48 and 96 — each doubling lowers the level noise can reach,
+/// and so the threshold, by 1–1.2 dB.
+const ACQ_LEVELS: [usize; 3] = [24, 48, 96];
+const ACQ_ESCALATE: u32 = 3;
+/// How far either side of ±220 Hz to look, by default.
+pub const ACQ_SPAN_HZ: f64 = 1500.0;
+/// Searches a false lock is allowed in (the threshold is set from it).
+const ACQ_FALSE_RATE: f64 = 1e-4;
+
+/// The search threshold, peak over mean, for `bits` bit periods summed in
+/// each of `cells` cells: in noise a cell is a Gamma(`bits`) variable over
+/// its mean, which tops x with probability ≤ exp(−bits·(x − 1 − ln x))
+/// (Chernoff); x is set so that the largest of the cells does that once in
+/// 1/ACQ_FALSE_RATE searches. (~1 M cells: 24 bits 4.9 dB, 48 bits 3.7 dB,
+/// 96 bits 2.7 dB.)
+fn acq_threshold(bits: usize, cells: usize) -> f32 {
+    let target = (cells as f64 / ACQ_FALSE_RATE).ln() / bits as f64;
+    // x − 1 − ln x rises from 0 at x = 1: bisect.
+    let (mut lo, mut hi) = (1.0f64, 20.0f64);
+    for _ in 0..60 {
+        let mid = 0.5 * (lo + hi);
+        if mid - 1.0 - mid.ln() < target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    hi as f32
+}
 /// Bits in a row with the smoothed despread SNR under 3 dB before searching
 /// again. (Not the single bit's: off the code, one bit's power is an
 /// exponential variable, over twice the noise one time in seven, so a run
@@ -730,6 +755,11 @@ pub struct CidRx {
     disp: Iq,
     /// Early, prompt and late magnitudes, averaged for display.
     epl_avg: [f32; 3],
+    /// Search depth (an index into ACQ_LEVELS), searches at it that found
+    /// nothing, and the frequency span either side of ±220 Hz.
+    level: usize,
+    fails: u32,
+    span_hz: f64,
     pub stats: CidStats,
 }
 
@@ -759,6 +789,9 @@ impl CidRx {
             next_frame: None,
             disp: Iq::new(0.0, 0.0),
             epl_avg: [0.0; 3],
+            level: 0,
+            fails: 0,
+            span_hz: ACQ_SPAN_HZ,
             stats: CidStats::default(),
         }
     }
@@ -799,20 +832,29 @@ impl CidRx {
         }
     }
 
-    /// Search code phase × frequency over `ACQ_BITS` bit periods held.
+    /// Search ±(220 Hz + `span_hz`) about the centre rather than the default
+    /// (a host whose centre is only roughly known).
+    pub fn with_span(mut self, span_hz: f64) -> Self {
+        self.span_hz = span_hz;
+        self
+    }
+
+    /// Search code phase × frequency over the bit periods the search depth
+    /// calls for.
     fn acquire(&mut self) -> bool {
         let l4 = CHIPS * SPS;
         let l2 = 2 * CHIPS;
-        if self.held.len() < ACQ_BITS * l4 + 4 {
+        let acq_bits = ACQ_LEVELS[self.level];
+        if self.held.len() < acq_bits * l4 + 4 {
             return false;
         }
         self.stats.searches += 1;
         let fs2 = self.fs / 2.0;
         let bin = fs2 / l2 as f64;
-        let k_max = ((OFFSET_HZ + ACQ_SPAN_HZ) / bin).ceil() as isize;
+        let k_max = ((OFFSET_HZ + self.span_hz) / bin).ceil() as isize;
         // Two per chip, by averaging pairs (`as_chunks` views the samples
         // as [Iq; 2] arrays).
-        let x2: Vec<Iq> = self.held[..ACQ_BITS * l4]
+        let x2: Vec<Iq> = self.held[..acq_bits * l4]
             .as_chunks::<2>()
             .0
             .iter()
@@ -822,7 +864,7 @@ impl CidRx {
         let mut acc = vec![0f32; cells * l2];
         let mut spec = vec![Iq::new(0.0, 0.0); l2];
         let mut work = vec![Iq::new(0.0, 0.0); l2];
-        for b in 0..ACQ_BITS {
+        for b in 0..acq_bits {
             for half in 0..2 {
                 // A half-bin shift for the in-between frequencies.
                 for (n, s) in spec.iter_mut().enumerate() {
@@ -849,12 +891,21 @@ impl CidRx {
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(b.1))
             .expect("cells");
-        self.stats.search = Some(Arc::new(search_map(&acc, mean, best, k_max, bin)));
-        if peak < ACQ_THRESHOLD * mean {
-            // Nothing: keep the newest bit period for the next try.
-            self.held.drain(..(ACQ_BITS - 1) * l4);
+        let threshold = acq_threshold(acq_bits, acc.len());
+        let map = search_map(&acc, mean, best, k_max, bin, threshold, acq_bits);
+        self.stats.search = Some(Arc::new(map));
+        if peak < threshold * mean {
+            // Nothing: keep the newest bit period for the next try, and
+            // after a few, look deeper.
+            self.held.drain(..(acq_bits - 1) * l4);
+            self.fails += 1;
+            if self.fails >= ACQ_ESCALATE && self.level + 1 < ACQ_LEVELS.len() {
+                self.level += 1;
+                self.fails = 0;
+            }
             return false;
         }
+        self.fails = 0;
         let (cell, lag) = (best / l2, best % l2);
         let half = cell / (2 * k_max as usize + 1);
         let k = (cell % (2 * k_max as usize + 1)) as isize - k_max;
@@ -894,6 +945,8 @@ impl CidRx {
             Iq::new(0.0, 0.0),
             Iq::new(0.0, 0.0),
         );
+        // The prompt's first half, for the frequency detector.
+        let mut p_first = Iq::new(0.0, 0.0);
         // The NCO advances by a rotation per sample (recomputed every 256
         // to stay accurate).
         let mut rot = Iq::new(0.0, 0.0);
@@ -905,6 +958,9 @@ impl CidRx {
             }
             let c = self.code4[n];
             let i = t + n;
+            if n == l4 / 2 {
+                p_first = p;
+            }
             p += self.held[i] * rot * c;
             e += self.held[i - 1] * rot * c;
             l += self.held[i + 1] * rot * c;
@@ -962,9 +1018,28 @@ impl CidRx {
             CidLive::keep(&mut live.diffs, d * scale * scale, LIVE_BITS);
             CidLive::keep(&mut live.soft, soft, FRAME_BITS);
             self.stats.bits += 1;
-            // Frequency: the step squared loses the data.
-            let err = (d * d).arg() as f64 / 2.0;
-            freq += 0.1 * err / (std::f64::consts::TAU * l4 as f64 / self.fs);
+        }
+        // Frequency. The bit-to-bit step squared (the data gone) is quiet
+        // but ambiguous: it reads the same half a cycle a bit away (±27 Hz
+        // at 224 kchip/s), and locked there every bit loses 3.9 dB and turns
+        // over. The second half of the bit against the first (both carry
+        // the same data bit) is unambiguous within ±1 bit rate but noisier:
+        // it picks which reading of the quiet one is meant.
+        let bit_s = l4 as f64 / self.fs;
+        let half = (p - p_first) * p_first.conj();
+        let coarse_hz = if half.norm_sqr() > 0.0 {
+            f64::from(half.arg()) / (std::f64::consts::TAU * bit_s / 2.0)
+        } else {
+            0.0
+        };
+        if prev.norm_sqr() > 0.0 {
+            let d = p * prev.conj();
+            let fine_hz = f64::from((d * d).arg()) / 2.0 / (std::f64::consts::TAU * bit_s);
+            let amb = 1.0 / (2.0 * bit_s);
+            let err_hz = fine_hz + amb * ((coarse_hz - fine_hz) / amb).round();
+            freq += 0.1 * err_hz;
+        } else {
+            freq += 0.02 * coarse_hz;
         }
         // Timing: early against late, a quarter chip either side.
         let (ea, la) = (e.norm(), l.norm());
@@ -1109,7 +1184,15 @@ impl CidRx {
 /// The display map of a search: `acc` holds `2·(2·k_max + 1)` frequency
 /// cells of `2·CHIPS` code phases (two per chip), cell `half·n + k + k_max`
 /// at `(k + half/2)·bin` Hz; `best` is the strongest entry.
-fn search_map(acc: &[f32], mean: f32, best: usize, k_max: isize, bin: f64) -> CidSearch {
+fn search_map(
+    acc: &[f32],
+    mean: f32,
+    best: usize,
+    k_max: isize,
+    bin: f64,
+    threshold: f32,
+    bits: usize,
+) -> CidSearch {
     let l2 = 2 * CHIPS;
     let n = 2 * k_max as usize + 1;
     let db = |v: f32| (10.0 * (v / mean.max(1e-30)).log10()).max(-10.0);
@@ -1144,7 +1227,8 @@ fn search_map(acc: &[f32], mean: f32, best: usize, k_max: isize, bin: f64) -> Ci
         .collect();
     CidSearch {
         peak_db: db(acc[best]),
-        threshold_db: 10.0 * ACQ_THRESHOLD.log10(),
+        threshold_db: 10.0 * threshold.log10(),
+        bits,
         code_phase: lag as f64 / 2.0,
         freq_hz: cell_freq(cell),
         profile,
@@ -1189,6 +1273,15 @@ mod tests {
             .collect();
         (r.fields[3], r.fields[4], r.fields[5]) = (Some(v[0]), Some(v[1]), Some(v[2]));
         assert_eq!(r.telephone().as_deref(), Some("+14803332200 ext. 1835"));
+    }
+
+    #[test]
+    fn deeper_searches_lower_the_threshold() {
+        let cells = 1_060_000;
+        let db = |b| 10.0 * acq_threshold(b, cells).log10();
+        assert!((db(24) - 4.9).abs() < 0.15, "{}", db(24));
+        assert!((db(48) - 3.7).abs() < 0.15, "{}", db(48));
+        assert!((db(96) - 2.7).abs() < 0.15, "{}", db(96));
     }
 
     #[test]
@@ -1264,6 +1357,11 @@ mod tests {
     /// with `cut` samples missing after sample `at` (from the start of the
     /// stream) — reported to the receiver as a gap, or not.
     fn receive_with_cut(at: usize, cut: usize, report: bool) -> (CidRx, Vec<CidFrame>) {
+        receive_at(300.0, at, cut, report)
+    }
+
+    /// The same at carrier offset `f0`.
+    fn receive_at(f0: f64, at: usize, cut: usize, report: bool) -> (CidRx, Vec<CidFrame>) {
         let guid = 0x0011_22FF_FF33_4455;
         let frame = |second, a| {
             build_frame(
@@ -1321,7 +1419,7 @@ mod tests {
                 Some(_) => amp,
                 None => 0.0,
             };
-            let ph = std::f64::consts::TAU * 300.0 * n as f64 / fs;
+            let ph = std::f64::consts::TAU * f0 * n as f64 / fs;
             block.push(
                 Iq::new(c * ph.cos() as f32, c * ph.sin() as f32)
                     + Iq::new(gauss(), gauss()) * std::f32::consts::FRAC_1_SQRT_2,
@@ -1333,6 +1431,26 @@ mod tests {
         }
         rx.push(&block, &mut out);
         (rx, out)
+    }
+
+    #[test]
+    fn locks_true_at_any_offset() {
+        // The squared-step detector false-locked half a cycle a bit away
+        // for some offsets (+20 Hz here); the half-bit detector does not.
+        for f0 in [20.0, 97.0, 300.0, -150.0] {
+            let (rx, out) = receive_at(f0, 0, 0, false);
+            assert!(
+                (rx.stats.offset_hz - f0).abs() < 4.0,
+                "{f0} Hz: tracked {:.1} Hz, {:.1} dB",
+                rx.stats.offset_hz,
+                rx.stats.snr_db
+            );
+            assert!(
+                !out.is_empty(),
+                "{f0} Hz: no frame at {:.1} dB",
+                rx.stats.snr_db
+            );
+        }
     }
 
     #[test]

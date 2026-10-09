@@ -1573,9 +1573,10 @@ fn cid_search(ui: &mut Ui, m: &decdvb_engine::cid::CidSearch, acquired: bool) {
     let above = m.peak_db >= m.threshold_db;
     ui.label(
         RichText::new(format!(
-            "{} search · peak {:.1} dB over the mean (locks at {:.1}) · {:+.0} Hz · \
-             code phase {:.1}",
+            "{} search over {} bits · peak {:.1} dB over the mean (locks at {:.1}) · \
+             {:+.0} Hz · code phase {:.1}",
             if acquired { "locking" } else { "latest" },
+            m.bits,
             m.peak_db,
             m.threshold_db,
             m.freq_hz,
