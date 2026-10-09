@@ -19,6 +19,7 @@ pub mod vfo;
 pub use carriers::{Carrier, detect_carriers};
 pub use cid::CidView;
 pub use decdvb_modem::e1::Coding as E1Coding;
+pub use decdvb_modem::tdm257::{ChannelState as TdmChannelState, TdmStats};
 pub use decdvb_modem::text::{ByteTextView, TextView};
 pub use demod::{Demod, LockState, PlFrame};
 pub use estimate::{BandEstimate, estimate_band};

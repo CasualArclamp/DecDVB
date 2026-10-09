@@ -248,6 +248,28 @@ fn report(st: &VfoStatus) {
             );
         }
     }
+    if let Some(t) = &f.tdm {
+        println!(
+            "tdm 257: {} · {} frames (2 ms) · {} alignment-bit errors · {} losses · side data {}",
+            if t.locked { "aligned" } else { "searching" },
+            t.frames,
+            t.faw_errors,
+            t.losses,
+            t.side_data
+                .iter()
+                .map(|b| char::from(b'0' + b))
+                .collect::<String>()
+        );
+        for (c, ch) in t.channels.iter().enumerate() {
+            println!(
+                "  channel {c:2} (bit {c:2} of each word): {:12} changes 20 ms {:5.1} % · 4 ms {:5.1} % · ones {:4.1} %",
+                ch.state.label(),
+                100.0 * ch.change_20ms,
+                100.0 * ch.change_4ms,
+                100.0 * ch.ones
+            );
+        }
+    }
     if let Some(e) = &f.e1 {
         println!(
             "e1: {} · {} frames · {} FAS errors · {} losses{}",

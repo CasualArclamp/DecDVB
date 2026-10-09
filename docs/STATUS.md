@@ -1000,3 +1000,44 @@ the same file. Fixed:
 Tests: a reported 60 000-sample gap rides through (one search, the frame
 decodes); unreported, the receiver searches again and relocks. In the GUI
 the 30 s test capture now locks at 9.3 dB a bit and decodes its frame.
+
+## The Q-Flex's 128.5 kbit/s is a 257-bit TDM multiplex (2026-10-09)
+
+The alignment bit of each 257-bit frame (2 ms; found by its column making
+the rest 16-periodic) is now read: a 70-frame pattern, 99.9 % stable — on
+alternate frames the Barker-7 sequence reversed, 0100111, again and again
+(a 14-frame, 28 ms cycle), and between them "01101" repeating (one bit every
+4 ms, so a 20 ms cycle: the codec frames' marker). So the 128.5 kbit/s on the
+modem's data port is a multiplexer's own TDM stream: 500 bit/s of framing
+and 128 kbit/s of payload as sixteen 16-bit words at 8 kHz (two 64 kbit/s
+timeslots' worth). Its make is still unknown.
+
+What 7 minutes show, channel by channel (bit n of each word, 8 kbit/s):
+- 0, 1, 2: idle codec — one 160-bit frame repeated (20 ms); laid out in
+  octets each frame is five 4 ms sub-frames whose first octet is a
+  per-channel constant (11000000, 10000100, 10010000), every octet starting
+  with a 1.
+- 3, 4, 5: a fixed 4 ms pattern.
+- 6–15: varying, more for about 20 s in every 60 s. Bits 8–14 hold one
+  7-bit value per 2 ms, changing at word 10 of every frame (P = 0.999), in
+  one of eight states (66/0/1, 64/32/33, 16/96/97, 3/4/5, 48/72/73, 9/6/7,
+  12/18/19, 36/24/25) that steps every 0.5–1.5 s: signalling, not audio.
+  (Corrects the earlier notes: bits 12 and 13 are not always 0, and the
+  activity is a 60 s cycle, not a 5 s burst.)
+- No channel carries speech in this capture.
+
+ESC: the bursts (0.2–0.3 s, on multiframe boundaries) are neither async
+characters (stop bits fail as often as random) nor HDLC, plain or under
+the usual descramblers: scrambled or encrypted binary, presumably the modems'
+M&C.
+
+`decdvb-modem::tdm257::TdmRx` finds the frame by the alignment word (every
+phase × parity × rotation, ≥ 95 % of 56 word bits), checks it every other
+frame (5 wrong of the last 14 → search again), and meters each channel over
+0.5 s: bits changed since 20 ms and since 4 ms, and ones → fixed, 4 ms
+pattern, idle codec, varying, or active (> 25 % changed at 20 ms). It runs
+on Paradise data in the FEC thread (`FecStats::tdm`); the CLI prints the
+channels, the FastLink card draws them as bars (speech should stand up near
+half). On the 7-minute capture: aligned, 214 030 frames, 5 word-bit errors,
+1 loss (at the FastLink slip). Next: a capture while someone talks, and the
+multiplexer's make — then the codec.

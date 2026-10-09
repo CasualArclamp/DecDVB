@@ -337,6 +337,9 @@ pub struct FecStats {
     pub tpc: Option<decdvb_modem::tpc2964::TpcStats>,
     /// Q-Flex FastLink: frame sync and LDPC decoding.
     pub fastlink: Option<decdvb_modem::fastlink::FastLinkStats>,
+    /// The 257-bit TDM multiplex inside a Paradise-framed payload, once
+    /// its alignment word was found.
+    pub tdm: Option<decdvb_modem::tdm257::TdmStats>,
     /// A K = 7 convolutional code: the rate and orientation found.
     pub viterbi: Option<decdvb_modem::dvbs::ViterbiStats>,
     /// What a modem's data carry (TPC 2964).
@@ -1456,6 +1459,7 @@ fn run(
     let mut dvbs_out = Vec::new();
     let mut tpc: Option<decdvb_modem::tpc2964::TpcRx> = None;
     let mut fastlink: Option<decdvb_modem::fastlink::FastLinkRx> = None;
+    let mut tdm: Option<decdvb_modem::tdm257::TdmRx> = None;
     let mut viterbi: Option<decdvb_modem::dvbs::ViterbiRx> = None;
     let mut tpc_frames = Vec::new();
     let mut payload: Option<decdvb_modem::payload::PayloadRx> = None;
@@ -1527,6 +1531,15 @@ fn run(
                     } else {
                         (!payload_out.inner.is_empty()).then_some(payload_out.inner.as_slice())
                     };
+                    // Paradise's data: look for the 257-bit multiplex in it.
+                    if matches!(
+                        pay.format(),
+                        Some(decdvb_modem::payload::Format::ParadiseEsc)
+                    ) && !payload_out.inner.is_empty()
+                    {
+                        tdm.get_or_insert_with(decdvb_modem::tdm257::TdmRx::new)
+                            .push(&payload_out.inner);
+                    }
                     if let Some(bits) = unread {
                         tpc_text
                             .get_or_insert_with(|| {
@@ -1590,6 +1603,11 @@ fn run(
                 }
                 s.tpc = tpc.as_ref().map(|r| r.stats.clone());
                 s.fastlink = fastlink.as_ref().map(|r| r.stats.clone());
+                // Shown once it has locked at least once.
+                s.tdm = tdm
+                    .as_ref()
+                    .filter(|t| t.stats.frames > 0)
+                    .map(|t| t.stats.clone());
                 s.viterbi = viterbi.as_ref().map(|r| r.stats.clone());
                 s.payload = Some(pay.stats.clone());
                 s.text = tpc_text.as_ref().map(|t| t.view());

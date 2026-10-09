@@ -1795,6 +1795,125 @@ fn fastlink_card(ui: &mut Ui, c: &CarrierState, st: &VfoStatus) {
         }
         payload_rows(ui, f);
     });
+    if let Some(m) = f.and_then(|f| f.tdm.as_ref()) {
+        tdm_card(ui, m);
+    }
+}
+
+/// The 257-bit TDM multiplex inside the Paradise framing: its alignment,
+/// then the sixteen 8 kbit/s channels (bit n of each 16-bit word) as bars —
+/// the share of bits changed since 20 ms before: an idle codec channel sits
+/// at zero, speech should stand up near half.
+fn tdm_card(ui: &mut Ui, t: &decdvb_engine::TdmStats) {
+    use decdvb_engine::TdmChannelState as S;
+    let good = Color32::from_rgb(110, 220, 110);
+    let wait = Color32::from_rgb(240, 200, 80);
+    ui.add_space(6.0);
+    ui.label(RichText::new("TDM multiplex (257-bit frames, 2 ms)").strong());
+    egui::Grid::new("tdm257").num_columns(2).show(ui, |ui| {
+        ui.label("Alignment");
+        ui.colored_label(
+            if t.locked { good } else { wait },
+            format!(
+                "{} · {} frames · {} word-bit errors{}",
+                if t.locked { "aligned" } else { "searching" },
+                t.frames,
+                t.faw_errors,
+                if t.losses > 0 {
+                    format!(" · {} losses", t.losses)
+                } else {
+                    String::new()
+                }
+            ),
+        )
+        .on_hover_text(
+            "One alignment bit a frame: the Barker-7 word (reversed) on alternate              frames, a 20 ms marker (01101…) between. Found blind on a live Q-Flex              carrier; the multiplexer's make is not known.",
+        );
+        ui.end_row();
+    });
+    let active = t.channels.iter().filter(|c| c.state == S::Active).count();
+    let w = ui.available_width();
+    let (painter, area) = scope_panel(
+        ui,
+        vec2(w, 120.0),
+        "Channels · change since 20 ms",
+        &if active > 0 {
+            format!("{active} active")
+        } else {
+            "all idle".to_string()
+        },
+    );
+    let font = egui::FontId::proportional(10.0);
+    let weak = ui.visuals().weak_text_color();
+    let plot = egui::Rect::from_min_max(area.min, area.max - vec2(0.0, 14.0));
+    let n = t.channels.len();
+    let bw = plot.width() / n as f32;
+    // Full scale: half the bits changed (random data).
+    let y_of = |v: f32| plot.bottom() - (v / 0.5).clamp(0.0, 1.0) * plot.height();
+    painter.line_segment(
+        [
+            egui::pos2(plot.left(), y_of(0.25)),
+            egui::pos2(plot.right(), y_of(0.25)),
+        ],
+        (1.0, scope::GRID),
+    );
+    for (i, ch) in t.channels.iter().enumerate() {
+        let colour = match ch.state {
+            S::Active => scope::LOCK,
+            S::Varying => scope::MARK,
+            S::IdleCodec => scope::TRACE,
+            _ => scope::AXIS,
+        };
+        let x = plot.left() + i as f32 * bw;
+        let top = y_of(ch.change_20ms).min(plot.bottom() - 2.0);
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x + 0.2 * bw, top),
+                egui::pos2(x + 0.8 * bw, plot.bottom()),
+            ),
+            1.0,
+            colour,
+        );
+        painter.text(
+            egui::pos2(x + 0.5 * bw, plot.bottom() + 2.0),
+            egui::Align2::CENTER_TOP,
+            i.to_string(),
+            font.clone(),
+            weak,
+        );
+    }
+    // A key, and each channel's state on hover over the panel.
+    ui.horizontal_wrapped(|ui| {
+        for (label, c) in [
+            ("idle codec", scope::TRACE),
+            ("varying", scope::MARK),
+            ("active", scope::LOCK),
+            ("pattern / fixed", scope::AXIS),
+        ] {
+            ui.label(RichText::new("■").color(c));
+            ui.label(RichText::new(label).small().weak());
+        }
+    });
+    egui::CollapsingHeader::new("Channel details")
+        .id_salt("tdm_details")
+        .show(ui, |ui| {
+            egui::Grid::new("tdm_channels")
+                .num_columns(4)
+                .striped(true)
+                .show(ui, |ui| {
+                    for h in ["bit", "state", "20 ms", "4 ms"] {
+                        ui.label(RichText::new(h).small().weak());
+                    }
+                    ui.end_row();
+                    for (i, ch) in t.channels.iter().enumerate() {
+                        ui.label(i.to_string());
+                        ui.label(ch.state.label());
+                        ui.label(format!("{:.1} %", 100.0 * ch.change_20ms));
+                        ui.label(format!("{:.1} %", 100.0 * ch.change_4ms));
+                        ui.end_row();
+                    }
+                });
+        });
 }
 
 /// What FEC made of a DVB-S2 VFO's frames, and the stream the BBHEADERs

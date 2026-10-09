@@ -22,6 +22,7 @@ pub mod interleave;
 pub mod paradise;
 pub mod payload;
 pub mod rs;
+pub mod tdm257;
 pub mod text;
 pub mod tpc;
 pub mod tpc2964;
