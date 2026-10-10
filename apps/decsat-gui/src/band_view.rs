@@ -67,7 +67,12 @@ pub struct BandInput<'a> {
     pub next_name: String,
     /// A live radio is the source: dragging past the span's edge tunes it.
     pub can_retune: bool,
+    /// The frequency plan's carriers (RF), labelled where they fall.
+    pub plan: &'a [crate::freqplan::Bookmark],
 }
+
+/// The colour of the frequency plan's marks.
+const PLAN: Color32 = Color32::from_rgb(235, 205, 120);
 
 #[derive(Debug, Clone, Copy, Default)]
 enum Drag {
@@ -461,8 +466,72 @@ impl BandView {
             ));
         }
 
-        // ---- VFOs
+        // ---- The frequency plan: a tick under each plan carrier in view and
+        // its name where there is room (more as the view zooms in); the one
+        // under the pointer named in full.
         let pointer = resp.hover_pos().or(resp.interact_pointer_pos());
+        let mut plan_boxes: Vec<(usize, Rect)> = Vec::new();
+        if inp.rf_center > 0.0 && !inp.plan.is_empty() {
+            let font = FontId::proportional(10.5);
+            let mut free_from = f32::NEG_INFINITY;
+            for (i, b) in inp.plan.iter().enumerate() {
+                let off = b.freq_hz - inp.rf_center;
+                if off < lo || off > hi {
+                    continue;
+                }
+                let x = x_of(off);
+                painter.line_segment(
+                    [pos2(x, spec.bottom() - 6.0), pos2(x, spec.bottom())],
+                    Stroke::new(1.0, PLAN),
+                );
+                let galley = painter.layout_no_wrap(b.name.clone(), font.clone(), PLAN);
+                let size = galley.size();
+                let left = x - size.x / 2.0;
+                if left > free_from + 6.0 && left >= rect.left() && left + size.x <= rect.right() {
+                    let r = Rect::from_min_size(pos2(left, spec.bottom() - 7.0 - size.y), size);
+                    painter.galley(r.min, galley, PLAN);
+                    plan_boxes.push((i, r));
+                    free_from = r.right();
+                }
+            }
+            // The plan carrier under the pointer, in the spectrum.
+            if let Some(p) = pointer.filter(|p| spec.contains(*p)) {
+                let rf = inp.rf_center + hz_of(p.x);
+                let px_hz = (hi - lo) / w as f64;
+                let near = inp
+                    .plan
+                    .iter()
+                    .filter(|b| (b.freq_hz - rf).abs() <= (b.bandwidth_hz / 2.0).max(4.0 * px_hz))
+                    .min_by(|a, b| (a.freq_hz - rf).abs().total_cmp(&(b.freq_hz - rf).abs()));
+                if let Some(b) = near {
+                    let text = format!(
+                        "{}\n{} · {}",
+                        b.name,
+                        crate::format::freq(b.freq_hz),
+                        crate::format::rate(b.bandwidth_hz).replace("S/s", "Hz")
+                    );
+                    let g =
+                        painter.layout_no_wrap(text, FontId::proportional(12.0), Color32::BLACK);
+                    let at = pos2(
+                        (p.x + 12.0).min(rect.right() - g.size().x - 8.0),
+                        (p.y + 14.0).min(spec.bottom() - g.size().y - 6.0),
+                    );
+                    let r = Rect::from_min_size(at, g.size()).expand(4.0);
+                    painter.rect_filled(r, CornerRadius::same(4), PLAN);
+                    painter.galley(at, g, Color32::BLACK);
+                }
+            }
+        }
+        // A VFO made at `off`, `bw` wide, is named after the plan carrier it
+        // sits on.
+        let name_at = |off: f64, bw: f64| -> String {
+            (inp.rf_center > 0.0)
+                .then(|| crate::freqplan::at(inp.plan, inp.rf_center + off, bw))
+                .flatten()
+                .map_or_else(|| inp.next_name.clone(), |b| b.name.clone())
+        };
+
+        // ---- VFOs
         let edge_px = 5.0;
         // Which VFO / edge / carrier is under a point.
         let hit_vfo = |p: Pos2| -> Option<(VfoId, bool)> {
@@ -937,7 +1006,7 @@ impl BandView {
                 let (a, b) = (start_hz.min(self.create_to), start_hz.max(self.create_to));
                 if x_of(b) - x_of(a) > 6.0 {
                     let mut s = VfoSettings::new(
-                        inp.next_name.clone(),
+                        name_at((a + b) / 2.0, b - a),
                         (a + b) / 2.0,
                         (b - a).max(min_vfo),
                         inp.new_decoder,
@@ -960,7 +1029,10 @@ impl BandView {
         if matches!(self.drag, Drag::None)
             && let Some(p) = resp.hover_pos()
         {
-            if carrier_hit.is_some() || close_hit(p).is_some() {
+            if carrier_hit.is_some()
+                || close_hit(p).is_some()
+                || plan_boxes.iter().any(|(_, r)| r.contains(p))
+            {
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
             } else {
                 match hit_vfo(p) {
@@ -977,6 +1049,18 @@ impl BandView {
             if let Some(id) = close_hit(p) {
                 // The ✕ on a VFO's label.
                 actions.push(Action::Remove(id));
+            } else if let Some(&(i, _)) = plan_boxes.iter().find(|(_, r)| r.contains(p)) {
+                // A plan carrier's name: a VFO on it, named so, a little
+                // wider than the carrier's occupied band.
+                let b = &inp.plan[i];
+                let mut s = VfoSettings::new(
+                    b.name.clone(),
+                    b.freq_hz - inp.rf_center,
+                    (b.bandwidth_hz * 1.12).max(min_vfo),
+                    inp.new_decoder,
+                );
+                s.record_dir = default_record_dir();
+                actions.push(Action::Create(s));
             } else if let Some(i) = carrier_hit {
                 let c = inp.front.carriers[i];
                 // A narrow line gets room for a slow carrier and its drift;
@@ -988,7 +1072,7 @@ impl BandView {
                 };
                 let bw = c.fit_among(want, &inp.front.carriers);
                 let mut s = VfoSettings::new(
-                    inp.next_name.clone(),
+                    name_at(c.center_hz, bw),
                     c.center_hz,
                     bw.max(min_vfo),
                     inp.new_decoder,
@@ -1013,7 +1097,7 @@ impl BandView {
             && carrier_hit.is_none()
         {
             let bw = ((hi - lo) / 25.0).max(min_vfo);
-            let mut s = VfoSettings::new(inp.next_name.clone(), hz_of(p.x), bw, inp.new_decoder);
+            let mut s = VfoSettings::new(name_at(hz_of(p.x), bw), hz_of(p.x), bw, inp.new_decoder);
             s.record_dir = default_record_dir();
             actions.push(Action::Create(s));
         }

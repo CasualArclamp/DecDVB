@@ -9,6 +9,7 @@ mod band_view;
 mod filename;
 mod format;
 mod freq_display;
+mod freqplan;
 mod player;
 mod prefs;
 mod radio;
@@ -45,7 +46,7 @@ fn main() -> eframe::Result {
         Err(e) => {
             eprintln!("decsat-gui: {e}");
             eprintln!(
-                "usage: decsat-gui [capture] [--claim-carriers] [--decoder id|ip|ts|dvbs|tpc|cdm600|fastlink|viterbi|cid|psk|rec|spec] \
+                "usage: decsat-gui [capture] [--claim-carriers] [--decoder id|ip|ts|dvbs|tpc|cdm600|fastlink|viterbi|cid|psk|rec|spec] [--plan FILE.json] \
                  [--select N] [--after SECS] [--screenshot OUT.png]"
             );
             std::process::exit(2);
@@ -80,6 +81,12 @@ fn main() -> eframe::Result {
             };
             if app.remember {
                 app.restore_session();
+                if let Some(p) = prefs::freqplan_path() {
+                    app.load_plan(&p);
+                }
+            }
+            if let Some(p) = &opts.plan {
+                app.load_plan(p);
             }
             // Claimed VFOs keep `VfoSettings::new`'s temp-dir output folder.
             if let Some(k) = opts.decoder {
@@ -144,6 +151,8 @@ struct App {
     remember: bool,
     session_saved: String,
     session_at: std::time::Instant,
+    /// The frequency plan (named carriers), if one is loaded.
+    plan: Vec<freqplan::Bookmark>,
 }
 
 impl Default for App {
@@ -179,6 +188,7 @@ impl Default for App {
             remember: false,
             session_saved: String::new(),
             session_at: std::time::Instant::now(),
+            plan: Vec::new(),
         }
     }
 }
@@ -186,6 +196,21 @@ impl Default for App {
 impl App {
     fn next_name(&self) -> String {
         format!("VFO {}", self.names)
+    }
+
+    /// Load the frequency plan in `path` (an SDR++ bookmark list).
+    fn load_plan(&mut self, path: &std::path::Path) {
+        match freqplan::load(path) {
+            Ok(plan) => {
+                self.note = format!(
+                    "Frequency plan: {} carriers from {}",
+                    plan.len(),
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
+                self.plan = plan;
+            }
+            Err(e) => self.note = format!("Frequency plan not read: {e}"),
+        }
     }
 
     /// The session to remember: the HackRF panel, the file source's
@@ -691,6 +716,32 @@ impl App {
                     self.apply(a);
                 }
             }
+            let plan_tip = if self.plan.is_empty() {
+                "Load a frequency plan: an SDR++ frequency-manager bookmark list (.json).                  Its carriers are labelled on the waterfall (zoom in for more names),                  clicking a name makes a VFO on that carrier, and VFOs made on one take                  its name. Kept only here: its path is remembered."
+                    .to_string()
+            } else {
+                format!(
+                    "{} carriers in the plan. Click to load another; right-click to stop using it.",
+                    self.plan.len()
+                )
+            };
+            let r = ui.button("📋 Plan…").on_hover_text(plan_tip);
+            if r.clicked()
+                && let Some(p) = rfd::FileDialog::new()
+                    .add_filter("SDR++ bookmarks", &["json"])
+                    .set_directory(prefs::output_dir())
+                    .pick_file()
+            {
+                self.load_plan(&p);
+                if !self.plan.is_empty() {
+                    let _ = prefs::set_freqplan_path(Some(&p));
+                }
+            }
+            if r.secondary_clicked() && !self.plan.is_empty() {
+                self.plan.clear();
+                let _ = prefs::set_freqplan_path(None);
+                self.note = "Frequency plan put away".into();
+            }
             if ui.button("📂 Open IQ…").clicked()
                 && let Some(p) = rfd::FileDialog::new()
                     .add_filter(
@@ -1051,6 +1102,7 @@ impl eframe::App for App {
                     new_decoder: self.new_decoder,
                     next_name: self.next_name(),
                     can_retune: self.can_retune(),
+                    plan: &self.plan,
                 };
                 actions.extend(self.band.show(ui, &inp));
             });

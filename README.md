@@ -334,6 +334,16 @@ then says when someone speaks, and ▶/● play and record it. A carrier too slo
 *provisional* while it listens longer. Between identifications it keeps
 demodulating with what it found, so the constellation and MER stay live.
 
+### Frequency plan
+
+**📋 Plan…** loads a frequency plan — an SDR++ frequency-manager bookmark
+list (`.json`: name, RF frequency, bandwidth per carrier). Its carriers are
+marked along the foot of the spectrum and named where there is room (zoom in
+for more); hovering names the one under the pointer, clicking a name makes a
+VFO on that carrier with its name and width, and a VFO drawn or claimed on a
+plan carrier takes its name. The plan stays your own file: only its path is
+remembered (right-click the button to stop using it).
+
 ### Command line
 
 ```bash

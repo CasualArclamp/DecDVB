@@ -1632,3 +1632,17 @@ whose carrier has voice active — G.728 speech in an E1/D&I timeslot, or a
 TDM call talking (`band_view::voice_active`) — is drawn green with 🔊 in
 the waterfall and the VFO list. Checked on the CDM-600L recording (an
 unattended screenshot, TPC decoder so nothing plays).
+
+## Frequency plan (2026-10-10)
+
+`decsat-gui::freqplan` reads SDR++ frequency-manager bookmark lists
+(`{"bookmarks": {name: {frequency, bandwidth, mode}}}`, `serde_json`):
+📋 Plan… in the toolbar, the path kept in prefs (`freqplan`; right-click
+clears it), the plan itself never copied. The band view marks each plan
+carrier in view along the spectrum's foot (names decluttered left to right,
+more as it zooms), names the one under the pointer with its frequency and
+width, makes a VFO on a clicked name (its width × 1.12), and names VFOs
+drawn, claimed or double-clicked onto a plan carrier (`freqplan::at`). GUI
+automation takes `--plan FILE` (unattended runs do not read the saved one).
+Rory's Horizons 3e plan (Comtech and Q-Flex sites; 58 837 Hz is
+1.35 × 43.6 kS/s, the CDM-600s) stays local.

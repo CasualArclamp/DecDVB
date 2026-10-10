@@ -30,6 +30,8 @@ pub struct Options {
     pub ts_viewer: bool,
     /// Play the selected VFO's first multicast audio stream in the app.
     pub play_audio: bool,
+    /// A frequency plan to show (unattended runs do not read the saved one).
+    pub plan: Option<PathBuf>,
 }
 
 impl Options {
@@ -60,6 +62,9 @@ impl Options {
                         decoder_by_name(&v)
                             .ok_or("--decoder takes id, ip, ts, dvbs, tpc, cdm600, fastlink, viterbi, cid, psk, rec or spec")?,
                     );
+                }
+                Some("--plan") => {
+                    o.plan = Some(PathBuf::from(args.next().ok_or("--plan needs a file")?));
                 }
                 Some("--select") => {
                     let v = args.next().ok_or("--select needs a VFO number")?;

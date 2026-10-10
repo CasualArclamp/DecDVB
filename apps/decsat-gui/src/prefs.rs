@@ -148,6 +148,25 @@ pub fn save_audio() {
     let _ = write_key("muted", if decsat_audio::muted() { "1" } else { "0" });
 }
 
+/// The frequency plan file in use (the user's own: only its path is kept).
+pub fn freqplan_path() -> Option<PathBuf> {
+    read_all()
+        .into_iter()
+        .find(|(k, _)| k == "freqplan")
+        .map(|(_, v)| PathBuf::from(v))
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Use `path` as the frequency plan from now on (`None`: no plan).
+pub fn set_freqplan_path(path: Option<&std::path::Path>) -> std::io::Result<()> {
+    write_key(
+        "freqplan",
+        &path
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    )
+}
+
 /// Where new output goes.
 pub fn output_dir() -> PathBuf {
     OUTPUT_DIR
