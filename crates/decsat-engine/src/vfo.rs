@@ -346,10 +346,47 @@ pub struct VfoStatus {
 #[derive(Debug, Clone, Copy)]
 pub struct CarrierState {
     pub locked: bool,
+    /// The symbols' modulation error ratio, dB: their Es/N0 as measured
+    /// (signal power over the error from the nearest ideal point).
     pub mer_db: f32,
     /// Residual offset the loop is tracking, Hz.
     pub offset_hz: f64,
     pub modulation: decsat_core::Modulation,
+    /// Information bits a symbol carries, once the code is known (its rate
+    /// times the bits per symbol, less framing overhead): Eb/N0 is then per
+    /// information bit. `None`: per channel bit (uncoded).
+    pub info_bits: Option<f32>,
+}
+
+impl CarrierState {
+    /// Es/N0, dB: the MER.
+    pub fn esn0_db(&self) -> f32 {
+        self.mer_db
+    }
+
+    /// Eb/N0, dB: Es/N0 less 10·log10 of the bits a symbol carries
+    /// (information bits when the code is known, else channel bits).
+    pub fn ebn0_db(&self) -> f32 {
+        let bits = self
+            .info_bits
+            .unwrap_or(f32::from(self.modulation.bits_per_symbol()));
+        self.mer_db - 10.0 * bits.max(1e-3).log10()
+    }
+
+    /// "Es/N0 8.1 dB · Eb/N0 4.6 dB", the Eb/N0 marked uncoded when the
+    /// code's rate is not known.
+    pub fn snr_text(&self) -> String {
+        format!(
+            "Es/N0 {:.1} dB · Eb/N0 {:.1} dB{}",
+            self.esn0_db(),
+            self.ebn0_db(),
+            if self.info_bits.is_some() {
+                ""
+            } else {
+                " (uncoded)"
+            }
+        )
+    }
 }
 
 /// Messages on a worker's queue. Settings do not travel here: the queue is
@@ -1324,6 +1361,7 @@ impl Worker {
                         mer_db: l.demod.mer_db(),
                         offset_hz: l.demod.carrier_offset_hz(),
                         modulation: l.demod.modulation(),
+                        info_bits: None,
                     });
                 } else {
                     match self
@@ -1378,11 +1416,18 @@ impl Worker {
                     st.symbol_rate = Some(d.symbol_rate());
                     st.scatter = d.recent_symbols(2000);
                     if let (true, Some(m)) = (d.carrier_running(), d.modulation()) {
+                        // The last MODCOD's LDPC rate (BCH, header and pilots
+                        // left out: a few tenths of a dB).
+                        let rate = self
+                            .last_modcod
+                            .and_then(|i| decsat_core::modcod(i, decsat_core::FecFrame::Normal))
+                            .map(|mc| mc.rate.as_f64() as f32);
                         st.carrier = Some(CarrierState {
                             locked: d.carrier_locked(),
                             mer_db: d.mer_db(),
                             offset_hz: d.carrier_offset_hz(),
                             modulation: m,
+                            info_bits: rate.map(|r| r * f32::from(m.bits_per_symbol())),
                         });
                     }
                     st.gold_code = Some(d.gold_code());
@@ -1408,9 +1453,10 @@ impl Worker {
                             };
                             format!("locked · {} of {} BBFRAMEs good · {what}", f.ok, f.frames)
                         }
-                        (LockState::Locked, _) => {
-                            format!("locked, {} frames, MER {:.1} dB", d.frames(), d.mer_db())
-                        }
+                        (LockState::Locked, _) => match &st.carrier {
+                            Some(c) => format!("locked, {} frames, {}", d.frames(), c.snr_text()),
+                            None => format!("locked, {} frames", d.frames()),
+                        },
                     };
                     st.fec = fec;
                 }
@@ -1434,18 +1480,20 @@ impl Worker {
                 Some(d) => {
                     st.symbol_rate = Some(d.symbol_rate());
                     st.scatter = d.recent();
-                    st.carrier = Some(CarrierState {
+                    let f = fec.as_ref().map(|w| w.stats());
+                    let carrier = CarrierState {
                         locked: d.locked(),
                         mer_db: d.mer_db(),
                         offset_hz: d.carrier_offset_hz(),
                         modulation: d.modulation(),
-                    });
-                    let f = fec.as_ref().map(|w| w.stats());
+                        info_bits: modem_info_bits(kind.chain(), d.modulation(), f.as_ref()),
+                    };
+                    st.carrier = Some(carrier);
                     let lock = format!(
-                        "{} {}, MER {:.1} dB",
+                        "{} {}, {}",
                         d.modulation().name(),
                         if d.locked() { "locked" } else { "not locked" },
-                        d.mer_db()
+                        carrier.snr_text()
                     );
                     st.message = if *kind == DecoderKind::Tpc2964 {
                         tpc_message(&lock, f.as_ref())
@@ -1518,22 +1566,24 @@ impl Worker {
                 Some(d) => {
                     st.symbol_rate = Some(d.symbol_rate());
                     st.scatter = d.recent();
-                    st.carrier = Some(CarrierState {
+                    let carrier = CarrierState {
                         locked: d.locked(),
                         mer_db: d.mer_db(),
                         offset_hz: d.carrier_offset_hz(),
                         modulation: d.modulation(),
-                    });
+                        info_bits: None,
+                    };
+                    st.carrier = Some(carrier);
                     if let Some(p) = path {
                         st.recording = Some((p.clone(), *written));
                     }
                     st.recording_active = writer.is_some();
                     st.text = text.as_ref().map(|t| t.view());
                     let lock = format!(
-                        "{} {}, MER {:.1} dB",
+                        "{} {}, {}",
                         d.modulation().name(),
                         if d.locked() { "locked" } else { "not locked" },
-                        d.mer_db()
+                        carrier.snr_text()
                     );
                     st.message = match (writer.is_some(), *open_failed, path) {
                         (_, true, Some(p)) => format!("{lock} — cannot write {}", p.display()),
@@ -1543,6 +1593,30 @@ impl Worker {
                 }
             },
         }
+    }
+}
+
+/// Information bits a symbol of a coded modem carries, when its code is
+/// known: TPC 2964's 2223 data bits a 2964-bit frame (UW included);
+/// FastLink's data bits a frame of symbols; a convolutional code's rate (and
+/// DVB-S's Reed–Solomon 188/204, EN 300 421 §4.4.2) once found.
+fn modem_info_bits(
+    kind: DecoderKind,
+    m: decsat_core::Modulation,
+    f: Option<&FecStats>,
+) -> Option<f32> {
+    use decsat_modem::{fastlink, tpc2964};
+    let bits = f32::from(m.bits_per_symbol());
+    match kind {
+        DecoderKind::Tpc2964 => Some(bits * tpc2964::DATA as f32 / tpc2964::FRAME as f32),
+        DecoderKind::FastLink => Some(fastlink::FRAME_DATA as f32 / fastlink::FRAME_SYMBOLS as f32),
+        DecoderKind::Viterbi => f?.viterbi.as_ref()?.rate.map(|r| bits * r.value() as f32),
+        DecoderKind::DvbsTs => f?
+            .dvbs
+            .as_ref()?
+            .rate
+            .map(|r| bits * r.value() as f32 * 188.0 / 204.0),
+        _ => None,
     }
 }
 

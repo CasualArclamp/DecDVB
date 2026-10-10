@@ -223,10 +223,10 @@ fn report(st: &VfoStatus) {
     println!("\n== {}", st.message);
     if let Some(c) = &st.carrier {
         println!(
-            "carrier: {} {}, MER {:.1} dB, offset {:+.0} Hz",
+            "carrier: {} {}, {}, offset {:+.0} Hz",
             c.modulation.name(),
             if c.locked { "locked" } else { "not locked" },
-            c.mer_db,
+            c.snr_text(),
             c.offset_hz
         );
     }

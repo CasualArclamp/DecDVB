@@ -33,7 +33,7 @@ TPC 2964 carrier). Every carrier was found and identified blind.*
 | VFOs: draw, drag, resize, click a carrier to claim it; one thread each | ✅ |
 | **Identify** — blind symbol rate, roll-off, constellation, DVB-S2/S2X detection | ✅ |
 | DVB-S2/S2X PL demodulation: frame lock, MODCOD per frame (ACM) | ✅ |
-| Carrier recovery: a locked constellation and MER, for Identify and DVB-S2 VFOs | ✅ |
+| Carrier recovery: a locked constellation, Es/N0 (the MER) and Eb/N0, for Identify and DVB-S2 VFOs | ✅ |
 | **DVB-S → MPEG-TS** (EN 300 421): code rate, rotation and inversion found blind; Viterbi, RS, the same TS outputs | ✅ |
 | **TPC 2964 → IP / TS / voice** (Intelsat IESS-315 turbo product code, BPSK/QPSK): frame structure, scrambling and payload found from the signal; HDLC → IP, MPEG-TS, E1, Comtech D&I++ voice and 64 kbit/s timeslots in HDLC packets | ✅ confirmed on a live Comtech CDM-600L carrier |
 | **Q-Flex FastLink → data and voice** (Paradise, QPSK 0.710): sync word, the (2880, 2048) LDPC code and the frame scrambler, all measured from a live carrier; inside, Paradise's closed-network + ESC framing and a 257-bit TDM multiplex (sixteen 8 kbit/s channels, metered live so speech shows); a call's G.728 voice put together from its four channels — listen, record `.wav` | ✅ decodes a live Q-Flex down to the calls' speech |
@@ -89,7 +89,7 @@ PCAP and TS files go (default `Documents\DecSAT`); it is remembered between
 runs and applies to existing VFOs too.
 
 The side bar lists the VFOs with their CPU load (✕ removes one), and shows the
-selected one's settings, its Identify result or demodulator state (lock, MER,
+selected one's settings, its Identify result or demodulator state (lock, Es/N0 and Eb/N0,
 residual offset), a carrier-locked constellation and a zoomed spectrum.
 
 ### DVB-S2 → GSE/IP → PCAP
@@ -263,7 +263,7 @@ rate wide: 151 kHz below 512 kBd, 302 kHz above): it measures the carrier,
 searches for the spreading code (a fraction of a second), then reads frames —
 one every 36 s (18 s on carriers of 512 kBd and up). Its card shows the
 tracking live — the despread bits and their differential products as
-constellations (with MER), the early/prompt/late correlators on the code's
+constellations (with Es/N0), the early/prompt/late correlators on the code's
 correlation peak, SNR and frequency over the last few seconds, the soft bits
 and the frame sync filling copy by copy — and, under **Code search**, the
 acquisition itself: correlation over the 4096 code phases, and code phase ×
@@ -349,7 +349,7 @@ Where each channel's bits go is learnt from the voice equipment's silence
 fill (a known pattern) while the channels idle; the **Call voice** card
 then says when someone speaks, and ▶/● play and record it. A carrier too slow to show three frames in the first look is marked
 *provisional* while it listens longer. Between identifications it keeps
-demodulating with what it found, so the constellation and MER stay live.
+demodulating with what it found, so the constellation and Es/N0 stay live.
 
 ### Frequency plan
 

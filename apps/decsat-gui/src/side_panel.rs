@@ -1570,7 +1570,7 @@ fn scope_panel(
 
 /// A BPSK constellation: axes, the unit circle and the two ideal points
 /// as a graticule, the points fading with age (the newest marked), and the
-/// MER against the nearer ideal point as the reading.
+/// Es/N0 (the MER against the nearer ideal point) as the reading.
 fn scope_constellation(ui: &mut Ui, title: &str, pts: &[decsat_core::Iq], side: f32, c: Color32) {
     const FULL: f32 = 1.8;
     let err: f32 = pts
@@ -1581,7 +1581,7 @@ fn scope_constellation(ui: &mut Ui, title: &str, pts: &[decsat_core::Iq], side: 
         String::new()
     } else {
         format!(
-            "MER {:.1} dB",
+            "Es/N0 {:.1} dB",
             10.0 * (pts.len() as f32 / err.max(1e-9)).log10()
         )
     };
@@ -2902,7 +2902,7 @@ fn carrier_rows(ui: &mut Ui, c: &CarrierState) {
     if c.locked {
         ui.colored_label(
             Color32::from_rgb(110, 220, 110),
-            format!("{} locked · MER {:.1} dB", c.modulation.name(), c.mer_db),
+            format!("{} locked · {}", c.modulation.name(), c.snr_text()),
         );
     } else {
         ui.colored_label(
@@ -3030,7 +3030,7 @@ fn identification_card(
                     if c.locked {
                         ui.colored_label(
                             Color32::from_rgb(110, 220, 110),
-                            format!("locked · MER {:.1} dB (live)", c.mer_db),
+                            format!("locked · {} (live)", c.snr_text()),
                         );
                     } else {
                         ui.colored_label(Color32::from_rgb(230, 150, 90), "not locked (live)");
@@ -3041,7 +3041,7 @@ fn identification_card(
                     if id.carrier_locked {
                         ui.colored_label(
                             Color32::from_rgb(110, 220, 110),
-                            format!("locked · MER {mer:.1} dB"),
+                            format!("locked · Es/N0 {mer:.1} dB"),
                         );
                     } else {
                         ui.colored_label(
