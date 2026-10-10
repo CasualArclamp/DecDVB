@@ -1373,3 +1373,24 @@ silence made of near-all-ones 10-bit words — the "0 every fifth bit" of
 each 8 kbit/s half. The Q-Flex calls are 16 kbit/s across four channels
 too. Testing it needs a G.728 decoder, i.e. the codebooks of ITU-T G.728
 (not fetched: ask first).
+
+G.728 tried (2026-10-10, Rory's go-ahead): the ITU-T reference coder (G.191
+STL, `openitu/STL` src/g728, AT&T, "ITU-T General Public License" — used
+locally as a test tool only, nothing of it in this repo) built and checked
+bit-exact against all its test vectors. Then the CDM-600L TS1 sub-channel
+and both Q-Flex calls were decoded under every codeword alignment, bit and
+field order, lane order and polarity (the Q-Flex stream taken as two bits a
+TDM word: channels 0, 1 for 2 ms, then 2, 15). Result: not confirmed.
+- Inverted, the idle frames decode near-silent (5th-percentile frame level
+  −50 dBFS, against −10 for random codewords): the idle code is close to
+  all-zero codewords once inverted. That fits G.728 but would fit others.
+- No reading decodes the talk spurts as speech: every one comes out loud
+  and clipping (2–4 % of samples), like random codewords (8 %).
+- The talk data carry fixed bits plain G.728 cannot have: in the second
+  lane of each pair (channels 1 and 15) a 0 after a mostly-1 bit, about
+  every fifth lane bit — 32 per 20 ms — and channel 15's per-call flag.
+  Their drift says each 4 ms holds ~60 bits of a coded stream, but no
+  choice of lane order and left-out bit puts them on a 10-bit grid. So the
+  multiplexer's mapping is not solved; with it, G.728 (or its 12.8/9.6
+  kbit/s Annex H, if the fixed bits are padding) could be tried again. The
+  make of the voice multiplexer would short-cut all of this.
