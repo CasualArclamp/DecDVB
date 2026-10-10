@@ -1710,3 +1710,7 @@ Rory's Horizons 3e plan (Comtech and Q-Flex sites; 58 837 Hz is
   call unchanged (8.7 s); the CDM-600L's decode identical sample for sample.
   Also: a block with more than three unknown sync bits is not speech.
 
+**The Q-Flex calls' tones are the radio's own (2026-10-10).** Rory, having
+listened: the weak lines at ~400, 1200 and 2000 Hz in the decoded calls come
+from the radio itself, not the decoding. Nothing to chase there.
+
