@@ -1458,7 +1458,8 @@ octet, 16 kbit/s):
 - a codeword is 10 contiguous bits starting at the sync bit, MSB first,
   all bits inverted: bit 9 sync (inverted 1 → shapes 64–127, once per
   20 ms 0 → 0–63), bits 8–3 the rest of the shape index, bit 2 the gain
-  sign, bits 1–0 the gain magnitude (G.728 §3.9, Table 5/5.2 layout);
+  sign, bits 1–0 the gain magnitude (G.728 §3.9 and §5.14: 7-bit shape index
+  then 3-bit gain index; codebooks in Annex B);
 - the silence fill is not codec output: raw units 1111 cccc 11 with a
   4-bit counter stepping down one a codeword (inverted, codewords 0…15
   over and over), which decodes near-silent.
