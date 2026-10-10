@@ -569,20 +569,30 @@ pub fn classify_constellation(sym: &[Iq], rs: f64) -> (ConstellationGuess, Optio
 
     // One ring: BPSK leaves a line in s², QPSK in s⁴ (but not s²), 8PSK only
     // in s⁸. The line sits at 2× (4×, 8×) the residual carrier offset, which
-    // this also measures. BPSK first: it has an s⁴ line too.
+    // this also measures. A line counts only when the next power has one at
+    // twice its frequency, as the carrier's own always does: data that
+    // repeat from frame to frame (an 8PSK modem's idle frames, a third of
+    // each repeated with its sign flipped) put lines into s² and s⁴ that
+    // are not the carrier's, and a lone s² line read 8PSK as BPSK.
     let p2: Vec<Iq> = sym.iter().map(|s| (s / rms) * (s / rms)).collect();
     let p4: Vec<Iq> = p2.iter().map(|s| s * s).collect();
     let p8: Vec<Iq> = p4.iter().map(|s| s * s).collect();
-    if let Some((f, s2)) = strongest_line(&p2, rs, -half, half)
-        && s2 > 20.0
-    {
-        return (ConstellationGuess::Bpsk, Some(f / 2.0));
-    }
-    let l4 = strongest_line(&p4, rs, -half, half);
-    let l8 = strongest_line(&p8, rs, -half, half);
-    match (l4, l8) {
-        (Some((f, s4)), _) if s4 > 20.0 => (ConstellationGuess::Qpsk, Some(f / 4.0)),
-        (_, Some((f, s8))) if s8 > 20.0 => (ConstellationGuess::Psk8, Some(f / 8.0)),
+    let line = |p: &[Iq]| strongest_line(p, rs, -half, half).filter(|&(_, st)| st > 20.0);
+    let (l2, l4, l8) = (line(&p2), line(&p4), line(&p8));
+    // Rust note: `rem_euclid` is a modulo that is never negative; the lines'
+    // frequencies wrap at ±rs/2, so twice one is compared round the circle.
+    let tol = 8.0 * rs / sym.len() as f64;
+    let twice = |a: Option<(f64, f32)>, b: Option<(f64, f32)>| match (a, b) {
+        (Some((fa, _)), Some((fb, _))) => {
+            let d = (fb - 2.0 * fa + half).rem_euclid(rs) - half;
+            d.abs() <= tol
+        }
+        _ => false,
+    };
+    match (l2, l4, l8) {
+        (Some((f, _)), _, _) if twice(l2, l4) => (ConstellationGuess::Bpsk, Some(f / 2.0)),
+        (_, Some((f, _)), _) if twice(l4, l8) => (ConstellationGuess::Qpsk, Some(f / 4.0)),
+        (_, _, Some((f, _))) => (ConstellationGuess::Psk8, Some(f / 8.0)),
         _ if sse1 < 0.05 => (ConstellationGuess::PskUnclear, None),
         _ => (ConstellationGuess::Unclear, None),
     }
@@ -1006,6 +1016,38 @@ mod tests {
         assert_eq!(symbol_rate_moved(&x, 4.0, 1.0), None);
         let moved = symbol_rate_moved(&x, 4.0, 4.0 / 3.0).expect("moved");
         assert!((moved - 1.0).abs() < 0.01, "{moved}");
+    }
+
+    /// 8PSK whose frames (988 symbols) repeat a third of their content with
+    /// the sign flipped each frame, as a Comtech 8PSK TPC carrier's idle
+    /// data do: the repetition puts lines into s² and s⁴ that are not the
+    /// carrier's, and the classifier took it for BPSK.
+    #[test]
+    fn eight_psk_with_repeating_frames_is_not_bpsk() {
+        let mut x = 0x9E37_79B9u32;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let fixed: Vec<u32> = (0..330).map(|_| next() % 8).collect();
+        let df = 0.013; // residual carrier, cycles a symbol
+        let sym: Vec<Iq> = (0..988 * 120)
+            .map(|n| {
+                let (frame, k) = (n / 988, n % 988);
+                let label = if k < fixed.len() {
+                    (fixed[k] + 4 * (frame as u32 % 2)) % 8
+                } else {
+                    next() % 8
+                };
+                let ph = std::f64::consts::TAU * (label as f64 / 8.0 + df * n as f64);
+                Iq::new(ph.cos() as f32, ph.sin() as f32)
+            })
+            .collect();
+        let (guess, offset) = classify_constellation(&sym, 1.0);
+        assert_eq!(guess, ConstellationGuess::Psk8);
+        assert!((offset.unwrap() - df).abs() < 1e-3, "{offset:?}");
     }
 
     #[test]
