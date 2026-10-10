@@ -45,7 +45,7 @@ fn main() -> eframe::Result {
         Err(e) => {
             eprintln!("decsat-gui: {e}");
             eprintln!(
-                "usage: decsat-gui [capture] [--claim-carriers] [--decoder id|ip|ts|dvbs|tpc|psk|rec|spec] \
+                "usage: decsat-gui [capture] [--claim-carriers] [--decoder id|ip|ts|dvbs|tpc|cdm600|fastlink|viterbi|cid|psk|rec|spec] \
                  [--select N] [--after SECS] [--screenshot OUT.png]"
             );
             std::process::exit(2);
