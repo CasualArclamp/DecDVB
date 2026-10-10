@@ -1519,3 +1519,27 @@ voice in bits 2–3". Checked: the CDM-600L recording decodes end to end
 (`decdvb decode … --decoder tpc --e1-record 1`) to the same speech as the
 reference decoder, the silence fill muted; only the first half second,
 before the timeslot is judged, plays raw.
+
+## The Q-Flex calls are G.728 too: their channel mapping (2026-10-10)
+
+The silence fill is a known plaintext (raw units 1111 cccc 11, the count
+stepping down: a 160-bit cycle), and each call channel's data bits in
+silence match it exactly (96–100 %) as every other bit of the 16 kbit/s
+stream, 64 stream bits a 4 ms subframe. So the stream is two 8 kbit/s
+halves interleaved: even bits from channel 15 (15 bits, from subframe
+bit 0) then channel 1 (16, from bit 16), odd bits from channel 2 (16,
+from bit 0) then channel 0 (16, from bit 16). Two things make it hard:
+- the halves drift against each other (0 half-bits apart at 401 s, 8 at
+  407 s; in the talk spurts the framing says 32), and the channels slip
+  a bit now and then, each on its own;
+- one even bit each subframe is in none of the 16 channels (it sits
+  between channel 1's block and channel 15's next): 63 of 64 bits carried,
+  so about one G.728 codeword in six has a wrong bit.
+
+Taken as halves with a delay searched per 0.5 s, the windows where the
+G.728 framing holds (sync bit 1 in 32, gain-bit pair dependent) decode with
+the reference decoder as speech (pitch harmonics, formants) in both calls
+— about 2.5 s of each so far; the rest is lost to slips inside windows.
+Next: follow each channel's slips subframe by subframe (by its overhead
+pattern) and the halves' delay continuously, then put it in the TDM path
+as the CDM-600L's is.
