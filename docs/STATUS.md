@@ -1543,3 +1543,41 @@ the reference decoder as speech (pitch harmonics, formants) in both calls
 Next: follow each channel's slips subframe by subframe (by its overhead
 pattern) and the halves' delay continuously, then put it in the TDM path
 as the CDM-600L's is.
+
+## Q-Flex call voice in the app (2026-10-10)
+
+The "drift" between the call's two half-streams was the analysis's own
+doing, mostly the 0.5 s windows guessing channel 15's place a bit either
+way: in both calls the channels hold their places throughout. Per 4 ms the
+stream is, in time order, (ch1, ch0) bit pairs in their data half and
+(ch15 one bit late, ch2) pairs in theirs, the first even bit of that half
+lost (the 64th bit, in no channel). The 19:54 call has the halves the other
+way round in the subframe; the rule is the same.
+
+`tdm257` now learns this itself. While a channel idles as a codec its last
+160 ms are matched against the silence fill (`calibrate`: for each offset
+into the fill's 160-bit cycle, the longest run of subframe positions that
+follow it; the offset is known modulo 160, or 80 for some channels). Four
+placed channels whose bits tile a subframe's 64 stream bits (63 here, none
+twice, offsets within 40 of each other, relative so that the fill
+restarting after speech changes nothing) make a stream (`group`). A run can
+come out a bit long — a status bit next to it matching the fill by chance —
+so every 15- or 16-bit window of each run is tried: all such tilings are
+assembled and framed side by side, and the first whose G.728 framing shows
+speech is kept. The stream goes through `g728::Framer` (the Lane's framing
+split out, with `UNCARRIED` bits: a sync slot not carried may stand for an
+odd one; decoded as the sync value or 0).
+
+Engine: `tdm_play` / `tdm_record` in the VFO settings; a CallVoice stage
+plays and records the decoded speech as A-law, 2 ms a TDM frame, silence
+between talk spurts. GUI: a "Call voice (G.728)" card (channels, speech or
+silent, seconds so far, ▶ ●). CLI: `--tdm-record` and a "G.728 call voice"
+line. Checked: the qflex_3 capture end to end — call at 395.3 s on channels
+0, 1, 2, 15, 8.7 s of speech decoded and recorded where it falls in time;
+the 19:54 call's frames, 9.9 s (the `#[ignore]` test
+`decodes_a_captured_call` reads saved frames). Weak steady lines at 400,
+1200 and 2000 Hz remain in both calls' decodes; they do not change with the
+guess for the missing bit.
+
+E1 timeslots not judged yet, or sub-rate with no G.728 found, now play
+silence instead of their bytes as A-law (loud noise).

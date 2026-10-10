@@ -720,6 +720,11 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
         if let Some(e) = st.fec.as_ref().and_then(|f| f.e1.as_ref()) {
             e1_card(ui, e, v, &mut actions);
         }
+        if let Some(f) = &st.fec
+            && let Some(voice) = f.tdm.as_ref().and_then(|t| t.voice)
+        {
+            call_voice_card(ui, voice, f.call_voice.as_ref(), v, &mut actions);
+        }
         if let Some(f) = &st.fec {
             if let Some(g) = &f.gse {
                 gse_card(ui, g);
@@ -805,6 +810,82 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
 /// An E1 in a modem's data: its alignment and timeslots, each with its
 /// level; any one can be played (G.711 A-law, through the app's player) and
 /// one recorded to a `.wav`.
+/// A call's G.728 voice in a Q-Flex's TDM multiplex: which channels, whether
+/// it is speaking, and ▶ / ● for it.
+fn call_voice_card(
+    ui: &mut Ui,
+    voice: decdvb_engine::TdmVoiceView,
+    out: Option<&decdvb_engine::CallVoiceView>,
+    v: &UiVfo,
+    actions: &mut Vec<Action>,
+) {
+    ui.add_space(6.0);
+    let channels: Vec<String> = (0..16)
+        .filter(|c| voice.channels >> c & 1 == 1)
+        .map(|c| c.to_string())
+        .collect();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Call voice (G.728)").strong()).on_hover_text(
+            "G.728 LD-CELP at 16 kbit/s spread over four TDM channels, two bits a TDM word.              Where each channel's bits go is learnt from the voice equipment's silence fill;              one bit in 64 is in no channel and is guessed.",
+        );
+        if v.settings.tdm_play {
+            volume_control(ui);
+        }
+    });
+    let mut s = v.settings.clone();
+    ui.horizontal(|ui| {
+        if voice.talking {
+            ui.colored_label(scope::LOCK, "speech");
+        } else {
+            ui.label("silent");
+        }
+        ui.label(
+            RichText::new(format!(
+                "channels {} · {:.1} s of speech so far",
+                channels.join(", "),
+                voice.talk_blocks as f64 * 0.04
+            ))
+            .small()
+            .weak(),
+        );
+        if ui
+            .small_button(if s.tdm_play { "⏹" } else { "▶" })
+            .on_hover_text(if s.tdm_play { "Stop" } else { "Listen" })
+            .clicked()
+        {
+            s.tdm_play = !s.tdm_play;
+        }
+        if ui
+            .small_button(if s.tdm_record { "⏹" } else { "●" })
+            .on_hover_text(if s.tdm_record {
+                "Stop recording"
+            } else {
+                "Record the call voice to a .wav"
+            })
+            .clicked()
+        {
+            s.tdm_record = !s.tdm_record;
+        }
+    });
+    if let Some(o) = out {
+        if let Some(err) = &o.error {
+            ui.colored_label(Color32::from_rgb(230, 110, 110), err);
+        }
+        if let Some((path, bytes)) = &o.record_file {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            let txt = format!("{} ({})", name.unwrap_or_default(), format::bytes(*bytes));
+            if o.recording {
+                ui.colored_label(Color32::from_rgb(230, 90, 90), format!("● {txt}"));
+            } else {
+                ui.label(RichText::new(format!("{txt}, stopped")).small());
+            }
+        }
+    }
+    if s != v.settings {
+        actions.push(Action::Update(v.id, s));
+    }
+}
+
 fn e1_card(ui: &mut Ui, e: &decdvb_engine::E1View, v: &UiVfo, actions: &mut Vec<Action>) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {

@@ -37,6 +37,8 @@ pub struct DecodeArgs {
     pub out: Option<PathBuf>,
     pub fast: bool,
     pub e1_record: Option<u8>,
+    /// fastlink: record the TDM multiplex's call voice.
+    pub tdm_record: bool,
     /// psk: how the .bin numbers the symbols.
     pub labels: String,
     /// cid: low-SNR mode.
@@ -165,6 +167,10 @@ pub fn decode(a: DecodeArgs) -> Result<()> {
         bail!("--e1-record needs --out");
     }
     s.e1_record = a.e1_record;
+    if a.tdm_record && a.out.is_none() {
+        bail!("--tdm-record needs --out");
+    }
+    s.tdm_record = a.tdm_record;
     let id = eng.add_vfo(s);
 
     let t0 = Instant::now();
@@ -482,6 +488,18 @@ pub(crate) fn print_tdm(t: &decdvb_modem::tdm257::TdmStats) {
             c.seconds(),
             if c.open { " (still going)" } else { "" },
             c.channel_list()
+        );
+    }
+    if let Some(v) = &t.voice {
+        let ch: Vec<String> = (0..16)
+            .filter(|c| v.channels >> c & 1 == 1)
+            .map(|c| c.to_string())
+            .collect();
+        println!(
+            "  G.728 call voice on channels {} · {:.1} s of speech decoded{}",
+            ch.join(", "),
+            v.talk_blocks as f64 * 0.04,
+            if v.talking { " · speaking" } else { "" }
         );
     }
     for (c, ch) in t.channels.iter().enumerate() {

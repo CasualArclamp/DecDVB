@@ -355,6 +355,160 @@ pub struct FecStats {
     pub text: Option<decdvb_modem::text::TextView>,
     /// An E1 in a modem's data: its framing and voice channels.
     pub e1: Option<E1View>,
+    /// A TDM multiplex's call voice being played or recorded.
+    pub call_voice: Option<CallVoiceView>,
+}
+
+/// A call's voice out of the TDM multiplex, for display.
+#[derive(Debug, Clone, Default)]
+pub struct CallVoiceView {
+    pub playing: bool,
+    pub audio: Option<AudioHandle>,
+    pub recording: bool,
+    /// The recording (current or last) and its bytes.
+    pub record_file: Option<(PathBuf, u64)>,
+    pub error: Option<String>,
+}
+
+/// A Q-Flex call's G.728 voice (decoded by the TDM receiver) through the
+/// multicast-audio player and recorder as RTP A-law, as an E1 timeslot
+/// goes: 16 samples a 2 ms TDM frame, silence when there is no speech.
+struct CallVoice {
+    play: bool,
+    player: Option<AudioPlayer>,
+    play_q: VecDeque<u8>,
+    play_buf: Vec<u8>,
+    play_rtp: (u16, u32),
+    record: bool,
+    recorder: Option<AudioRecorder>,
+    record_q: VecDeque<u8>,
+    record_buf: Vec<u8>,
+    record_rtp: (u16, u32),
+    record_last: Option<(PathBuf, u64)>,
+    error: Option<String>,
+    /// TDM frames already accounted for.
+    frames: u64,
+}
+
+impl CallVoice {
+    fn new() -> Self {
+        Self {
+            play: false,
+            player: None,
+            play_q: VecDeque::new(),
+            play_buf: Vec::new(),
+            play_rtp: (0, 0),
+            record: false,
+            recorder: None,
+            record_q: VecDeque::new(),
+            record_buf: Vec::new(),
+            record_rtp: (0, 0),
+            record_last: None,
+            error: None,
+            frames: 0,
+        }
+    }
+
+    fn follow(&mut self, o: &FecOutput) {
+        if o.tdm_play != self.play {
+            self.play = o.tdm_play;
+            self.player = None;
+            self.play_q.clear();
+            self.play_buf.clear();
+            if self.play {
+                match AudioPlayer::start(&e1_stream(0), AUDIO_OUTPUT) {
+                    Ok(p) => self.player = Some(p),
+                    Err(e) => self.error = Some(e),
+                }
+            }
+        }
+        if o.tdm_record != self.record {
+            self.record = o.tdm_record;
+            if let Some(r) = self.recorder.take() {
+                self.record_last = r.path().map(|p| (p.to_path_buf(), r.bytes));
+            }
+            self.record_q.clear();
+            self.record_buf.clear();
+            if self.record {
+                let stamp = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let stem = format!(
+                    "decdvb-{}-{:+.0}Hz-call-{stamp}",
+                    o.name.replace(' ', "_"),
+                    o.carrier_hz
+                );
+                let _ = std::fs::create_dir_all(&o.dir);
+                match AudioRecorder::start(&e1_stream(0), &o.dir, &stem) {
+                    Ok(r) => self.recorder = Some(r),
+                    Err(e) => self.error = Some(e),
+                }
+            }
+        }
+    }
+
+    /// The receiver's decoded speech in; for each TDM frame since last
+    /// time, 2 ms of A-law out to the player and recorder.
+    fn feed(&mut self, rx: &mut decdvb_modem::tdm257::TdmRx) {
+        use decdvb_ip::mcast::rtp_packet;
+        rx.decode_voice = self.play || self.record;
+        for &x in &rx.voice_pcm {
+            let b = decdvb_modem::e1::alaw_encode(x);
+            if self.play {
+                self.play_q.push_back(b);
+            }
+            if self.record {
+                self.record_q.push_back(b);
+            }
+        }
+        rx.voice_pcm.clear();
+        for q in [&mut self.play_q, &mut self.record_q] {
+            if q.len() > VOICE_BACKLOG {
+                q.drain(..q.len() - VOICE_BACKLOG / 2);
+            }
+        }
+        let new = rx.stats.frames.saturating_sub(self.frames);
+        self.frames = rx.stats.frames;
+        for _ in 0..new * decdvb_modem::tdm257::WORDS as u64 {
+            if let Some(p) = &mut self.player {
+                self.play_buf.push(voice_byte(&mut self.play_q));
+                if self.play_buf.len() == E1_CHUNK {
+                    let (seq, ts) = &mut self.play_rtp;
+                    p.packet(&rtp_packet(8, *seq, *ts, 0xCA11_0000, &self.play_buf));
+                    *seq = seq.wrapping_add(1);
+                    *ts = ts.wrapping_add(E1_CHUNK as u32);
+                    self.play_buf.clear();
+                }
+            }
+            if let Some(r) = &mut self.recorder {
+                self.record_buf.push(voice_byte(&mut self.record_q));
+                if self.record_buf.len() == E1_CHUNK {
+                    let (seq, ts) = &mut self.record_rtp;
+                    r.packet(&rtp_packet(8, *seq, *ts, 0xCA11_0000, &self.record_buf));
+                    *seq = seq.wrapping_add(1);
+                    *ts = ts.wrapping_add(E1_CHUNK as u32);
+                    self.record_buf.clear();
+                }
+            }
+        }
+    }
+
+    fn view(&self) -> CallVoiceView {
+        CallVoiceView {
+            playing: self.player.is_some(),
+            audio: self.player.as_ref().map(|p| p.handle()),
+            recording: self.recorder.is_some(),
+            record_file: match &self.recorder {
+                Some(r) => r.path().map(|p| (p.to_path_buf(), r.bytes)),
+                None => self.record_last.clone(),
+            },
+            error: self
+                .error
+                .clone()
+                .or_else(|| self.recorder.as_ref().and_then(|r| r.error.clone())),
+        }
+    }
 }
 
 /// An E1's state, for display.
@@ -533,6 +687,17 @@ impl E1Stage {
         }
     }
 
+    /// A timeslot's own byte when it is G.711 audio (or a steady pattern:
+    /// idle or a tone); A-law silence while it is still being judged or is
+    /// sub-rate with no codec found — played as A-law that is loud noise.
+    fn plain_byte(&self, f: &[u8; decdvb_modem::e1::TIMESLOTS], t: u8) -> u8 {
+        use decdvb_modem::e1::Coding;
+        match self.activity.coding()[t as usize] {
+            Coding::G711 | Coding::Steady => f[t as usize],
+            Coding::Unknown | Coding::SubRate(_) => 0xD5,
+        }
+    }
+
     /// Whether timeslot `t` plays and records as decoded G.728.
     fn is_voice(&self, t: u8) -> bool {
         self.voice
@@ -635,12 +800,12 @@ impl E1Stage {
             // A timeslot carrying G.728 goes out decoded.
             let play_byte = match self.play_want {
                 Some(t) if self.is_voice(t) => Some(voice_byte(&mut self.play_voice)),
-                Some(t) => Some(f[t as usize]),
+                Some(t) => Some(self.plain_byte(f, t)),
                 None => None,
             };
             let record_byte = match self.record_want {
                 Some(t) if self.is_voice(t) => Some(voice_byte(&mut self.record_voice)),
-                Some(t) => Some(f[t as usize]),
+                Some(t) => Some(self.plain_byte(f, t)),
                 None => None,
             };
             if let (Some(t), Some(p), Some(b)) = (self.play_want, &mut self.player, play_byte) {
@@ -694,7 +859,7 @@ impl E1Stage {
                 .iter()
                 .map(|v| {
                     let l = v.as_ref()?.lane()?;
-                    Some((l.bits[0].leading_zeros() as u8 + 1, l.talking))
+                    Some((l.bits[0].leading_zeros() as u8 + 1, l.talking()))
                 })
                 .collect(),
             playing: self.play_want.filter(|_| self.player.is_some()),
@@ -827,6 +992,9 @@ pub struct FecOutput {
     /// An E1's timeslot to play, and one to record (to a `.wav` in `dir`).
     pub e1_play: Option<u8>,
     pub e1_record: Option<u8>,
+    /// A TDM multiplex's call voice: play it, record it (to a `.wav`).
+    pub tdm_play: bool,
+    pub tdm_record: bool,
 }
 
 /// Runs a [`FecDecoder`] on its own thread.
@@ -1636,6 +1804,7 @@ fn run(
     let mut tpc: Option<decdvb_modem::tpc2964::TpcRx> = None;
     let mut fastlink: Option<decdvb_modem::fastlink::FastLinkRx> = None;
     let mut tdm: Option<decdvb_modem::tdm257::TdmRx> = None;
+    let mut call_voice: Option<CallVoice> = None;
     let mut tdm_active_until = 0u64;
     let mut viterbi: Option<decdvb_modem::dvbs::ViterbiRx> = None;
     let mut tpc_frames = Vec::new();
@@ -1727,8 +1896,11 @@ fn run(
                         Some(decdvb_modem::payload::Format::ParadiseEsc)
                     ) && !payload_out.inner.is_empty()
                     {
-                        tdm.get_or_insert_with(decdvb_modem::tdm257::TdmRx::new)
-                            .push(&payload_out.inner);
+                        let rx = tdm.get_or_insert_with(decdvb_modem::tdm257::TdmRx::new);
+                        rx.push(&payload_out.inner);
+                        let cv = call_voice.get_or_insert_with(CallVoice::new);
+                        cv.follow(&o);
+                        cv.feed(rx);
                     }
                     if let Some(bits) = unread {
                         tpc_text
@@ -1798,6 +1970,7 @@ fn run(
                     .as_ref()
                     .filter(|t| t.stats.frames > 0)
                     .map(|t| t.stats.clone());
+                s.call_voice = call_voice.as_ref().map(|c| c.view());
                 s.viterbi = viterbi.as_ref().map(|r| r.stats.clone());
                 s.payload = Some(pay.stats.clone());
                 s.text = tpc_text.as_ref().map(|t| t.view());

@@ -194,6 +194,9 @@ pub struct VfoSettings {
     /// A modem carrying an E1: the timeslot to play, and one to record.
     pub e1_play: Option<u8>,
     pub e1_record: Option<u8>,
+    /// A Q-Flex's TDM multiplex: play, and record, its call's voice.
+    pub tdm_play: bool,
+    pub tdm_record: bool,
     /// Where the IQ recorder and the symbol writer write.
     pub record_dir: PathBuf,
 }
@@ -233,6 +236,8 @@ impl VfoSettings {
             audio_record: None,
             e1_play: None,
             e1_record: None,
+            tdm_play: false,
+            tdm_record: false,
             record_dir: std::env::temp_dir(),
         }
     }
@@ -1490,6 +1495,8 @@ fn fec_output(s: &VfoSettings, ddc: &Ddc) -> FecOutput {
         audio_record: s.audio_record,
         e1_play: s.e1_play,
         e1_record: s.e1_record,
+        tdm_play: s.tdm_play,
+        tdm_record: s.tdm_record,
     }
 }
 

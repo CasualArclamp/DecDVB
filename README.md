@@ -31,7 +31,7 @@ TPC 2964 carrier). Every carrier was found and identified blind.*
 | Carrier recovery: a locked constellation and MER, for Identify and DVB-S2 VFOs | ✅ |
 | **DVB-S → MPEG-TS** (EN 300 421): code rate, rotation and inversion found blind; Viterbi, RS, the same TS outputs | ✅ |
 | **TPC 2964 → IP / TS / voice** (Intelsat IESS-315 turbo product code, BPSK/QPSK): frame structure, scrambling and payload found from the signal; HDLC → IP, MPEG-TS, E1 and Comtech D&I++ voice | ✅ confirmed on a live Comtech CDM-600L carrier |
-| **Q-Flex FastLink → data** (Paradise, QPSK 0.710): sync word, the (2880, 2048) LDPC code and the frame scrambler, all measured from a live carrier; inside, Paradise's closed-network + ESC framing and a 257-bit TDM multiplex (sixteen 8 kbit/s channels, metered live so speech shows) | ✅ decodes a live Q-Flex down to the multiplex (the voice codec not yet known) |
+| **Q-Flex FastLink → data and voice** (Paradise, QPSK 0.710): sync word, the (2880, 2048) LDPC code and the frame scrambler, all measured from a live carrier; inside, Paradise's closed-network + ESC framing and a 257-bit TDM multiplex (sixteen 8 kbit/s channels, metered live so speech shows); a call's G.728 voice put together from its four channels — listen, record `.wav` | ✅ decodes a live Q-Flex down to the calls' speech |
 | **Viterbi K=7 → data** (IESS-308/309 SCPC and the like): rate 1/2–7/8, puncturing and orientation found blind and followed when the carrier turns; then the payload search — with or without differential decoding — for HDLC, TS, E1, D&I++, Paradise or IBS/SMS (IESS-309, 16/15) framing, or just the scrambler from the idle fill | ✅ decodes a live 10.24 kBd IESS-308 carrier to its IBS frames (rate 1/2, differential, V.35) |
 | **Carrier ID (DVB-CID, ETSI TS 103 129)**: the spread-spectrum identifier under a carrier — the uplink modulator's unique ID (and MAC), position, telephone and text | ✅ to the specification, on synthetic carriers (no CID among the recordings yet) |
 | **E1 voice**: G.704 E1 or Comtech Drop & Insert++ timeslots, G.711 A-law — levels per channel, listen, record `.wav`; G.728 LD-CELP 16 kbit/s voice in two bits of a timeslot found and decoded | ✅ (G.728 confirmed on a live CDM-600L's D&I voice) |
@@ -210,9 +210,9 @@ overhead). Behind the TPC 2964 decoder the payload search finds either,
 under the V.35 descrambler or any other it tries, and the **Voice** card
 lists the channels with their levels: **▶** listens (the app's player and
 volume), **●** records a `.wav`. A timeslot whose sign bit never changes is
-not G.711 audio — sub-rate channels or compressed voice, which played as
-A-law is digital noise — and is marked **not G.711** with the bits that do
-change.
+not G.711 audio — sub-rate channels or compressed voice — and is marked
+**not G.711** with the bits that do change; it plays as silence (as A-law
+it would be loud digital noise), and so does any timeslot not yet judged.
 
 When those bits carry **G.728** (LD-CELP, 16 kbit/s: a 10-bit codeword every
 five samples), the card says **G.728 speech** and ▶/● play and record it
@@ -319,7 +319,11 @@ Comtech VersaFEC and the TPC/LDPC modes of SCPC modems publish no sync
 word or frame layout, so they can only be recognised by such measurements;
 captures of them would let DecDVB name them. Paradise FastLink was worked
 out that way from a capture of a Q-Flex (QPSK 0.710): Identify names it, and
-the **Q-Flex FastLink** decoder decodes it. A carrier too slow to show three frames in the first look is marked
+the **Q-Flex FastLink** decoder decodes it — down to the calls in its TDM
+multiplex: G.728 voice spread over four channels, two bits a TDM word.
+Where each channel's bits go is learnt from the voice equipment's silence
+fill (a known pattern) while the channels idle; the **Call voice** card
+then says when someone speaks, and ▶/● play and record it. A carrier too slow to show three frames in the first look is marked
 *provisional* while it listens longer. Between identifications it keeps
 demodulating with what it found, so the constellation and MER stay live.
 
@@ -333,6 +337,7 @@ decdvb test-signals tests         # both, into tests/ (see tests/README.md)
 decdvb mcast recording.ts --decode --record out   # the radio in a .ts (MPE)
 decdvb payload fastlink.bin --tdm-out frames.bin  # a modem .bin through the payload stage
 decdvb decode --hackrf 1635.0 --decoder fastlink --offset 640e3 --bandwidth 200e3   --out dir --record-on-activity     # watch a FastLink live, record when a channel speaks
+decdvb decode qflex_333333Sps.cf32 --decoder fastlink --out dir --tdm-record   # a Q-Flex's call voice to a .wav
 decdvb modcods                    # the DVB-S2 MODCOD table
 ```
 

@@ -10,13 +10,15 @@
 //! (140 ms). All of this was found blind on one capture (STATUS.md, "The
 //! Q-Flex's 128.5 kbit/s"); no specification is known.
 //!
-//! Each channel runs in 4 ms subframes of four octets, `D(n) D(n−1) S S`
-//! (measured, STATUS.md "Q-Flex channels: 4 ms subframes"): one new data
-//! octet, the previous one again, and a status octet twice — so 2 kbit/s
-//! of new data a channel. Idle codec channels cycle five data octets
-//! (a 40-bit frame every 20 ms); on the signalling channels S is 00 or FF.
-//! A channel's subframes slip against the TDM frame now and then: each
-//! source has its own clock.
+//! Each channel runs in 4 ms subframes: 16 data bits, then a status octet
+//! twice (on the signalling channels 00 or FF). A call is G.728 voice at
+//! 16 kbit/s spread over four channels, two bits a TDM word: the stream's
+//! even bits from one pair of channels' data halves, its odd bits from the
+//! other (STATUS.md, "The Q-Flex calls are G.728 too"). One stream bit in
+//! 64 is in no channel (one channel's data sits a bit early, over its
+//! status), so the decoder takes it as unknown. Which channels, and where
+//! their bits go, is learnt from the voice equipment's silence fill — a
+//! known 160-bit cycle — while the channels idle: [`Placement`].
 //!
 //! The receiver finds the frame by the alignment word, then meters every
 //! channel: idle codec channels repeat a 160-bit (20 ms) frame, pattern
@@ -25,6 +27,10 @@
 //! about a quarter of the bits from one 20 ms to the next — so a channel
 //! once seen idle as a codec counts as active as soon as it departs from
 //! its idle frame at all.
+
+use std::collections::VecDeque;
+
+use crate::g728;
 
 /// Frame and payload bits, words a frame, channels.
 pub const FRAME: usize = 257;
@@ -139,6 +145,19 @@ pub struct TdmStats {
     pub channels: [ChannelView; CHANNELS],
     /// Calls heard, oldest first (the last `CALLS_KEPT`).
     pub calls: Vec<Call>,
+    /// A call's G.728 voice, once its channels' places are known.
+    pub voice: Option<VoiceView>,
+}
+
+/// The voice stream being followed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VoiceView {
+    /// Its channels, one bit each.
+    pub channels: u16,
+    /// The last 40 ms held speech.
+    pub talking: bool,
+    /// 40 ms blocks of speech so far.
+    pub talk_blocks: u64,
 }
 
 /// A channel's recent bits and running counts.
@@ -230,6 +249,22 @@ pub struct TdmRx {
     pub keep_frames: bool,
     /// The frames kept: 257 bits (0/1) each, the alignment bit first.
     pub frames_out: Vec<u8>,
+    /// Each channel's latest bits (for calibration), the first being its
+    /// bit `hist_k0`.
+    hist: Vec<Vec<u8>>,
+    hist_k0: usize,
+    /// Each channel's place in a voice stream, and when it was last
+    /// measured (frame).
+    placements: [Option<Placement>; CHANNELS],
+    calibrated_at: [u64; CHANNELS],
+    /// The ways the placed channels can make a stream, each framed; once
+    /// one frames speech it is `chosen` and the rest go.
+    voices: Vec<VoiceStream>,
+    chosen: bool,
+    /// Decode the voice into `voice_pcm` (8 kHz, ±1), which the caller
+    /// empties; without it the stream is only followed.
+    pub decode_voice: bool,
+    pub voice_pcm: Vec<f32>,
 }
 
 impl Default for TdmRx {
@@ -251,6 +286,14 @@ impl TdmRx {
             stats: TdmStats::default(),
             keep_frames: false,
             frames_out: Vec::new(),
+            hist: vec![Vec::new(); CHANNELS],
+            hist_k0: 0,
+            placements: [None; CHANNELS],
+            calibrated_at: [0; CHANNELS],
+            voices: Vec::new(),
+            chosen: false,
+            decode_voice: false,
+            voice_pcm: Vec::new(),
         }
     }
 
@@ -294,6 +337,49 @@ impl TdmRx {
             }
         }
         self.follow_calls(talking);
+        self.calibrate_idle();
+        self.stats.voice = self.voices.first().map(|v| VoiceView {
+            channels: v.members.iter().fold(0, |m, &(c, ..)| m | 1 << c),
+            talking: self.chosen && v.framer.talking,
+            talk_blocks: if self.chosen { v.framer.talk_blocks } else { 0 },
+        });
+    }
+
+    /// Measure the places of channels idling (silence fill), at most once
+    /// a second each, and follow the voice stream they make up.
+    fn calibrate_idle(&mut self) {
+        let now = self.stats.frames;
+        let n = CAL_SUBFRAMES * SUBFRAME;
+        let mut changed = false;
+        for c in 0..CHANNELS {
+            let h = &self.hist[c];
+            if self.stats.channels[c].state != ChannelState::IdleCodec
+                || h.len() < n
+                || (self.calibrated_at[c] > 0 && now < self.calibrated_at[c] + CAL_EVERY)
+            {
+                continue;
+            }
+            self.calibrated_at[c] = now;
+            let p = calibrate(&h[h.len() - n..], self.hist_k0 + h.len() - n);
+            if p != self.placements[c] {
+                self.placements[c] = p;
+                changed = true;
+            }
+        }
+        if changed {
+            let placed: Vec<(usize, Placement)> = (0..CHANNELS)
+                .filter_map(|c| self.placements[c].map(|p| (c, p)))
+                .collect();
+            // A new stream only when the channels' places relative to each
+            // other change (the fill restarting after speech moves them all
+            // alike); one not worked out keeps the last.
+            let ways = group(&placed);
+            let kept = self.chosen && ways.contains(&self.voices[0].members);
+            if !ways.is_empty() && !kept {
+                self.voices = ways.into_iter().map(VoiceStream::new).collect();
+                self.chosen = false;
+            }
+        }
     }
 
     /// Open a call when enough proven codec channels talk at once; extend
@@ -391,12 +477,281 @@ impl TdmRx {
         let payload = &self.held[at + 1..at + FRAME];
         for w in 0..WORDS {
             for (c, m) in self.meters.iter_mut().enumerate() {
-                m.push(payload[w * CHANNELS + c], self.bits_in);
+                let b = payload[w * CHANNELS + c];
+                m.push(b, self.bits_in);
+                self.hist[c].push(b);
+            }
+            for v in &mut self.voices {
+                v.word(self.bits_in, |c| payload[w * CHANNELS + c]);
             }
             self.bits_in += 1;
         }
+        // Keep up to two calibrations' worth of each channel's bits.
+        let keep = CAL_SUBFRAMES * SUBFRAME;
+        if self.hist[0].len() >= 2 * keep {
+            for h in &mut self.hist {
+                h.drain(..keep);
+            }
+            self.hist_k0 += keep;
+        }
+        let decode = self.decode_voice && self.chosen;
+        for v in &mut self.voices {
+            v.flush(self.bits_in, decode, &mut self.voice_pcm);
+        }
+        if !self.chosen
+            && let Some(i) = self.voices.iter().position(|v| v.framer.talk_blocks > 0)
+        {
+            // Rust note: `swap_remove` takes it out in O(1); the rest go.
+            let v = self.voices.swap_remove(i);
+            self.voices = vec![v];
+            self.chosen = true;
+        }
         self.stats.frames += 1;
         self.lock = Some((at + FRAME, next.0, next.1));
+    }
+}
+
+/// The voice equipment's silence fill as a 16 kbit/s stream: 10-bit units
+/// 1111 cccc 11, the count stepping down one a unit — a 160-bit cycle (the
+/// same fill as on the CDM-600L's timeslot, STATUS.md).
+fn fill_bit(p: usize) -> u8 {
+    let (unit, k) = ((p / 10) % 16, p % 10);
+    if (4..8).contains(&k) {
+        ((15 - unit) >> (7 - k)) as u8 & 1
+    } else {
+        1
+    }
+}
+
+/// Subframes a calibration looks at (160 ms of silence fill), channel bits
+/// a subframe, and frames between calibrations of a channel (1 s).
+const CAL_SUBFRAMES: usize = 40;
+const SUBFRAME: usize = 32;
+const CAL_EVERY: u64 = 500;
+/// Stream bits a subframe: two a TDM word.
+const STREAM_SUBFRAME: usize = 64;
+
+/// Where a channel's bits go in a call's 16 kbit/s stream, found from its
+/// silence fill: its bit k (counted from the start of the multiplex) is
+/// stream bit `off + 2k` when `(k − start) mod 32 < len` — the rest of
+/// its subframe being status. `off` is known modulo the fill's 160-bit
+/// cycle, and with `alt` the channel fits 80 further on as well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    pub start: usize,
+    pub len: usize,
+    pub off: usize,
+    pub alt: bool,
+}
+
+impl Placement {
+    fn carries(&self, k: usize) -> bool {
+        (k + SUBFRAME - self.start) % SUBFRAME < self.len
+    }
+}
+
+/// A channel's placement from its bits (`bits[i]` being its bit `k0 + i`,
+/// whole subframes of them), if they are silence fill: for each offset into
+/// the fill's cycle, the longest run of subframe positions whose bits all
+/// match it (a status bit, constant, cannot follow the fill's count).
+fn calibrate(bits: &[u8], k0: usize) -> Option<Placement> {
+    let per = (bits.len() / SUBFRAME) as u32;
+    // (run length, run start, offset, offsets with that run)
+    let mut best: Option<(usize, usize, usize, Vec<usize>)> = None;
+    let mut hits = [0u32; SUBFRAME];
+    for off in 0..160 {
+        hits.fill(0);
+        for (i, &b) in bits.iter().enumerate() {
+            let k = k0 + i;
+            if b == fill_bit((off + 2 * k) % 160) {
+                hits[k % SUBFRAME] += 1;
+            }
+        }
+        let good = |r: usize| hits[r % SUBFRAME] * 100 >= per * 97;
+        let (mut run, mut len, mut start) = (0, 0, 0);
+        for r in 0..2 * SUBFRAME {
+            if good(r) {
+                run += 1;
+                if run > len {
+                    len = run.min(SUBFRAME);
+                    start = (r + 1 - run) % SUBFRAME;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        match &mut best {
+            Some((l, _, _, offs)) if len == *l => offs.push(off),
+            Some((l, ..)) if len < *l => {}
+            _ => best = Some((len, start, off, vec![off])),
+        }
+    }
+    let (len, start, off, offs) = best?;
+    (14..=17).contains(&len).then(|| Placement {
+        start,
+        len,
+        off,
+        alt: offs.contains(&((off + 80) % 160)),
+    })
+}
+
+/// A channel in a stream: its number, placement and offset (relative to
+/// the stream's first channel).
+type Member = (usize, Placement, isize);
+
+/// Every way four placed channels' bits fill a stream — every subframe's 64
+/// stream bits but at most two, none twice — with offsets near each other
+/// (the channels of a call run nearly together), made relative to the
+/// lowest. A run found from the fill may be a bit long (a status bit next
+/// to it can match the fill by chance), so each 15- or 16-bit window of it
+/// is tried; which way is right shows when speech comes (only it frames).
+fn group(placed: &[(usize, Placement)]) -> Vec<Vec<Member>> {
+    let placed: Vec<(usize, Placement)> = placed
+        .iter()
+        .flat_map(|&(c, p)| {
+            (15..=16.min(p.len)).flat_map(move |len| {
+                (0..=p.len - len).map(move |a| {
+                    let start = (p.start + a) % SUBFRAME;
+                    (c, Placement { start, len, ..p })
+                })
+            })
+        })
+        .collect();
+    let mut found: Vec<Vec<Member>> = Vec::new();
+    let n = placed.len();
+    // Rust note: `Placement` is `Copy`, so the closure takes it by value
+    // and the iterator it returns borrows nothing.
+    let slots = |p: Placement, o: isize| {
+        (0..p.len).map(move |i| {
+            (o + 2 * (p.start + i) as isize).rem_euclid(STREAM_SUBFRAME as isize) as usize
+        })
+    };
+    // Another channel's offsets near `o0`: at `off` or (with `alt`) 80 on,
+    // modulo the fill's cycle.
+    let near = |p: &Placement, o0: isize| -> Vec<isize> {
+        let bases: &[isize] = if p.alt { &[0, 80] } else { &[0] };
+        let mut v = Vec::new();
+        for b in bases {
+            for m in -2..=2 {
+                let o = p.off as isize + b + 160 * m;
+                if (o - o0).abs() <= 40 {
+                    v.push(o);
+                }
+            }
+        }
+        v
+    };
+    let quads = (0..n).flat_map(|a| {
+        (a + 1..n)
+            .flat_map(move |b| (b + 1..n).flat_map(move |c| (c + 1..n).map(move |d| [a, b, c, d])))
+    });
+    for q in quads {
+        let set = q.map(|i| placed[i]);
+        if (1..4).any(|i| (0..i).any(|j| set[i].0 == set[j].0)) {
+            continue;
+        }
+        let first = set[0].1;
+        let firsts: &[isize] = if first.alt { &[0, 80] } else { &[0] };
+        for o0 in firsts.iter().map(|b| first.off as isize + b) {
+            let cands: Vec<Vec<isize>> = set[1..].iter().map(|(_, p)| near(p, o0)).collect();
+            for &o1 in &cands[0] {
+                for &o2 in &cands[1] {
+                    for &o3 in &cands[2] {
+                        let offs = [o0, o1, o2, o3];
+                        let mut seen = [false; STREAM_SUBFRAME];
+                        let mut ok = true;
+                        for ((_, p), &o) in set.iter().zip(&offs) {
+                            for s in slots(*p, o) {
+                                ok &= !seen[s];
+                                seen[s] = true;
+                            }
+                        }
+                        if ok && seen.iter().filter(|&&x| x).count() >= STREAM_SUBFRAME - 2 {
+                            let low = offs.iter().min().copied().unwrap_or(0);
+                            let mut m: Vec<Member> = set
+                                .iter()
+                                .zip(offs)
+                                .map(|(&(c, p), o)| {
+                                    (
+                                        c,
+                                        Placement {
+                                            off: 0,
+                                            alt: false,
+                                            ..p
+                                        },
+                                        o - low,
+                                    )
+                                })
+                                .collect();
+                            m.sort_by_key(|x| x.0);
+                            if !found.contains(&m) {
+                                found.push(m);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// A call's stream put together from its channels' bits, framed and
+/// decoded as G.728.
+struct VoiceStream {
+    members: Vec<Member>,
+    /// Stream bits from position `base` on, [`g728::UNCARRIED`] until
+    /// written.
+    buf: VecDeque<u8>,
+    base: Option<isize>,
+    framer: g728::Framer,
+}
+
+impl VoiceStream {
+    fn new(members: Vec<Member>) -> Self {
+        Self {
+            members,
+            buf: VecDeque::new(),
+            base: None,
+            framer: g728::Framer::new(),
+        }
+    }
+
+    /// The lowest place any member will write from channel bit `k` on.
+    fn front(&self, k: usize) -> isize {
+        self.members.iter().map(|m| m.2).min().unwrap_or(0) + 2 * k as isize
+    }
+
+    /// One TDM word (bit `k` of every channel): the members' data bits into
+    /// their places.
+    fn word(&mut self, k: usize, bit: impl Fn(usize) -> u8) {
+        let base = match self.base {
+            Some(b) => b,
+            None => *self.base.insert(self.front(k)),
+        };
+        for &(c, p, o) in &self.members {
+            let i = o + 2 * k as isize - base;
+            if !p.carries(k) || i < 0 {
+                continue;
+            }
+            let i = i as usize;
+            if self.buf.len() <= i {
+                self.buf.resize(i + 1, g728::UNCARRIED);
+            }
+            self.buf[i] = bit(c);
+        }
+    }
+
+    /// Stream bits no member will write any more on to the framer.
+    fn flush(&mut self, k_next: usize, decode: bool, out: &mut Vec<f32>) {
+        let Some(base) = self.base else {
+            return;
+        };
+        let n = (self.front(k_next) - base).clamp(0, self.buf.len() as isize) as usize;
+        for b in self.buf.drain(..n) {
+            self.framer.push(b, decode, out);
+        }
+        self.base = Some(base + n as isize);
     }
 }
 
@@ -557,6 +912,174 @@ mod tests {
         assert!((2.5..4.0).contains(&c.seconds()), "{c:?}");
         let start_s = c.start as f64 * 0.002;
         assert!((11.5..13.0).contains(&start_s), "{start_s}");
+    }
+
+    /// A call from a capture: aligned frames as `decdvb payload --tdm-out`
+    /// writes them (257 bytes of 0/1 each) in `DECDVB_TDM_FRAMES`, from
+    /// `DECDVB_TDM_FROM` seconds for `DECDVB_TDM_SECONDS`; its voice to
+    /// `DECDVB_TDM_WAV` (16-bit, 8 kHz). Captures stay out of the repo.
+    #[test]
+    #[ignore]
+    fn decodes_a_captured_call() {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("set {k}"));
+        let bits = std::fs::read(var("DECDVB_TDM_FRAMES")).unwrap();
+        let from = var("DECDVB_TDM_FROM").parse::<f64>().unwrap();
+        let secs = var("DECDVB_TDM_SECONDS").parse::<f64>().unwrap();
+        // Start 3 s early so the channels are measured idle first.
+        let f0 = ((from - 3.0).max(0.0) * 500.0) as usize * FRAME;
+        let f1 = (((from + secs) * 500.0) as usize * FRAME).min(bits.len());
+        let mut rx = TdmRx::new();
+        rx.decode_voice = true;
+        let mut pcm = Vec::new();
+        let mut talk = 0;
+        for chunk in bits[f0..f1].chunks(FRAME * 25) {
+            rx.push(chunk);
+            pcm.append(&mut rx.voice_pcm);
+            talk = rx.stats.voice.map_or(0, |v| v.talk_blocks);
+        }
+        let v = rx.stats.voice.expect("a voice stream");
+        println!(
+            "voice on channels {:016b}: {talk} blocks of speech ({:.1} s), {} samples",
+            v.channels,
+            talk as f64 * 0.04,
+            pcm.len()
+        );
+        let data: Vec<u8> = pcm
+            .iter()
+            .flat_map(|x| ((x * 32767.0).round().clamp(-32768.0, 32767.0) as i16).to_le_bytes())
+            .collect();
+        let mut wav = b"RIFF".to_vec();
+        wav.extend((36 + data.len() as u32).to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        for v in [16u32, 1 | 1 << 16, 8000, 16000, 2 | 16 << 16] {
+            wav.extend(v.to_le_bytes());
+        }
+        wav.extend(b"data");
+        wav.extend((data.len() as u32).to_le_bytes());
+        wav.extend(data);
+        std::fs::write(var("DECDVB_TDM_WAV"), wav).unwrap();
+        assert!(talk > 0);
+    }
+
+    /// A call as the Q-Flex multiplex carries one (the layout measured on a
+    /// live carrier): a 16 kbit/s stream — 3 s of silence fill, 1.5 s of
+    /// G.728 codewords (inverted, sync bit 1 but every 32nd), fill again —
+    /// spread over channels 15 and 1 (even bits) and 2 and 0 (odd bits),
+    /// the rest of each subframe status.
+    #[test]
+    fn a_call_is_found_from_its_silence_and_decoded() {
+        let place = [
+            (
+                15,
+                Placement {
+                    start: 0,
+                    len: 15,
+                    off: 76,
+                    alt: false,
+                },
+            ),
+            (
+                1,
+                Placement {
+                    start: 16,
+                    len: 16,
+                    off: 74,
+                    alt: false,
+                },
+            ),
+            (
+                2,
+                Placement {
+                    start: 0,
+                    len: 16,
+                    off: 75,
+                    alt: false,
+                },
+            ),
+            (
+                0,
+                Placement {
+                    start: 16,
+                    len: 16,
+                    off: 75,
+                    alt: false,
+                },
+            ),
+        ];
+        let frames = 3500;
+        let talk = 3 * 16_000..(3 * 16_000 + 24_000);
+        let mut x = 0x1357_9BDFu32;
+        let mut cw = Vec::new();
+        for i in 0..talk.len() / 10 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let sync = u16::from(i % 32 != 31);
+            cw.push((x >> 16) as u16 & 0x1FF | sync << 9);
+        }
+        // Stream bit at place `p` (places count from 74, the lowest offset).
+        let stream = |p: usize| -> u8 {
+            let i = p - 74;
+            if talk.contains(&i) {
+                let j = i - talk.start;
+                u8::from(cw[j / 10] >> (9 - j % 10) & 1 == 0)
+            } else {
+                fill_bit(p + 37)
+            }
+        };
+        let mut bits = Vec::new();
+        let mut k = 0usize;
+        for f in 0..frames {
+            bits.push(if f % 2 == 0 { FAW[(f / 2) % 7] } else { 0 });
+            for _ in 0..WORDS {
+                for c in 0..CHANNELS {
+                    let b = place.iter().find(|(ch, _)| *ch == c).map_or(0, |(_, p)| {
+                        if p.carries(k) {
+                            stream(p.off + 2 * k)
+                        } else {
+                            1
+                        }
+                    });
+                    bits.push(b);
+                }
+                k += 1;
+            }
+        }
+        let mut rx = TdmRx::new();
+        rx.decode_voice = true;
+        let mut pcm = Vec::new();
+        let mut most = 0;
+        for chunk in bits.chunks(FRAME * 25) {
+            rx.push(chunk);
+            pcm.append(&mut rx.voice_pcm);
+            most = most.max(rx.stats.voice.map_or(0, |v| v.talk_blocks));
+        }
+        let v = rx
+            .stats
+            .voice
+            .expect("the call's channels found from the fill");
+        assert_eq!(v.channels, 1 << 0 | 1 << 1 | 1 << 2 | 1 << 15);
+        // 1.5 s is 37 blocks of 40 ms; the edges' blocks are mixed.
+        assert!((34..=38).contains(&most), "{most}");
+        // The first block of speech picks the stream; the rest are decoded.
+        assert_eq!(pcm.len() as u64, (most - 1) * 320);
+        assert!(!v.talking, "silent again at the end");
+    }
+
+    #[test]
+    fn groups_the_q3_call() {
+        let p = |start, len, off, alt| Placement {
+            start,
+            len,
+            off,
+            alt,
+        };
+        let placed = [
+            (0, p(16, 16, 35, true)),
+            (1, p(15, 17, 34, false)),
+            (2, p(0, 16, 35, true)),
+            (15, p(0, 15, 36, false)),
+        ];
+        let g = group(&placed);
+        assert!(!g.is_empty(), "{g:?}");
     }
 
     #[test]

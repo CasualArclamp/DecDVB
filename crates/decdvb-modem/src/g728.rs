@@ -23,6 +23,10 @@
 //! the last of an adaptation cycle, every 20 ms. In silence the equipment
 //! sends a fill instead (the sync bit held, a 4-bit count in the codeword's
 //! low bits), which a decoder must not be fed.
+//!
+//! [`Framer`] does that framing on any bit stream — a Q-Flex call's, put
+//! together from four TDM channels (`tdm257`), comes with a bit in 64
+//! not carried at all.
 
 mod tables;
 
@@ -527,14 +531,15 @@ const BLOCK: usize = 64;
 /// Codewords from one sync bit to the next (20 ms).
 const SYNC_PERIOD: usize = 32;
 
-/// A G.728 channel on two bits of each octet of a 64 kbit/s timeslot,
-/// framed by a sync bit in place of every codeword's bit 9 (see the module
-/// notes). Octets in; decoded speech out — 40 ms at a time, one sample per
-/// octet while there is speech, nothing in silence.
-pub struct Lane {
-    /// The two bits carrying it, as masks, first-sent first (G.704 bit 2
-    /// is `0x40`).
-    pub bits: [u8; 2],
+/// A bit the carrier does not carry (the Q-Flex multiplex loses one of
+/// every 64): [`Framer`] takes it as unknown.
+pub const UNCARRIED: u8 = 2;
+
+/// G.728 codewords out of a bit stream framed by a sync bit in place of
+/// every codeword's bit 9 (see the module notes), decoded. Bits in (0, 1
+/// or [`UNCARRIED`]); speech out 40 ms at a time, five samples a codeword
+/// while there is speech, nothing in silence.
+pub struct Framer {
     raw: Vec<u8>,
     /// Where codewords start in `raw` (at their sync bits), once found.
     phase: Option<usize>,
@@ -545,12 +550,15 @@ pub struct Lane {
     pub talk_blocks: u64,
 }
 
-impl Lane {
-    /// The channel on G.704 bits `first` and `first + 1` (1..=7).
-    pub fn new(first: u8) -> Self {
-        let m = 0x80u8 >> (first.clamp(1, 7) - 1);
+impl Default for Framer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Framer {
+    pub fn new() -> Self {
         Self {
-            bits: [m, m >> 1],
             raw: Vec::with_capacity(BLOCK * 10 + 32),
             phase: None,
             decoder: Decoder::new(),
@@ -559,32 +567,35 @@ impl Lane {
         }
     }
 
-    /// The timeslot's octets in; with `decode`, speech out (±1, 8 kHz).
-    pub fn push(&mut self, octets: &[u8], decode: bool, out: &mut Vec<f32>) {
-        for &o in octets {
-            for m in self.bits {
-                self.raw.push(u8::from(o & m != 0));
-            }
-            if self.raw.len() >= BLOCK * 10 + 10 {
-                self.block(decode, out);
-            }
+    /// One bit in; with `decode`, speech out (±1, 8 kHz).
+    pub fn push(&mut self, bit: u8, decode: bool, out: &mut Vec<f32>) {
+        self.raw.push(bit);
+        if self.raw.len() >= BLOCK * 10 + 10 {
+            self.block(decode, out);
         }
     }
 
     /// Is this a block of speech with codewords starting at bit `p`: the
-    /// sync bits all alike but at two codewords 32 apart? Then: whether
-    /// the line is inverted (the sync bit then reads 1 but once in 32 —
-    /// shape indices 64–127, as §3.11 would have it) and which codeword
-    /// (0..32) carries the odd sync bit.
+    /// sync bits all alike but at two codewords 32 apart (or one, the
+    /// other not carried)? Then: whether the line is inverted (the sync
+    /// bit then reads 1 but once in 32 — shape indices 64–127, as §3.11
+    /// would have it) and which codeword (0..32) carries the odd sync bit.
     fn sync_at(&self, p: usize) -> Option<(u8, usize)> {
         let s = |i: usize| self.raw[p + 10 * i];
+        let known = (0..BLOCK).filter(|&i| s(i) != UNCARRIED).count();
         let ones = (0..BLOCK).filter(|&i| s(i) == 1).count();
-        let majority = u8::from(ones * 2 > BLOCK);
-        let mut odd = (0..BLOCK).filter(|&i| s(i) != majority);
-        match (odd.next(), odd.next(), odd.next()) {
-            (Some(a), Some(b), None) if b - a == SYNC_PERIOD => Some((1 - majority, a)),
-            _ => None,
-        }
+        let majority = u8::from(ones * 2 > known);
+        let odd: Vec<usize> = (0..BLOCK)
+            .filter(|&i| s(i) != UNCARRIED && s(i) != majority)
+            .collect();
+        let o = *odd.first()? % SYNC_PERIOD;
+        // Both sync slots odd, or one of them not carried; nothing else.
+        let slot_ok = |i: usize| s(i) != majority;
+        let fits = odd.len() <= 2
+            && odd.iter().all(|&i| i % SYNC_PERIOD == o)
+            && slot_ok(o)
+            && slot_ok(o + SYNC_PERIOD);
+        fits.then_some((1 - majority, o))
     }
 
     fn block(&mut self, decode: bool, out: &mut Vec<f32>) {
@@ -601,19 +612,66 @@ impl Lane {
             if decode {
                 let mut v = [0.0f32; IDIM];
                 for i in 0..BLOCK {
-                    let cw = self.raw[p + 10 * i..][..10]
-                        .iter()
-                        .fold(0u16, |c, &b| c << 1 | u16::from(b ^ invert));
+                    let sync_end = i % SYNC_PERIOD == odd;
+                    let cw =
+                        self.raw[p + 10 * i..][..10]
+                            .iter()
+                            .enumerate()
+                            .fold(0u16, |c, (k, &b)| {
+                                // A bit not carried: the sync bit's known value,
+                                // else 0 (the commoner value of most fields).
+                                let v = match (b, k) {
+                                    (UNCARRIED, 0) => u8::from(!sync_end),
+                                    (UNCARRIED, _) => 0,
+                                    _ => b ^ invert,
+                                };
+                                c << 1 | u16::from(v)
+                            });
                     self.decoder.decode(cw, &mut v);
                     out.extend_from_slice(&v);
                     // The odd sync bit ends an adaptation cycle (§3.11).
-                    if i % SYNC_PERIOD == odd {
+                    if sync_end {
                         self.decoder.start_cycle();
                     }
                 }
             }
         }
         self.raw.drain(..BLOCK * 10);
+    }
+}
+
+/// A G.728 channel on two bits of each octet of a 64 kbit/s timeslot (the
+/// CDM-600L's D&I voice): octets in, one sample per octet out while there
+/// is speech.
+pub struct Lane {
+    /// The two bits carrying it, as masks, first-sent first (G.704 bit 2
+    /// is `0x40`).
+    pub bits: [u8; 2],
+    pub framer: Framer,
+}
+
+impl Lane {
+    /// The channel on G.704 bits `first` and `first + 1` (1..=7).
+    pub fn new(first: u8) -> Self {
+        let m = 0x80u8 >> (first.clamp(1, 7) - 1);
+        Self {
+            bits: [m, m >> 1],
+            framer: Framer::new(),
+        }
+    }
+
+    /// The timeslot's octets in; with `decode`, speech out (±1, 8 kHz).
+    pub fn push(&mut self, octets: &[u8], decode: bool, out: &mut Vec<f32>) {
+        for &o in octets {
+            for m in self.bits {
+                self.framer.push(u8::from(o & m != 0), decode, out);
+            }
+        }
+    }
+
+    /// The last 40 ms held speech.
+    pub fn talking(&self) -> bool {
+        self.framer.talking
     }
 }
 
@@ -650,7 +708,7 @@ impl Voice {
             for l in &mut self.lanes {
                 l.push(&octets[..n], false, out);
             }
-            self.found = self.lanes.iter().position(|l| l.talk_blocks > 0);
+            self.found = self.lanes.iter().position(|l| l.framer.talk_blocks > 0);
             octets = &octets[n..];
         }
         if let Some(i) = self.found {
@@ -712,7 +770,7 @@ mod tests {
         voice.push(&timeslot(&cw), true, &mut got);
         let lane = voice.lane().expect("found");
         assert_eq!(lane.bits, [0x40, 0x20]);
-        assert!(lane.talking);
+        assert!(lane.talking());
         // The first block finds the lane; the next ones decode from a fresh
         // decoder, so line up against one started there.
         let mut dec = Decoder::new();
@@ -739,11 +797,11 @@ mod tests {
         assert!(voice.lane().is_none() && out.is_empty());
         // Then speech: found, and decoded.
         voice.push(&timeslot(&codewords(BLOCK * 3, 3)), true, &mut out);
-        assert!(voice.lane().is_some_and(|l| l.talking));
+        assert!(voice.lane().is_some_and(|l| l.talking()));
         // Then silence again: nothing out, not talking.
         let n = out.len();
         voice.push(&timeslot(&fill), true, &mut out);
-        assert!(!voice.lane().unwrap().talking);
+        assert!(!voice.lane().unwrap().talking());
         assert!(out.len() <= n + BLOCK * IDIM, "at most the block in flight");
     }
 
