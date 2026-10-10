@@ -12,6 +12,7 @@ mod freq_display;
 mod player;
 mod prefs;
 mod radio;
+mod session;
 mod side_panel;
 mod ts_viewer;
 mod waterfall;
@@ -72,8 +73,14 @@ fn main() -> eframe::Result {
             cc.egui_ctx.set_fonts(fonts);
             let mut app = App {
                 automation: automation::Automation::new(&opts),
+                // Unattended runs (screenshots, claimed carriers) neither
+                // take nor overwrite what the user last had.
+                remember: opts.screenshot.is_none() && opts.after.is_none() && !opts.claim_carriers,
                 ..App::default()
             };
+            if app.remember {
+                app.restore_session();
+            }
             // Claimed VFOs keep `VfoSettings::new`'s temp-dir output folder.
             if let Some(k) = opts.decoder {
                 app.new_decoder = k;
@@ -132,6 +139,11 @@ struct App {
     /// Live controls while the HackRF is the source.
     #[cfg(feature = "hackrf")]
     hackrf: Option<decdvb_io::HackRfControl>,
+    /// Keep the session (radio, source, VFOs) for next time; what was last
+    /// written, and when it was last looked at.
+    remember: bool,
+    session_saved: String,
+    session_at: std::time::Instant,
 }
 
 impl Default for App {
@@ -164,6 +176,9 @@ impl Default for App {
             radio: radio::RadioPanel::default(),
             #[cfg(feature = "hackrf")]
             hackrf: None,
+            remember: false,
+            session_saved: String::new(),
+            session_at: std::time::Instant::now(),
         }
     }
 }
@@ -171,6 +186,120 @@ impl Default for App {
 impl App {
     fn next_name(&self) -> String {
         format!("VFO {}", self.names)
+    }
+
+    /// The session to remember: the HackRF panel, the file source's
+    /// settings and the VFOs (see `session`).
+    fn session_pairs(&self) -> Vec<(String, String)> {
+        let mut p = vec![
+            ("source.rate".to_string(), self.sample_rate.to_string()),
+            (
+                "source.format".to_string(),
+                session::format_name(self.format).to_string(),
+            ),
+            (
+                "source.rf_center_mhz".to_string(),
+                self.rf_center_mhz.to_string(),
+            ),
+        ];
+        #[cfg(feature = "hackrf")]
+        {
+            let r = &self.radio;
+            p.extend([
+                (
+                    "radio.center_hz".to_string(),
+                    r.settings.center_hz.to_string(),
+                ),
+                ("radio.rate".to_string(), r.settings.sample_rate.to_string()),
+                (
+                    "radio.lna_db".to_string(),
+                    r.settings.gains.lna_db.to_string(),
+                ),
+                (
+                    "radio.vga_db".to_string(),
+                    r.settings.gains.vga_db.to_string(),
+                ),
+                (
+                    "radio.amp".to_string(),
+                    u8::from(r.settings.gains.amp).to_string(),
+                ),
+                ("radio.lnb_lo_mhz".to_string(), r.lnb_lo_mhz.to_string()),
+            ]);
+        }
+        for (i, v) in self.vfos.iter().enumerate() {
+            p.push((format!("vfo.{i}"), session::vfo_text(&v.settings)));
+        }
+        p
+    }
+
+    /// Take back the session saved last time. The VFOs wait in the list for
+    /// the first source to start (`start_engine` adds them).
+    fn restore_session(&mut self) {
+        let saved = prefs::session();
+        let get = |key: &str| {
+            saved
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        if let Some(v) = get("source.rate").and_then(|v| v.parse().ok()) {
+            self.sample_rate = v;
+        }
+        if let Some(f) = get("source.format").and_then(session::format_by_name) {
+            self.format = f;
+        }
+        if let Some(v) = get("source.rf_center_mhz").and_then(|v| v.parse().ok()) {
+            self.rf_center_mhz = v;
+        }
+        #[cfg(feature = "hackrf")]
+        {
+            let r = &mut self.radio;
+            if let Some(v) = get("radio.center_hz").and_then(|v| v.parse().ok()) {
+                r.settings.center_hz = v;
+            }
+            if let Some(v) = get("radio.rate").and_then(|v| v.parse().ok()) {
+                r.settings.sample_rate = v;
+            }
+            if let Some(v) = get("radio.lna_db").and_then(|v| v.parse().ok()) {
+                r.settings.gains.lna_db = v;
+            }
+            if let Some(v) = get("radio.vga_db").and_then(|v| v.parse().ok()) {
+                r.settings.gains.vga_db = v;
+            }
+            if let Some(v) = get("radio.amp") {
+                r.settings.gains.amp = v == "1";
+            }
+            if let Some(v) = get("radio.lnb_lo_mhz").and_then(|v| v.parse().ok()) {
+                r.lnb_lo_mhz = v;
+            }
+        }
+        let dir = prefs::output_dir();
+        for i in 0.. {
+            let Some(line) = get(&format!("vfo.{i}")) else {
+                break;
+            };
+            if let Some(s) = session::vfo_from_text(line, dir.clone()) {
+                self.vfos.push(UiVfo {
+                    id: i + 1,
+                    settings: s,
+                });
+            }
+        }
+        self.names = self.vfos.len() as u32 + 1;
+        self.session_saved = format!("{:?}", self.session_pairs());
+    }
+
+    /// Write the session when it has changed (looked at every 2 s).
+    fn keep_session(&mut self) {
+        if !self.remember || self.session_at.elapsed() < std::time::Duration::from_secs(2) {
+            return;
+        }
+        self.session_at = std::time::Instant::now();
+        let pairs = self.session_pairs();
+        let text = format!("{pairs:?}");
+        if text != self.session_saved && prefs::save_session(&pairs).is_ok() {
+            self.session_saved = text;
+        }
     }
 
     /// RF frequency at the span's centre. With no file open this is the
@@ -752,6 +881,7 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.sync_clock_ppm();
+        self.keep_session();
         // Files dropped on the window.
         // egui 0.36: a dropped file is a trait object; on native it has a path.
         let dropped = ctx.input(|i| {
@@ -775,6 +905,25 @@ impl eframe::App for App {
                 if let Some(s) = e.vfo_status(v.id) {
                     self.statuses.insert(v.id, s);
                 }
+            }
+            // Move each VFO by the carrier drift its worker has followed —
+            // only once the worker runs on the offset the GUI has, so the
+            // move is recognised as its own and nothing restarts.
+            let follows: Vec<(VfoId, decdvb_engine::VfoSettings)> =
+                self.vfos
+                    .iter()
+                    .filter_map(|v| {
+                        let st = self.statuses.get(&v.id)?;
+                        (st.follow_hz.abs() >= 1.0 && st.vfo_offset_hz == v.settings.offset_hz)
+                            .then(|| {
+                                let mut s = v.settings.clone();
+                                s.offset_hz += st.follow_hz;
+                                (v.id, s)
+                            })
+                    })
+                    .collect();
+            for (id, s) in follows {
+                self.apply(Action::Update(id, s));
             }
             // Repaint at display rate while running; a row arrives every 40 ms.
             ctx.request_repaint_after(Duration::from_millis(16));

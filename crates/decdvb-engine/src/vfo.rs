@@ -41,6 +41,10 @@ pub enum DecoderKind {
     /// Intelsat IESS-315 turbo product code `tpc_2964` (BPSK/QPSK): frame
     /// structure, scrambling and payload (HDLC/IP or MPEG-TS) found blind.
     Tpc2964,
+    /// A Comtech CDM-600(L)'s voice: the TPC 2964 chain to its Drop &
+    /// Insert (or E1) timeslots, with the G.728 voice found in them played
+    /// as soon as it is found.
+    Cdm600Voice,
     /// Teledyne Paradise Q-Flex FastLink (QPSK, rate 0.710): sync word,
     /// LDPC decoding and descrambling as measured on a live carrier; the
     /// data go to the same payload search as TPC 2964's.
@@ -63,12 +67,13 @@ pub enum DecoderKind {
 }
 
 impl DecoderKind {
-    pub const ALL: [DecoderKind; 11] = [
+    pub const ALL: [DecoderKind; 12] = [
         DecoderKind::Identify,
         DecoderKind::Dvbs2Ip,
         DecoderKind::Dvbs2Ts,
         DecoderKind::DvbsTs,
         DecoderKind::Tpc2964,
+        DecoderKind::Cdm600Voice,
         DecoderKind::FastLink,
         DecoderKind::Viterbi,
         DecoderKind::CarrierId,
@@ -84,6 +89,7 @@ impl DecoderKind {
             DecoderKind::Dvbs2Ts => "DVB-S2/S2X → MPEG-TS",
             DecoderKind::DvbsTs => "DVB-S → MPEG-TS",
             DecoderKind::Tpc2964 => "TPC 2964 (IESS-315) → IP / TS",
+            DecoderKind::Cdm600Voice => "Comtech CDM-600 voice (TPC → D&I → G.728)",
             DecoderKind::FastLink => "Q-Flex FastLink (QPSK 0.710) → data",
             DecoderKind::Viterbi => "Viterbi K=7 (IESS-308/309 SCPC) → data",
             DecoderKind::CarrierId => "Carrier ID (DVB-CID)",
@@ -93,11 +99,44 @@ impl DecoderKind {
         }
     }
 
+    /// A stable name for saving (settings files, the CLI): never changes
+    /// once given.
+    pub fn key(self) -> &'static str {
+        match self {
+            DecoderKind::Identify => "identify",
+            DecoderKind::Dvbs2Ip => "dvbs2-ip",
+            DecoderKind::Dvbs2Ts => "dvbs2-ts",
+            DecoderKind::DvbsTs => "dvbs-ts",
+            DecoderKind::Tpc2964 => "tpc2964",
+            DecoderKind::Cdm600Voice => "cdm600-voice",
+            DecoderKind::FastLink => "fastlink",
+            DecoderKind::Viterbi => "viterbi",
+            DecoderKind::CarrierId => "carrier-id",
+            DecoderKind::PskSymbols => "psk",
+            DecoderKind::IqRecord => "iq-record",
+            DecoderKind::Spectrum => "spectrum",
+        }
+    }
+
+    /// The kind saved as `key`.
+    pub fn from_key(key: &str) -> Option<DecoderKind> {
+        DecoderKind::ALL.into_iter().find(|k| k.key() == key)
+    }
+
+    /// The decoder chain a preset runs: the CDM-600 voice preset is TPC
+    /// 2964's; every other kind its own.
+    pub fn chain(self) -> DecoderKind {
+        match self {
+            DecoderKind::Cdm600Voice => DecoderKind::Tpc2964,
+            k => k,
+        }
+    }
+
     /// The decoder ends in an MPEG-TS (with its outputs and analyser), or
     /// may (TPC 2964, when its data carry one).
     pub fn outputs_ts(self) -> bool {
         matches!(
-            self,
+            self.chain(),
             DecoderKind::Dvbs2Ts
                 | DecoderKind::DvbsTs
                 | DecoderKind::Tpc2964
@@ -110,7 +149,7 @@ impl DecoderKind {
     /// side panel, and Identify's view folds away.
     pub fn demodulates(self) -> bool {
         matches!(
-            self,
+            self.chain(),
             DecoderKind::Dvbs2Ip
                 | DecoderKind::Dvbs2Ts
                 | DecoderKind::DvbsTs
@@ -128,6 +167,7 @@ impl DecoderKind {
             DecoderKind::Dvbs2Ts => "S2→TS",
             DecoderKind::DvbsTs => "S→TS",
             DecoderKind::Tpc2964 => "TPC",
+            DecoderKind::Cdm600Voice => "CDM",
             DecoderKind::FastLink => "FL",
             DecoderKind::Viterbi => "VIT",
             DecoderKind::CarrierId => "CID",
@@ -165,6 +205,11 @@ pub struct VfoSettings {
     /// Q-Flex FastLink: record the data whenever a channel of the TDM
     /// multiplex inside goes active (the 10 s before included).
     pub record_on_activity: bool,
+    /// Keep the down-converter on the carrier as its frequency drifts (an
+    /// LNB warming up, a satellite's Doppler): while the demodulator is
+    /// locked, the offset its carrier loop measures is moved into the
+    /// VFO's tuning, so the carrier cannot wander out of the VFO's band.
+    pub follow_carrier: bool,
     /// DVB-CID: low-SNR mode (searches 96–384 bits deep, a looser
     /// threshold, gentle tracking throughout) for a CID far under spec.
     pub cid_low_snr: bool,
@@ -197,6 +242,9 @@ pub struct VfoSettings {
     /// A Q-Flex's TDM multiplex: play, and record, its call's voice.
     pub tdm_play: bool,
     pub tdm_record: bool,
+    /// The CDM-600 voice preset: play the G.728 voice as soon as it is
+    /// found, without ▶ (so several carriers can be heard at once).
+    pub voice_auto: bool,
     /// Where the IQ recorder and the symbol writer write.
     pub record_dir: PathBuf,
 }
@@ -221,6 +269,7 @@ impl VfoSettings {
             symbol_labels: crate::psk::SymbolLabels::Standard,
             psk_bits: false,
             record_on_activity: false,
+            follow_carrier: true,
             cid_low_snr: false,
             clock_ppm: 0.0,
             record: false,
@@ -238,6 +287,7 @@ impl VfoSettings {
             e1_record: None,
             tdm_play: false,
             tdm_record: false,
+            voice_auto: true,
             record_dir: std::env::temp_dir(),
         }
     }
@@ -248,6 +298,10 @@ impl VfoSettings {
 pub struct VfoStatus {
     pub out_rate: f64,
     pub decimation: usize,
+    /// The VFO offset the worker is running on, and the carrier drift it has
+    /// followed beyond it (Hz) — for the GUI to move the VFO by.
+    pub vfo_offset_hz: f64,
+    pub follow_hz: f64,
     /// Fraction of real time the worker spends processing (1.0 = can't keep up).
     pub load: f32,
     pub dropped: u64,
@@ -529,7 +583,17 @@ struct Worker {
     /// them have been passed on.
     lost: Arc<AtomicU64>,
     lost_seen: u64,
+    /// Carrier drift followed (Hz) not yet taken into the settings' offset,
+    /// and baseband samples since the last look.
+    followed: f64,
+    follow_samples: usize,
 }
+
+/// How often a locked carrier's drift is followed (s), and the least
+/// offset (Hz, and share of the symbol rate) worth a move.
+const FOLLOW_EVERY: f64 = 0.25;
+const FOLLOW_MIN_HZ: f64 = 5.0;
+const FOLLOW_MIN_RS: f64 = 1e-3;
 
 impl Worker {
     fn new(
@@ -563,11 +627,13 @@ impl Worker {
             last_modcod: None,
             identification: None,
             lossless: false,
+            followed: 0.0,
+            follow_samples: 0,
         }
     }
 
     fn make_decoder(s: &VfoSettings, ddc: &Ddc) -> Decoder {
-        match s.decoder {
+        match s.decoder.chain() {
             DecoderKind::Identify => Decoder::Identify {
                 buf: Vec::new(),
                 rest_until: None,
@@ -597,11 +663,13 @@ impl Worker {
                 demod: None,
                 fec: None,
             },
+            // (The CDM-600 voice preset arrives here as TPC 2964.)
             DecoderKind::DvbsTs
             | DecoderKind::Tpc2964
+            | DecoderKind::Cdm600Voice
             | DecoderKind::FastLink
             | DecoderKind::Viterbi => Decoder::Modem {
-                kind: s.decoder,
+                kind: s.decoder.chain(),
                 buf: Vec::new(),
                 demod: None,
                 fec: None,
@@ -626,7 +694,17 @@ impl Worker {
 
     fn apply(&mut self, new: VfoSettings) {
         let rebuild_ddc = new.bandwidth_hz != self.settings.bandwidth_hz;
-        let retuned = new.offset_hz != self.settings.offset_hz;
+        // The GUI moving the VFO by drift this worker followed (see
+        // `follow`): the down-converter is there already, so nothing restarts.
+        let moved = new.offset_hz - self.settings.offset_hz;
+        let absorbed = moved != 0.0
+            && self.followed != 0.0
+            && moved.signum() == self.followed.signum()
+            && moved.abs() <= self.followed.abs() + 0.5;
+        if absorbed {
+            self.followed -= moved;
+        }
+        let retuned = moved != 0.0 && !absorbed;
         let new_decoder = new.decoder != self.settings.decoder
             || new.symbol_rate != self.settings.symbol_rate
             || new.gold_code != self.settings.gold_code
@@ -661,6 +739,53 @@ impl Worker {
             self.last_modcod = None;
             self.identification = None;
         }
+        if rebuild_ddc || retuned {
+            // The down-converter is back on the VFO: nothing followed.
+            self.followed = 0.0;
+        }
+    }
+
+    /// Follow the carrier's drift: a few times a second, a locked
+    /// demodulator's residual offset moves into the down-converter's
+    /// tuning (and out of the carrier loop, so it sees no step). The VFO's
+    /// band then stays on the carrier however far it wanders.
+    fn follow(&mut self, n: usize) {
+        if !self.settings.follow_carrier {
+            return;
+        }
+        self.follow_samples += n;
+        if (self.follow_samples as f64) < FOLLOW_EVERY * self.ddc.out_rate() {
+            return;
+        }
+        self.follow_samples = 0;
+        let (f, rs) = match &self.decoder {
+            Decoder::Dvbs2 { demod: Some(d), .. } if d.carrier_locked() => {
+                (d.carrier_offset_hz(), d.symbol_rate())
+            }
+            Decoder::Modem { demod: Some(d), .. } | Decoder::Psk { demod: Some(d), .. }
+                if d.locked() =>
+            {
+                (d.carrier_offset_hz(), d.symbol_rate())
+            }
+            _ => return,
+        };
+        if f.abs() < FOLLOW_MIN_HZ.max(FOLLOW_MIN_RS * rs) {
+            return;
+        }
+        // Not past the edge of what the receiver takes in.
+        let to = self.ddc.offset_hz() + f;
+        if to.abs() > 0.5 * (self.in_rate - self.ddc.bandwidth()) {
+            return;
+        }
+        self.ddc.set_offset(to);
+        match &mut self.decoder {
+            Decoder::Dvbs2 { demod: Some(d), .. } => d.retune_hz(f),
+            Decoder::Modem { demod: Some(d), .. } | Decoder::Psk { demod: Some(d), .. } => {
+                d.retune_hz(f)
+            }
+            _ => {}
+        }
+        self.followed += f;
     }
 
     fn run(
@@ -713,6 +838,7 @@ impl Worker {
                     self.ddc.process(&block, &mut self.bb);
                     let n = self.bb.len();
                     self.decode();
+                    self.follow(n);
                     // Load: processing time over the block's real duration.
                     let real = block.len() as f64 / self.in_rate;
                     let used = t0.elapsed().as_secs_f64() / real.max(1e-9);
@@ -1086,6 +1212,8 @@ impl Worker {
         let mut st = self.status.lock().unwrap();
         st.out_rate = out_rate;
         st.decimation = self.ddc.decimation();
+        st.vfo_offset_hz = self.settings.offset_hz;
+        st.follow_hz = self.followed;
         st.load = self.load;
         st.dropped = self.dropped.load(Ordering::Relaxed);
         if let Some(s) = spectrum_db {
@@ -1475,7 +1603,7 @@ fn fec_output(s: &VfoSettings, ddc: &Ddc) -> FecOutput {
     FecOutput {
         record: s.record
             && matches!(
-                s.decoder,
+                s.decoder.chain(),
                 DecoderKind::Dvbs2Ip
                     | DecoderKind::Tpc2964
                     | DecoderKind::FastLink
@@ -1497,6 +1625,7 @@ fn fec_output(s: &VfoSettings, ddc: &Ddc) -> FecOutput {
         e1_record: s.e1_record,
         tdm_play: s.tdm_play,
         tdm_record: s.tdm_record,
+        voice_auto: s.voice_auto && s.decoder == DecoderKind::Cdm600Voice,
     }
 }
 
@@ -1710,8 +1839,78 @@ mod tests {
             w.ddc.process(c, &mut w.bb);
             let n = w.bb.len();
             w.decode();
+            w.follow(n);
             w.publish(n);
         }
+    }
+
+    /// QPSK steady for `flat` seconds, then drifting `slope` Hz/s (an LNB
+    /// warming up, but faster), `sps` samples a symbol, a little noise.
+    fn drifting(n_sym: usize, sps: usize, rs: f64, flat: f64, slope: f64) -> Vec<Iq> {
+        let cst = Constellation::qpsk();
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut uniform = move || {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            (s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let syms: Vec<Iq> = (0..n_sym)
+            .map(|_| cst.map((uniform() * 4.0) as usize % 4))
+            .collect();
+        let mut sh = Shaper::new(sps, 0.25, 16);
+        let mut x = Vec::new();
+        sh.process(&syms, &mut x);
+        let rate = rs * sps as f64;
+        let mut ph = 0.0f64;
+        for (n, v) in x.iter_mut().enumerate() {
+            let t = n as f64 / rate;
+            ph += std::f64::consts::TAU * slope * (t - flat).max(0.0) / rate;
+            let noise = Iq::new(uniform() as f32 - 0.5, uniform() as f32 - 0.5) * 0.02;
+            *v = *v * Iq::new(ph.cos() as f32, ph.sin() as f32) + noise;
+        }
+        x
+    }
+
+    #[test]
+    fn the_vfo_follows_a_drifting_carrier() {
+        // 20 kBd QPSK in a 40 kHz VFO, steady for 2 s (to lock), then
+        // drifting 2.5 kHz/s for 10 s: 25 kHz, past the VFO's edge (20 kHz
+        // from its centre).
+        let (rs, sps) = (20_000.0, 4);
+        let x = drifting(240_000, sps, rs, 2.0, 2_500.0);
+        let run = |follow: bool| {
+            let mut s = VfoSettings::new("drift", 0.0, 40_000.0, DecoderKind::PskSymbols);
+            s.symbol_rate = Some(rs);
+            s.psk_modulation = Some(decdvb_core::Modulation::Qpsk);
+            s.follow_carrier = follow;
+            let status = Arc::new(Mutex::new(VfoStatus::default()));
+            let mut wk = Worker::new(
+                rs * sps as f64,
+                s,
+                status.clone(),
+                Arc::new(AtomicU64::new(0)),
+            );
+            feed(&mut wk, &x, 16_384);
+            let st = status.lock().unwrap().clone();
+            (wk, st)
+        };
+        let (mut wk, st) = run(true);
+        let c = st.carrier.expect("demodulator running");
+        assert!(c.locked, "lost the drifting carrier: {}", st.message);
+        // Followed to where it went (25 kHz), less what the loop holds.
+        let at = st.follow_hz + c.offset_hz;
+        assert!((at - 25_000.0).abs() < 1_000.0, "followed to {at} Hz");
+        // The GUI moving the VFO by what was followed changes nothing that
+        // runs: the demodulator carries on, the drift is taken in.
+        let mut moved = wk.settings.clone();
+        moved.offset_hz += st.follow_hz;
+        wk.apply(moved);
+        assert!(matches!(wk.decoder, Decoder::Psk { demod: Some(_), .. }));
+        assert!(wk.followed.abs() < 1.0, "{}", wk.followed);
+        // Without following it leaves the VFO.
+        let (_, st) = run(false);
+        assert!(st.carrier.is_none_or(|c| !c.locked), "{}", st.message);
     }
 
     /// A carrier of `cst` symbols at `rs`, `sps` samples per symbol (the band

@@ -1581,3 +1581,41 @@ guess for the missing bit.
 
 E1 timeslots not judged yet, or sub-rate with no G.728 found, now play
 silence instead of their bytes as A-law (loud noise).
+
+## Carrier drift followed; CDM-600 voice preset; settings remembered (2026-10-10)
+
+- **Drift.** A carrier drifting out of its VFO (an LNB warming up) is now
+  followed: every 0.25 s, while the demodulator is locked, the residual
+  offset its carrier loop holds (beyond 5 Hz or 0.1 % of the symbol rate)
+  moves into the down-converter's tuning and out of the loop
+  (`retune_hz` on `PskDemod` and the DVB-S2 `Demod`, its re-acquisition
+  hint too), so the loop sees no step and the VFO's band stays on the
+  carrier. The worker reports the drift it followed; the GUI moves the VFO
+  by it once the worker runs on the GUI's offset, and the worker takes a
+  move of up to what it followed as its own (nothing restarts). Setting
+  `follow_carrier` (on; "Drift: follow the carrier"). Test: 20 kBd QPSK in a
+  40 kHz VFO drifting 25 kHz (2.5 kHz/s after a steady start) stays locked
+  and followed; without following it is lost. Acquisition while already
+  ramping at 3 kHz/s fails (the carrier loop's pull-in), which a real LNB's
+  drift is far below.
+- **CDM-600 voice preset** (`DecoderKind::Cdm600Voice`, CLI `cdm600`): the
+  TPC 2964 chain (`chain()`), with `voice_auto` — the E1/D&I stage plays the
+  first timeslot whose G.728 has been found when none is chosen, so several
+  carriers play at once (each player its own output stream). ⏹ on the
+  auto-playing timeslot turns it off for that VFO. Badge: "LOCK · G.728
+  speech / silent / voice?". The CLI keeps it off (it records instead).
+- **E1 silence** as before: timeslots not yet judged, or sub-rate with no
+  codec found, play silence.
+- **Settings remembered** in prefs.txt: the HackRF panel (frequency, rate,
+  gains, LNB LO), the file source's rate, format and centre, and the VFOs
+  (`vfo.N`: name, offset, width, decoder, symbol rate, modulation, follow,
+  voice, gold code, …), written within 2 s of a change and restored at
+  start (VFOs join the first source started). Unattended runs (screenshot,
+  claimed carriers) neither read nor write them. The LNB LO default is
+  10600 MHz again.
+
+Three more CDM-600 sites (Rory's VFO_3/4/5 TPC recordings, "more than one
+VHF radio" each) are not the first carrier's format: no D&I++ header
+(scrambled or not), no E1 FAS, no HDLC; unscrambled, idling on a repeating
+8-bit pattern (00000110 or 00000101) with bursts (VFO_4 busy, VFO_3 a third
+of the time, VFO_5 idle throughout). Their framing is still to be found.

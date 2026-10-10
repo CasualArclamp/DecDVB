@@ -324,6 +324,17 @@ impl Demod {
         self.rate / self.sync.sps()
     }
 
+    /// The input is about to arrive `delta_hz` lower (the down-converter
+    /// moved onto the carrier by that much): take it out of the loop's
+    /// frequency and of the hint kept for re-acquisition.
+    pub fn retune_hz(&mut self, delta_hz: f64) {
+        let d = delta_hz / self.symbol_rate();
+        self.pll.set_freq_cycles(self.pll.freq_cycles() - d);
+        if let Some(s) = &mut self.seed {
+            *s -= d;
+        }
+    }
+
     /// Frames emitted so far.
     pub fn frames(&self) -> u64 {
         self.frames

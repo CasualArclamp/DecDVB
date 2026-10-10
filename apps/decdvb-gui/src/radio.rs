@@ -33,8 +33,9 @@ impl Default for RadioPanel {
         RadioPanel {
             open: false,
             settings: HackRfSettings::default(),
-            // A universal Ku LNB's high band; 9750 for its low band and QO-100.
-            lnb_lo_mhz: 10_700.0,
+            // A Ku LNB's 10.6 GHz LO (a universal LNB's high band; 9750
+            // for its low band and QO-100).
+            lnb_lo_mhz: 10_600.0,
             error: None,
         }
     }
@@ -76,7 +77,7 @@ impl RadioPanel {
 
                     ui.label("LNB LO");
                     ui.add(egui::DragValue::new(&mut self.lnb_lo_mhz).speed(1.0).range(0.0..=30_000.0).max_decimals(3).suffix(" MHz"))
-                        .on_hover_text("Only labels the axis: RF = tuned + LO. 10700 for a Ku LNB's high band, 9750 for its low band or QO-100, 0 without one.");
+                        .on_hover_text("Only labels the axis: RF = tuned + LO. 10600 for a universal Ku LNB's high band, 9750 for its low band or QO-100, 0 without one.");
                     ui.end_row();
 
                     ui.label("RF centre");

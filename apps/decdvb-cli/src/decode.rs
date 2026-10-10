@@ -56,11 +56,14 @@ fn decoder_by_name(name: &str) -> Result<DecoderKind> {
         "ts" => DecoderKind::Dvbs2Ts,
         "dvbs" => DecoderKind::DvbsTs,
         "tpc" | "tpc2964" => DecoderKind::Tpc2964,
+        "cdm600" | "cdm600-voice" | "cdm" => DecoderKind::Cdm600Voice,
         "fastlink" | "fl" => DecoderKind::FastLink,
         "viterbi" | "vit" => DecoderKind::Viterbi,
         "cid" | "carrier-id" => DecoderKind::CarrierId,
         "psk" => DecoderKind::PskSymbols,
-        other => bail!("unknown decoder `{other}` (id, ip, ts, dvbs, tpc, psk)"),
+        other => bail!(
+            "unknown decoder `{other}` (id, ip, ts, dvbs, tpc, cdm600, fastlink, viterbi, cid, psk)"
+        ),
     })
 }
 
@@ -167,6 +170,9 @@ pub fn decode(a: DecodeArgs) -> Result<()> {
         bail!("--e1-record needs --out");
     }
     s.e1_record = a.e1_record;
+    // Offline the voice is recorded (--e1-record), not played: the file
+    // may run faster than real time.
+    s.voice_auto = false;
     if a.tdm_record && a.out.is_none() {
         bail!("--tdm-record needs --out");
     }

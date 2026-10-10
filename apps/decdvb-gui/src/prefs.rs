@@ -32,20 +32,45 @@ fn read_all() -> Vec<(String, String)> {
         .collect()
 }
 
-fn write_key(key: &str, value: &str) -> std::io::Result<()> {
+fn write_all(all: &[(String, String)]) -> std::io::Result<()> {
     let Some(p) = prefs_path() else {
         return Ok(());
     };
-    let mut all = read_all();
-    match all.iter_mut().find(|(k, _)| k == key) {
-        Some(e) => e.1 = value.to_string(),
-        None => all.push((key.to_string(), value.to_string())),
-    }
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let text: String = all.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
     std::fs::write(p, text)
+}
+
+fn write_key(key: &str, value: &str) -> std::io::Result<()> {
+    let mut all = read_all();
+    match all.iter_mut().find(|(k, _)| k == key) {
+        Some(e) => e.1 = value.to_string(),
+        None => all.push((key.to_string(), value.to_string())),
+    }
+    write_all(&all)
+}
+
+/// The last session's keys: the radio, the file source, the VFOs.
+fn is_session(key: &str) -> bool {
+    key.starts_with("radio.") || key.starts_with("source.") || key.starts_with("vfo.")
+}
+
+/// The session saved last time, as key/value pairs.
+pub fn session() -> Vec<(String, String)> {
+    read_all()
+        .into_iter()
+        .filter(|(k, _)| is_session(k))
+        .collect()
+}
+
+/// Replace the saved session with `pairs` (the other settings stay).
+pub fn save_session(pairs: &[(String, String)]) -> std::io::Result<()> {
+    let mut all = read_all();
+    all.retain(|(k, _)| !is_session(k));
+    all.extend(pairs.iter().cloned());
+    write_all(&all)
 }
 
 /// Documents\DecDVB, or the temp dir if there is no home.

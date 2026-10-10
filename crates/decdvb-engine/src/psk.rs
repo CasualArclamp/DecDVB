@@ -286,6 +286,14 @@ impl PskDemod {
     pub fn carrier_offset_hz(&self) -> f64 {
         self.pll.freq_cycles() * self.symbol_rate()
     }
+
+    /// The input is about to arrive `delta_hz` lower (the down-converter
+    /// moved onto the carrier by that much): take it out of the loop's
+    /// frequency, so it sees no step.
+    pub fn retune_hz(&mut self, delta_hz: f64) {
+        let f = self.pll.freq_cycles() - delta_hz / self.symbol_rate();
+        self.pll.set_freq_cycles(f);
+    }
 }
 
 /// Live text search on a generic carrier: the hard decisions read under

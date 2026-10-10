@@ -727,12 +727,19 @@ impl E1Stage {
     }
 
     fn follow(&mut self, o: &FecOutput) {
-        if o.e1_play != self.play_want {
-            self.play_want = o.e1_play;
+        // The timeslot chosen, else (asked to) the first where G.728 speech
+        // has been found.
+        let auto = o
+            .voice_auto
+            .then(|| (1..decdvb_modem::e1::TIMESLOTS as u8).find(|&t| self.is_voice(t)))
+            .flatten();
+        let want = o.e1_play.or(auto);
+        if want != self.play_want {
+            self.play_want = want;
             self.player = None;
             self.play_buf.clear();
             self.play_voice.clear();
-            if let Some(t) = o.e1_play {
+            if let Some(t) = want {
                 match AudioPlayer::start(&e1_stream(t), AUDIO_OUTPUT) {
                     Ok(p) => self.player = Some(p),
                     Err(e) => self.error = Some(e),
@@ -962,7 +969,7 @@ pub struct GseView {
 }
 
 /// Where and whether a VFO's FEC writes its output.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct FecOutput {
     /// Write IP packets to a PCAP file.
     pub record: bool,
@@ -995,6 +1002,9 @@ pub struct FecOutput {
     /// A TDM multiplex's call voice: play it, record it (to a `.wav`).
     pub tdm_play: bool,
     pub tdm_record: bool,
+    /// Play an E1's G.728 voice as soon as it is found, when no timeslot
+    /// is chosen (the CDM-600 voice preset).
+    pub voice_auto: bool,
 }
 
 /// Runs a [`FecDecoder`] on its own thread.
@@ -2149,6 +2159,42 @@ mod tests {
     use decdvb_frame::StreamFormat;
     use decdvb_mod::{FrameSpec, PlFramer, Shaper, TsBbFramer};
     use std::f64::consts::TAU;
+
+    /// A D&I timeslot carrying G.728 (as the CDM-600L's: bits 2–3 of each
+    /// octet, codewords inverted, a sync bit 0 once in 32) plays by itself
+    /// under the CDM-600 voice preset, and not otherwise.
+    #[test]
+    fn found_g728_speech_plays_by_itself() {
+        let mut x = 0x2468_ACE1u32;
+        let mut bits = Vec::new();
+        for i in 0..2400 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let cw = (x >> 16) as u16 & 0x1FF | u16::from(i % 32 != 31) << 9;
+            bits.extend((0..10).rev().map(|k| u8::from(cw >> k & 1 == 0)));
+        }
+        let frames: Vec<[u8; decdvb_modem::e1::TIMESLOTS]> = bits
+            .chunks(2)
+            .map(|b| {
+                let mut f = [0xD5; decdvb_modem::e1::TIMESLOTS];
+                f[1] = 0x81 | b[0] << 6 | b[1] << 5;
+                f
+            })
+            .collect();
+        for auto in [true, false] {
+            let o = FecOutput {
+                voice_auto: auto,
+                ..FecOutput::default()
+            };
+            let mut st = E1Stage::new();
+            for chunk in frames.chunks(400) {
+                st.follow(&o);
+                st.frames(chunk);
+            }
+            st.follow(&o);
+            assert!(st.is_voice(1), "G.728 found in timeslot 1");
+            assert_eq!(st.view(Default::default()).playing, auto.then_some(1));
+        }
+    }
 
     #[test]
     fn ip_stage_reassembles_fragmented_rtp_aac() {

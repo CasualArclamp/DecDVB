@@ -115,7 +115,25 @@ pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
     if !s.enabled {
         return "off".into();
     }
-    match s.decoder {
+    if s.decoder == DecoderKind::Cdm600Voice {
+        let lock = if st.carrier.is_some_and(|c| c.locked) {
+            "LOCK"
+        } else {
+            "no lock"
+        };
+        let voice = st
+            .fec
+            .as_ref()
+            .and_then(|f| f.e1.as_ref())
+            .and_then(|e| e.voice.iter().flatten().next().copied());
+        return match (&st.carrier, voice) {
+            (None, _) => format!("acq {:.0} %", st.progress * 100.0),
+            (Some(_), Some((_, true))) => format!("{lock} · G.728 speech"),
+            (Some(_), Some((_, false))) => format!("{lock} · G.728 silent"),
+            (Some(_), None) => format!("{lock} · voice?"),
+        };
+    }
+    match s.decoder.chain() {
         DecoderKind::Identify if st.provisional => {
             let rs = st.symbol_rate.map(format::rate).unwrap_or_default();
             format!("{rs}? {:.0} %", st.progress * 100.0)
@@ -179,7 +197,7 @@ pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
             (Some(c), _) => format!("{} · rate?", if c.locked { "LOCK" } else { "no lock" }),
             (None, _) => format!("acq {:.0} %", st.progress * 100.0),
         },
-        DecoderKind::Tpc2964 => {
+        DecoderKind::Tpc2964 | DecoderKind::Cdm600Voice => {
             let t = st.fec.as_ref().and_then(|f| f.tpc.as_ref().map(|t| (f, t)));
             match (&st.carrier, t) {
                 (Some(c), Some((f, t))) if t.structure.is_some() => format!(

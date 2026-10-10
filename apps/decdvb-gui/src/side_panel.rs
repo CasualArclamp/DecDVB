@@ -355,6 +355,15 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                 ui.end_row();
             }
 
+            if s.decoder == DecoderKind::Cdm600Voice {
+                ui.label("Voice");
+                ui.checkbox(&mut s.voice_auto, "play when G.728 speech is found")
+                    .on_hover_text(
+                        "Play the G.728 voice in the D&I/E1 timeslots as soon as speech is                          found — no ▶ needed, so several carriers can be heard at once.                          Silence between talk spurts is muted.",
+                    );
+                ui.end_row();
+            }
+
             if s.decoder == DecoderKind::FastLink {
                 ui.label("Auto-record");
                 ui.checkbox(&mut s.record_on_activity, "when a TDM channel goes active")
@@ -378,7 +387,7 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                 ui.end_row();
             }
 
-            if s.decoder == DecoderKind::Tpc2964 {
+            if s.decoder.chain() == DecoderKind::Tpc2964 {
                 ui.label("Modulation");
                 let txt = match s.psk_modulation {
                     Some(Modulation::Bpsk) => "BPSK",
@@ -422,6 +431,12 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                     }
                 });
                 ui.end_row();
+                ui.label("Drift");
+                ui.checkbox(&mut s.follow_carrier, "follow the carrier")
+                    .on_hover_text(
+                        "While the demodulator is locked, the VFO moves with the carrier as                          its frequency drifts (an LNB warming up, Doppler), so it cannot                          wander out of the VFO. The decoder keeps running through the moves.",
+                    );
+                ui.end_row();
             }
             if matches!(s.decoder, DecoderKind::Dvbs2Ip | DecoderKind::Dvbs2Ts) {
                 ui.label("Gold code");
@@ -444,7 +459,7 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                 let ts = st.fec.as_ref().and_then(|f| f.ts.as_ref());
                 // A coded modem's raw data are recorded as well as the TS.
                 let tpc = matches!(
-                    s.decoder,
+                    s.decoder.chain(),
                     DecoderKind::Tpc2964 | DecoderKind::FastLink | DecoderKind::Viterbi
                 );
                 ui.label(if tpc { "Record" } else { "TS file" });
@@ -708,11 +723,11 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
     }
 
     if matches!(
-        v.settings.decoder,
+        v.settings.decoder.chain(),
         DecoderKind::Tpc2964 | DecoderKind::FastLink | DecoderKind::Viterbi
     ) && let Some(c) = &st.carrier
     {
-        match v.settings.decoder {
+        match v.settings.decoder.chain() {
             DecoderKind::FastLink => fastlink_card(ui, c, &st),
             DecoderKind::Viterbi => viterbi_card(ui, c, &st),
             _ => tpc_card(ui, c, &st),
@@ -939,6 +954,7 @@ fn e1_card(ui: &mut Ui, e: &decdvb_engine::E1View, v: &UiVfo, actions: &mut Vec<
         return;
     }
     let (mut play, mut rec) = (v.settings.e1_play, v.settings.e1_record);
+    let mut auto = v.settings.voice_auto;
     egui::ScrollArea::vertical()
         .id_salt(("e1_slots", v.id))
         .max_height(320.0)
@@ -990,13 +1006,20 @@ fn e1_card(ui: &mut Ui, e: &decdvb_engine::E1View, v: &UiVfo, actions: &mut Vec<
                                 "Every bit repeats each millisecond: an idle pattern, or a steady test tone.",
                             );
                         }
-                        let on = play == Some(ts);
+                        // Playing because G.728 speech was found (the CDM-600
+                        // voice preset): ⏹ turns that off for this VFO.
+                        let auto_on = play.is_none() && e.playing == Some(ts);
+                        let on = play == Some(ts) || auto_on;
                         if ui
                             .small_button(if on { "⏹" } else { "▶" })
                             .on_hover_text(if on { "Stop" } else { "Listen" })
                             .clicked()
                         {
-                            play = if on { None } else { Some(ts) };
+                            if auto_on {
+                                auto = false;
+                            } else {
+                                play = if on { None } else { Some(ts) };
+                            }
                         }
                         let recording = rec == Some(ts);
                         if ui
@@ -1014,10 +1037,11 @@ fn e1_card(ui: &mut Ui, e: &decdvb_engine::E1View, v: &UiVfo, actions: &mut Vec<
                     }
                 });
         });
-    if play != v.settings.e1_play || rec != v.settings.e1_record {
+    if play != v.settings.e1_play || rec != v.settings.e1_record || auto != v.settings.voice_auto {
         let mut s = v.settings.clone();
         s.e1_play = play;
         s.e1_record = rec;
+        s.voice_auto = auto;
         actions.push(Action::Update(v.id, s));
     }
 }
