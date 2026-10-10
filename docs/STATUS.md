@@ -1689,3 +1689,24 @@ Rory's Horizons 3e plan (Comtech and Q-Flex sites; 58 837 Hz is
   "on air" / "waiting". ▶ on a channel bypasses it. Toolbar: master Volume
   and mute (the app-wide player gain, as before), the floor switch and hold
   (prefs `voice_hold`, "off" for none).
+
+## Q-Flex calls auto-play; their fill never decoded (2026-10-10)
+
+- **Auto-play** (`CallVoice::follow`): under the FastLink decoder's Voice
+  setting a call plays once its stream has spoken (`talk_blocks > 0`), as
+  the voice floor allows (`may_play((source, 0), talking)`; ▶ bypasses it);
+  the card says on air / waiting, ⏹ turns `voice_auto` off.
+- **False speech in the fill, found decoding qflex_3 to a .wav:** 34 bursts
+  of near full-scale noise between calls (every 10–20 s, 0.5–1.2 s each),
+  never counted as a call. Logged blocks showed why: the Q-Flex's silence
+  fill (inverted units `111111cccc` counting down) keeps the sync marker
+  going, once in 32 codewords, and read one bit off its codeword phase the
+  marker column looks like speech's sync — with the opposite polarity to the
+  real call (sync mostly 1, not 0). The fill test needed all six fixed bits
+  in every codeword, so the marker and the stream's odd wrong bit (five
+  codewords of 64 off, 89 % of count steps right) defeated it. Now
+  `fill_at` allows `FILL_BROKEN` = 8 codewords off and 3 steps in 4 (speech:
+  ~60 and 1 in 16) and runs before the speech test. All 34 bursts gone, the
+  call unchanged (8.7 s); the CDM-600L's decode identical sample for sample.
+  Also: a block with more than three unknown sync bits is not speech.
+
