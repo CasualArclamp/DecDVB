@@ -1646,3 +1646,46 @@ drawn, claimed or double-clicked onto a plan carrier (`freqplan::at`). GUI
 automation takes `--plan FILE` (unattended runs do not read the saved one).
 Rory's Horizons 3e plan (Comtech and Q-Flex sites; 58 837 Hz is
 1.35 × 43.6 kS/s, the CDM-600s) stays local.
+
+## LO trim; multi-radio trunks; one voice at a time (2026-10-10)
+
+- **LO trim** (`main.rs`): the LNB's error added to the RF scale — axis,
+  readout, plan labels, VFO names — with the radio's tuning unchanged
+  (`rf_center` = untrimmed + trim; `set_rf_center` takes it off again).
+  ⟲ Align: `freqplan::align`, each carrier (wide ones) paired with plan
+  carriers of 0.6–1.7× its width within ±3 MHz, the trim most carriers agree
+  on within two FFT bins (their median; two needed). keep: every 5 s, ±20
+  kHz, half the step. Saved as `radio.lo_trim_hz` / `radio.plan_keep`.
+- **Multi-radio Comtech trunks** (`decsat-modem::slotpkt`): Rory's VFO_4
+  recording (320 kbit/s — the same as his live VFO 20, 213.3 kS/s) is HDLC
+  on an inverted line: idle flags `00000011`, packets of 398 bits whose
+  FCS-16 (bitwise, CCITT, remainder F0B8h) checks on every one. Content: bit
+  0 = 1, bits 1–4 a link sequence count, channel byte `10h`/`20h` (two in
+  turn, two packets each), type `13h`, five bits (`0xxx0`), 352 timeslot
+  bits, a 1, the FCS. Found by joining each channel's packets and asking
+  which cut keeps the timeslot's 1 ms pattern unbroken across the joins
+  (bits 29–380; bit 381 breaks it). Each channel is then 23.9 s of 64 kbit/s
+  over the 24 s recording, with G.728 in bits 2–3 exactly as on the first
+  CDM-600L — all silence fill in this recording (`decsat payload … --frame-bits
+  2223` now says so per channel). VFO_5 (187 kbit/s) is the same link with
+  only a status packet every 2 s. Other packet types share the 30 + 8n bit
+  shape. VFO_3 (≈1 Mbit/s, idle `00000101`) is something else again: not
+  yet found.
+- `payload::Format::Slots`: chosen on packets (three) or flags covering most
+  bits (an idle site); inverted line only, so plain HDLC links are untouched.
+  The E1 stage makes E1-shaped frames from the channels (a channel unheard
+  for 16 packets stops holding the others back) and runs its G.728 finders
+  on them.
+- **G.728 silence fill recognised** (`Framer::fill_blocks`): the sync bit
+  and the five below it fixed, the low four counting one per codeword (up;
+  down on an inverted line). A lane sending it counts as found, so an idle
+  trunk shows "G.728, silent" instead of "voice?". Steady and random bits
+  are never taken for it (test).
+- **Mixing and the voice floor** (`decsat-engine::floor`): the preset now
+  plays `MIX` — every G.728 channel of the carrier, mixed — once any has
+  spoken. With one voice at a time (default, hold 3 s), every auto-playing
+  channel across all VFOs asks an app-wide floor: the first to speak holds
+  it until quiet for the hold; the rest are muted meanwhile. The card says
+  "on air" / "waiting". ▶ on a channel bypasses it. Toolbar: master Volume
+  and mute (the app-wide player gain, as before), the floor switch and hold
+  (prefs `voice_hold`, "off" for none).

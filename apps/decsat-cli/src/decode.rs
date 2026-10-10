@@ -332,18 +332,22 @@ fn report(st: &VfoStatus) {
         print_tdm(t);
     }
     if let Some(e) = &f.e1 {
-        println!(
-            "e1: {} · {} frames · {} FAS errors · {} losses{}",
-            if e.stats.locked {
-                "aligned"
-            } else {
-                "not aligned"
-            },
-            e.stats.frames,
-            e.stats.fas_errors,
-            e.stats.losses,
-            if e.stats.cas { " · CAS" } else { "" }
-        );
+        if let Some((n, lost)) = e.packets {
+            println!("e1: {n} timeslot packets · {lost} lost");
+        } else {
+            println!(
+                "e1: {} · {} frames · {} FAS errors · {} losses{}",
+                if e.stats.locked {
+                    "aligned"
+                } else {
+                    "not aligned"
+                },
+                e.stats.frames,
+                e.stats.fas_errors,
+                e.stats.losses,
+                if e.stats.cas { " · CAS" } else { "" }
+            );
+        }
         println!("  {}", e.source);
         if let Some((p, n)) = &e.record_file {
             println!("  recorded to {} ({n} bytes)", p.display());
@@ -368,7 +372,8 @@ fn report(st: &VfoStatus) {
                     Coding::Steady => " · steady (idle pattern or tone)".into(),
                     _ => String::new(),
                 };
-                println!("  TS {ts:2}: {db:6.1} dBFS{note}");
+                let name = if e.channels.is_some() { "ch" } else { "TS" };
+                println!("  {name} {ts:2}: {db:6.1} dBFS{note}");
             }
         }
     }
@@ -470,6 +475,23 @@ pub(crate) fn print_payload(p: &decsat_modem::payload::PayloadStats) {
             e.losses,
             hex(&e.cycle),
             hex(&e.varying)
+        );
+    }
+    if let Some(s) = &p.slots {
+        let ch: Vec<String> = (1..16)
+            .filter(|c| s.channels >> c & 1 == 1)
+            .map(|c| format!("{:02x}h", c << 4))
+            .collect();
+        println!(
+            "  timeslot packets: {} packets ({} carrying timeslots), {} lost, channels {}",
+            s.packets,
+            s.slot_packets,
+            s.lost,
+            if ch.is_empty() {
+                "none yet".into()
+            } else {
+                ch.join(", ")
+            }
         );
     }
 }

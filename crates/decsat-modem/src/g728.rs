@@ -548,6 +548,9 @@ pub struct Framer {
     pub talking: bool,
     /// 40 ms blocks of speech so far.
     pub talk_blocks: u64,
+    /// 40 ms blocks of the equipment's silence fill so far: G.728 is here
+    /// even before anyone speaks.
+    pub fill_blocks: u64,
 }
 
 impl Default for Framer {
@@ -564,6 +567,7 @@ impl Framer {
             decoder: Decoder::new(),
             talking: false,
             talk_blocks: 0,
+            fill_blocks: 0,
         }
     }
 
@@ -598,6 +602,37 @@ impl Framer {
         fits.then_some((1 - majority, o))
     }
 
+    /// Is this a block of silence fill with codewords starting at bit `p`:
+    /// the sync bit and the five below it alike in every codeword, the low
+    /// four bits counting one up a codeword (down on an inverted line)?
+    fn fill_at(&self, p: usize) -> bool {
+        let unit = |i: usize| &self.raw[p + 10 * i..p + 10 * i + 10];
+        let Some(v) = (0..BLOCK)
+            .flat_map(|i| unit(i)[..6].iter().copied())
+            .find(|&b| b != UNCARRIED)
+        else {
+            return false;
+        };
+        let fixed = (0..BLOCK).all(|i| unit(i)[..6].iter().all(|&b| b == v || b == UNCARRIED));
+        if !fixed {
+            return false;
+        }
+        // The count, where all four of its bits are carried.
+        let count = |i: usize| {
+            let c = &unit(i)[6..];
+            (!c.contains(&UNCARRIED)).then(|| c.iter().fold(0u8, |a, &b| a << 1 | b))
+        };
+        let step = if v == 0 { 1 } else { 15 };
+        let (mut steps, mut ok) = (0, 0);
+        for i in 1..BLOCK {
+            if let (Some(a), Some(b)) = (count(i - 1), count(i)) {
+                steps += 1;
+                ok += usize::from(b.wrapping_sub(a) & 15 == step);
+            }
+        }
+        steps >= BLOCK / 2 && ok * 10 >= steps * 9
+    }
+
     fn block(&mut self, decode: bool, out: &mut Vec<f32>) {
         // Rust note: `or_else` only searches the other phases when the
         // locked one fails.
@@ -606,6 +641,13 @@ impl Framer {
             .and_then(|p| self.sync_at(p).map(|s| (p, s)))
             .or_else(|| (0..10).find_map(|p| self.sync_at(p).map(|s| (p, s))));
         self.talking = found.is_some();
+        if found.is_none() {
+            let p0 = self.phase.unwrap_or(0);
+            if let Some(p) = (0..10).map(|k| (p0 + k) % 10).find(|&p| self.fill_at(p)) {
+                self.phase = Some(p);
+                self.fill_blocks += 1;
+            }
+        }
         if let Some((p, (invert, odd))) = found {
             self.phase = Some(p);
             self.talk_blocks += 1;
@@ -676,7 +718,8 @@ impl Lane {
 }
 
 /// G.728 voice somewhere in a timeslot's sub-rate bits: a [`Lane`] on each
-/// pair of neighbouring bits that change, until one of them speaks.
+/// pair of neighbouring bits that change, until one of them speaks (or
+/// sends the silence fill).
 pub struct Voice {
     /// The changing bits ([`crate::e1::Coding::SubRate`]'s mask).
     pub mask: u8,
@@ -708,7 +751,11 @@ impl Voice {
             for l in &mut self.lanes {
                 l.push(&octets[..n], false, out);
             }
-            self.found = self.lanes.iter().position(|l| l.framer.talk_blocks > 0);
+            // Speech, or the silence fill: either way the lane is G.728.
+            self.found = self
+                .lanes
+                .iter()
+                .position(|l| l.framer.talk_blocks > 0 || l.framer.fill_blocks > 0);
             octets = &octets[n..];
         }
         if let Some(i) = self.found {
@@ -794,7 +841,8 @@ mod tests {
         let mut voice = Voice::new(0x60);
         let mut out = Vec::new();
         voice.push(&timeslot(&fill), true, &mut out);
-        assert!(voice.lane().is_none() && out.is_empty());
+        // The fill says G.728 is there, but nothing is decoded from it.
+        assert!(voice.lane().is_some_and(|l| !l.talking()) && out.is_empty());
         // Then speech: found, and decoded.
         voice.push(&timeslot(&codewords(BLOCK * 3, 3)), true, &mut out);
         assert!(voice.lane().is_some_and(|l| l.talking()));
@@ -803,6 +851,25 @@ mod tests {
         voice.push(&timeslot(&fill), true, &mut out);
         assert!(!voice.lane().unwrap().talking());
         assert!(out.len() <= n + BLOCK * IDIM, "at most the block in flight");
+    }
+
+    #[test]
+    fn steady_or_random_bits_are_not_fill() {
+        let mut out = Vec::new();
+        // A lane stuck at one value: no count.
+        let mut f = Framer::new();
+        for _ in 0..BLOCK * 10 * 3 {
+            f.push(1, false, &mut out);
+        }
+        assert_eq!(f.fill_blocks, 0);
+        // Random bits.
+        let mut x = 99u32;
+        let mut f = Framer::new();
+        for _ in 0..BLOCK * 10 * 20 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            f.push((x >> 20) as u8 & 1, false, &mut out);
+        }
+        assert_eq!(f.fill_blocks + f.talk_blocks, 0);
     }
 
     /// The Recommendation's decoder test vectors (Appendix I: CWn.BIN in,

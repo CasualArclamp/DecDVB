@@ -514,11 +514,14 @@ impl CallVoice {
 /// An E1's state, for display.
 #[derive(Debug, Clone, Default)]
 pub struct E1View {
-    /// How the channels are carried: "E1 (G.704)" or "D&I++".
+    /// How the channels are carried: "E1 (G.704)", "D&I++" or HDLC
+    /// packets.
     pub source: String,
-    /// D&I++: the number of 64 kbit/s timeslots carried (channels 1..=n);
-    /// `None` for a whole E1 (timeslots 1–31).
+    /// D&I++ or packets: the 64 kbit/s timeslots carried are channels
+    /// 1..=n; `None` for a whole E1 (timeslots 1–31).
     pub channels: Option<u8>,
+    /// Timeslots in HDLC packets: packets taken, and packets lost.
+    pub packets: Option<(u64, u64)>,
     pub stats: decsat_modem::e1::E1Stats,
     /// Level of each timeslot over the last half second, dBFS (A-law
     /// decoded; idle channels sit near −70, data near −5).
@@ -530,9 +533,13 @@ pub struct E1View {
     /// (G.704 numbering) and whether it is speaking now. Such a timeslot
     /// plays and records decoded.
     pub voice: Vec<Option<(u8, bool)>>,
-    /// The timeslot playing, and its player.
+    /// The timeslot playing ([`MIX`]: every G.728 channel, by itself),
+    /// and its player.
     pub playing: Option<u8>,
     pub audio: Option<AudioHandle>,
+    /// The channel of this carrier holding the voice floor (heard now,
+    /// others waiting; see [`crate::floor`]).
+    pub on_air: Option<u8>,
     /// The timeslot recording, and the file (current or last) with bytes.
     pub recording: Option<u8>,
     pub record_file: Option<(PathBuf, u64)>,
@@ -572,7 +579,29 @@ struct E1Stage {
     /// the timeslot's own bytes.
     play_voice: VecDeque<u8>,
     record_voice: VecDeque<u8>,
+    /// Playing [`MIX`]: each channel's decoded speech, mixed as it plays,
+    /// and which channels the voice floor lets be heard.
+    mix: Vec<VecDeque<f32>>,
+    heard: [bool; decsat_modem::e1::TIMESLOTS],
+    /// This stage's number on the voice floor.
+    source: u64,
+    /// Timeslots from HDLC packets: the channels seen (a mask), each
+    /// channel's octets not yet made into frames, and when (in packets)
+    /// each was last heard from.
+    slots: Option<u16>,
+    slot_fifo: Vec<VecDeque<u8>>,
+    slot_seen: [Option<u64>; decsat_modem::e1::TIMESLOTS],
+    slot_count: u64,
 }
+
+/// [`E1View::playing`] when the voice preset plays every channel with
+/// G.728 on it (as the floor allows), mixed. Timeslot 0 is an E1's
+/// alignment, never a voice channel.
+pub const MIX: u8 = 0;
+
+/// A packet channel not heard from for this many packets is taken to have
+/// stopped, and no longer holds the others' frames back.
+const SLOT_STALE: u64 = 16;
 
 /// Decoded G.728 waiting to play or record, at most (in samples): it comes
 /// 40 ms at a time and leaves a sample a frame, so it never needs more.
@@ -634,6 +663,17 @@ impl E1Stage {
             voice_pcm: Vec::new(),
             play_voice: VecDeque::new(),
             record_voice: VecDeque::new(),
+            mix: (0..decsat_modem::e1::TIMESLOTS)
+                .map(|_| VecDeque::new())
+                .collect(),
+            heard: [false; decsat_modem::e1::TIMESLOTS],
+            source: crate::floor::new_source(),
+            slots: None,
+            slot_fifo: (0..decsat_modem::e1::TIMESLOTS)
+                .map(|_| VecDeque::new())
+                .collect(),
+            slot_seen: [None; decsat_modem::e1::TIMESLOTS],
+            slot_count: 0,
         }
     }
 
@@ -664,13 +704,17 @@ impl E1Stage {
             let Some(v) = &mut self.voice[ts] else {
                 continue;
             };
+            let mixing = self.play_want == Some(MIX);
             let (play, rec) = (
                 self.play_want == Some(ts as u8),
                 self.record_want == Some(ts as u8),
             );
             self.voice_pcm.clear();
-            v.push(&f[ts..=ts], play || rec, &mut self.voice_pcm);
+            v.push(&f[ts..=ts], play || rec || mixing, &mut self.voice_pcm);
             for &x in &self.voice_pcm {
+                if mixing {
+                    self.mix[ts].push_back(x);
+                }
                 let b = decsat_modem::e1::alaw_encode(x);
                 if play {
                     self.play_voice.push_back(b);
@@ -679,11 +723,51 @@ impl E1Stage {
                     self.record_voice.push_back(b);
                 }
             }
+            let q = &mut self.mix[ts];
+            if q.len() > VOICE_BACKLOG {
+                q.drain(..q.len() - VOICE_BACKLOG / 2);
+            }
         }
         for q in [&mut self.play_voice, &mut self.record_voice] {
             if q.len() > VOICE_BACKLOG {
                 q.drain(..q.len() - VOICE_BACKLOG / 2);
             }
+        }
+    }
+
+    /// Timeslot `t`'s G.728 lane, once found.
+    fn lane(&self, t: usize) -> Option<&decsat_modem::g728::Lane> {
+        self.voice.get(t)?.as_ref()?.lane()
+    }
+
+    /// The next sample of the mix: every channel's speech the voice floor
+    /// lets be heard (A-law silence when there is none).
+    fn mix_byte(&mut self) -> u8 {
+        let mut sum = 0.0f32;
+        let mut any = false;
+        for (t, q) in self.mix.iter_mut().enumerate() {
+            if let Some(x) = q.pop_front()
+                && self.heard[t]
+            {
+                sum += x;
+                any = true;
+            }
+        }
+        if any {
+            decsat_modem::e1::alaw_encode(sum.clamp(-1.0, 1.0))
+        } else {
+            0xD5
+        }
+    }
+
+    /// Ask the voice floor which channels may be heard in the mix.
+    fn ask_floor(&mut self) {
+        for t in 1..decsat_modem::e1::TIMESLOTS {
+            let talking = self.lane(t).map(|l| l.talking());
+            self.heard[t] = match talking {
+                Some(talking) => crate::floor::may_play((self.source, t as u8), talking),
+                None => false,
+            };
         }
     }
 
@@ -726,19 +810,60 @@ impl E1Stage {
         self.frames(&frames);
     }
 
+    /// Timeslots from HDLC packets, `(channel, octets)`: made into
+    /// E1-shaped frames (channel k in timeslot k, the rest idle A-law) once
+    /// every channel still sending has an octet for them.
+    fn slot_packets(&mut self, packets: &[(u8, Vec<u8>)], channels: u16) {
+        use decsat_modem::e1::TIMESLOTS;
+        self.slots = Some(channels);
+        for (t, octets) in packets {
+            let t = *t as usize;
+            if (1..TIMESLOTS).contains(&t) {
+                self.slot_fifo[t].extend(octets.iter().copied());
+                self.slot_seen[t] = Some(self.slot_count);
+                self.slot_count += 1;
+            }
+        }
+        let now = self.slot_count;
+        let mut live = Vec::new();
+        for t in 1..TIMESLOTS {
+            match self.slot_seen[t] {
+                Some(at) if now - at <= SLOT_STALE => live.push(t),
+                _ => self.slot_fifo[t].clear(),
+            }
+        }
+        let n = live
+            .iter()
+            .map(|&t| self.slot_fifo[t].len())
+            .min()
+            .unwrap_or(0);
+        let frames: Vec<[u8; TIMESLOTS]> = (0..n)
+            .map(|_| {
+                let mut f = [0xD5; TIMESLOTS];
+                for &t in &live {
+                    f[t] = self.slot_fifo[t].pop_front().unwrap_or(0xD5);
+                }
+                f
+            })
+            .collect();
+        self.frames(&frames);
+    }
+
     fn follow(&mut self, o: &FecOutput) {
-        // The timeslot chosen, else (asked to) the first where G.728 speech
-        // has been found.
-        let auto = o
-            .voice_auto
-            .then(|| (1..decsat_modem::e1::TIMESLOTS as u8).find(|&t| self.is_voice(t)))
-            .flatten();
+        // The timeslot chosen, else (asked to) every channel with G.728,
+        // mixed, once one has spoken.
+        let spoken = (1..decsat_modem::e1::TIMESLOTS)
+            .any(|t| self.lane(t).is_some_and(|l| l.framer.talk_blocks > 0));
+        let auto = (o.voice_auto && spoken).then_some(MIX);
         let want = o.e1_play.or(auto);
         if want != self.play_want {
             self.play_want = want;
             self.player = None;
             self.play_buf.clear();
             self.play_voice.clear();
+            for q in &mut self.mix {
+                q.clear();
+            }
             if let Some(t) = want {
                 match AudioPlayer::start(&e1_stream(t), AUDIO_OUTPUT) {
                     Ok(p) => self.player = Some(p),
@@ -774,6 +899,9 @@ impl E1Stage {
 
     fn frames(&mut self, frames: &[[u8; decsat_modem::e1::TIMESLOTS]]) {
         use decsat_ip::mcast::rtp_packet;
+        if self.play_want == Some(MIX) {
+            self.ask_floor();
+        }
         for f in frames {
             self.activity.push(f);
             self.voice(f);
@@ -806,6 +934,7 @@ impl E1Stage {
             // One RTP packet per 20 ms of the chosen timeslot.
             // A timeslot carrying G.728 goes out decoded.
             let play_byte = match self.play_want {
+                Some(MIX) => Some(self.mix_byte()),
                 Some(t) if self.is_voice(t) => Some(voice_byte(&mut self.play_voice)),
                 Some(t) => Some(self.plain_byte(f, t)),
                 None => None,
@@ -852,12 +981,23 @@ impl E1Stage {
     }
 
     fn view(&self, stats: decsat_modem::e1::E1Stats) -> E1View {
+        // The highest channel a packet has carried: rows 1..=it.
+        let slot_last = self.slots.map(|m| (15 - m.leading_zeros().min(15)) as u8);
+        let holder = crate::floor::holder();
         E1View {
-            source: match self.dandi {
-                Some(n) => format!("Comtech D&I++, {n} × 64 kbit/s"),
-                None => "E1 (G.704)".into(),
+            source: match (self.dandi, slot_last) {
+                (Some(n), _) => format!("Comtech D&I++, {n} × 64 kbit/s"),
+                (None, Some(_)) => {
+                    let n = self.slots.unwrap_or(0).count_ones();
+                    format!("timeslots in HDLC packets, {n} × 64 kbit/s")
+                }
+                (None, None) => "E1 (G.704)".into(),
             },
-            channels: self.dandi,
+            channels: self.dandi.or(slot_last),
+            packets: None,
+            on_air: holder
+                .filter(|h| h.0 == self.source && self.play_want == Some(MIX))
+                .map(|h| h.1),
             stats,
             levels_db: self.levels_db.clone(),
             coding: self.activity.coding().to_vec(),
@@ -1934,6 +2074,12 @@ fn run(
                         stage.follow(&o);
                         stage.frames(&payload_out.e1);
                     }
+                    if !payload_out.slots.is_empty() {
+                        let channels = pay.stats.slots.as_ref().map_or(0, |s| s.channels);
+                        let stage = e1.get_or_insert_with(E1Stage::new);
+                        stage.follow(&o);
+                        stage.slot_packets(&payload_out.slots, channels);
+                    }
                     if !payload_out.dandi.is_empty() {
                         // Timeslots carried: the data rate — the symbol rate
                         // through the code — is n × 64 kbit/s × 46/45 (the
@@ -1986,17 +2132,24 @@ fn run(
                 s.text = tpc_text.as_ref().map(|t| t.view());
                 if let Some(stage) = &mut e1 {
                     stage.follow(&o);
-                    let st = match &pay.stats.dandi {
-                        Some(d) => decsat_modem::e1::E1Stats {
+                    let st = match (&pay.stats.dandi, &pay.stats.slots) {
+                        (Some(d), _) => decsat_modem::e1::E1Stats {
                             locked: d.locked,
                             frames: d.frames,
                             fas_errors: d.bad_frames,
                             losses: d.losses,
                             cas: false,
                         },
-                        None => pay.stats.e1.clone().unwrap_or_default(),
+                        (None, Some(p)) => decsat_modem::e1::E1Stats {
+                            locked: p.slot_packets > 0,
+                            frames: p.slot_packets,
+                            ..Default::default()
+                        },
+                        _ => pay.stats.e1.clone().unwrap_or_default(),
                     };
-                    s.e1 = Some(stage.view(st));
+                    let mut view = stage.view(st);
+                    view.packets = pay.stats.slots.as_ref().map(|p| (p.slot_packets, p.lost));
+                    s.e1 = Some(view);
                 }
                 s.raw_file = raw.path.clone().map(|p| (p, raw.bytes));
                 s.raw_triggered = raw.triggered;
@@ -2163,6 +2316,64 @@ mod tests {
     /// A D&I timeslot carrying G.728 (as the CDM-600L's: bits 2–3 of each
     /// octet, codewords inverted, a sync bit 0 once in 32) plays by itself
     /// under the CDM-600 voice preset, and not otherwise.
+    /// A multi-radio site's timeslots in HDLC packets: speech on one
+    /// channel, the G.728 silence fill on the other. Both are found as
+    /// G.728, and the preset plays them mixed.
+    #[test]
+    fn packet_timeslots_carry_g728_on_each_channel() {
+        let octets = |words: &[u16], invert: bool| -> Vec<u8> {
+            let bits: Vec<u8> = words
+                .iter()
+                .flat_map(|&w| {
+                    (0..10)
+                        .rev()
+                        .map(move |k| u8::from(w >> k & 1 == 1) ^ u8::from(invert))
+                })
+                .collect();
+            bits.chunks(2)
+                .map(|b| 0x81 | b[0] << 6 | b[1] << 5)
+                .collect()
+        };
+        let mut x = 0x1357_9BDFu32;
+        let speech: Vec<u16> = (0..2400)
+            .map(|i| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 16) as u16 & 0x1FF | u16::from(i % 32 != 31) << 9
+            })
+            .collect();
+        let fill: Vec<u16> = (0..2400).map(|i| (i % 16) as u16).collect();
+        let (one, two) = (octets(&speech, true), octets(&fill, false));
+        let o = FecOutput {
+            voice_auto: true,
+            ..FecOutput::default()
+        };
+        let mut st = E1Stage::new();
+        // Two packets of one channel, then two of the other, 44 octets each.
+        let mut k = 0;
+        while (k + 2) * 44 <= one.len() {
+            let pk: Vec<(u8, Vec<u8>)> = (0..2)
+                .map(|j| (1, one[(k + j) * 44..(k + j + 1) * 44].to_vec()))
+                .chain((0..2).map(|j| (2, two[(k + j) * 44..(k + j + 1) * 44].to_vec())))
+                .collect();
+            st.follow(&o);
+            st.slot_packets(&pk, 0b110);
+            k += 2;
+        }
+        st.follow(&o);
+        assert!(
+            st.lane(1).is_some_and(|l| l.framer.talk_blocks > 0),
+            "speech on 1"
+        );
+        assert!(
+            st.lane(2).is_some_and(|l| l.framer.fill_blocks > 0),
+            "fill on 2"
+        );
+        let v = st.view(Default::default());
+        assert_eq!(v.channels, Some(2));
+        assert_eq!(v.voice[2], Some((2, false)));
+        assert_eq!(v.playing, Some(MIX));
+    }
+
     #[test]
     fn found_g728_speech_plays_by_itself() {
         let mut x = 0x2468_ACE1u32;
@@ -2192,7 +2403,7 @@ mod tests {
             }
             st.follow(&o);
             assert!(st.is_voice(1), "G.728 found in timeslot 1");
-            assert_eq!(st.view(Default::default()).playing, auto.then_some(1));
+            assert_eq!(st.view(Default::default()).playing, auto.then_some(MIX));
         }
     }
 

@@ -126,6 +126,16 @@ pub fn load() {
         decsat_audio::set_volume(v);
     }
     decsat_audio::set_muted(get("muted") == Some("1"));
+    // One voice at a time (the hold, s), or "off": everyone at once.
+    match get("voice_hold") {
+        Some("off") => decsat_engine::floor::set_hold(None),
+        Some(v) => {
+            if let Ok(s) = v.parse::<f32>() {
+                decsat_engine::floor::set_hold(Some(s));
+            }
+        }
+        None => {}
+    }
     if let Some(v) = get("clock_ppm").and_then(|v| v.parse::<f64>().ok()) {
         *CLOCK_PPM.lock().unwrap() = v;
     }
@@ -146,6 +156,8 @@ pub fn set_clock_ppm(ppm: f64) {
 pub fn save_audio() {
     let _ = write_key("volume", &format!("{:.3}", decsat_audio::volume()));
     let _ = write_key("muted", if decsat_audio::muted() { "1" } else { "0" });
+    let hold = decsat_engine::floor::hold().map_or("off".into(), |s| format!("{s:.1}"));
+    let _ = write_key("voice_hold", &hold);
 }
 
 /// The frequency plan file in use (the user's own: only its path is kept).

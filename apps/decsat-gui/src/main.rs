@@ -160,6 +160,8 @@ struct App {
     lo_trim_hz: f64,
     plan_keep: bool,
     plan_keep_at: std::time::Instant,
+    /// The voice floor's hold, kept while it is off.
+    voice_hold_s: f32,
 }
 
 impl Default for App {
@@ -199,6 +201,7 @@ impl Default for App {
             lo_trim_hz: 0.0,
             plan_keep: false,
             plan_keep_at: std::time::Instant::now(),
+            voice_hold_s: decsat_engine::floor::hold().unwrap_or(3.0),
         }
     }
 }
@@ -1001,6 +1004,43 @@ impl App {
                         .speed(0.5)
                         .suffix(" dB"),
                 );
+            }
+            ui.separator();
+            // The master volume for everything played, voice included.
+            ui.label("Volume");
+            side_panel::volume_control(ui);
+            // The voice floor: one talker at a time across every carrier.
+            let held = decsat_engine::floor::hold();
+            let mut one = held.is_some();
+            let mut secs = held.unwrap_or(self.voice_hold_s);
+            let r = ui.checkbox(&mut one, "one voice at a time").on_hover_text(
+                "Voice that plays by itself (the CDM-600 voice preset), from every carrier \
+                 and channel: the first to speak is heard, the others wait until they have \
+                 been quiet for the hold. Off: everyone at once, mixed. A channel played \
+                 with ▶ is always heard.",
+            );
+            let mut save = r.changed();
+            let mut changed = r.changed();
+            if one {
+                let r = ui
+                    .add(
+                        egui::DragValue::new(&mut secs)
+                            .range(0.5..=30.0)
+                            .speed(0.05)
+                            .max_decimals(1)
+                            .prefix("hold ")
+                            .suffix(" s"),
+                    )
+                    .on_hover_text("How long a talker keeps the floor after they stop speaking.");
+                changed |= r.changed();
+                save |= r.drag_stopped() || (r.changed() && !r.dragged());
+            }
+            if changed {
+                self.voice_hold_s = secs;
+                decsat_engine::floor::set_hold(one.then_some(secs));
+            }
+            if save {
+                prefs::save_audio();
             }
         });
     }

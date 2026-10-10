@@ -23,6 +23,7 @@ use crate::dandi::{DiPlusRx, DiPlusStats};
 use crate::e1::{E1Rx, TIMESLOTS};
 use crate::ibs::IbsRx;
 use crate::paradise::EscRx;
+use crate::slotpkt::SlotRx;
 use crate::tpc2964::additive_sequence;
 
 /// How the data might be scrambled.
@@ -372,6 +373,9 @@ pub enum Format {
     /// Intelsat IBS/SMS framing (IESS-309): 128-bit frames, one overhead
     /// octet and 120 data bits (see [`crate::ibs`]).
     Ibs,
+    /// 64 kbit/s timeslots in HDLC packets, on an inverted line (the
+    /// multi-radio Comtech sites; see [`crate::slotpkt`]).
+    Slots,
     /// No framing known, but the descrambled data are mostly an idle fill
     /// (constant, 1010… or a repeated byte): the scrambler is found even
     /// though what the data carry is not.
@@ -388,6 +392,8 @@ pub struct PayloadOut {
     pub e1: Vec<[u8; TIMESLOTS]>,
     /// D&I++ timeslot bytes, in order.
     pub dandi: Vec<u8>,
+    /// Timeslots from HDLC packets: (timeslot, its octets), in order.
+    pub slots: Vec<(u8, Vec<u8>)>,
     /// Paradise closed network plus ESC: the data bits and the ESC bits
     /// (0/1) with the overhead taken out.
     pub inner: Vec<u8>,
@@ -403,6 +409,7 @@ impl PayloadOut {
         self.ts.clear();
         self.e1.clear();
         self.dandi.clear();
+        self.slots.clear();
         self.inner.clear();
         self.esc.clear();
         self.raw.clear();
@@ -424,6 +431,8 @@ pub struct PayloadStats {
     pub paradise: Option<crate::paradise::EscStats>,
     /// IBS framing, likewise.
     pub ibs: Option<crate::ibs::IbsStats>,
+    /// Timeslots in HDLC packets, likewise.
+    pub slots: Option<crate::slotpkt::SlotStats>,
     /// Frames of data looked at before deciding (or so far).
     pub probed: u64,
 }
@@ -449,6 +458,7 @@ pub struct PayloadRx {
     dandi: DiPlusRx,
     paradise: EscRx,
     ibs: IbsRx,
+    slots: SlotRx,
     /// Bits not yet packed into `raw` bytes.
     raw_bits: Vec<u8>,
     pub stats: PayloadStats,
@@ -468,6 +478,7 @@ impl PayloadRx {
             dandi: DiPlusRx::new(),
             paradise: EscRx::new(),
             ibs: IbsRx::new(),
+            slots: SlotRx::new(),
             raw_bits: Vec::new(),
             stats: PayloadStats::default(),
         }
@@ -509,6 +520,8 @@ impl PayloadRx {
                 EscRx::new(),
                 IbsRx::new(),
             );
+            let mut sl = SlotRx::new();
+            let mut slo = Vec::new();
             let (mut frames, mut pkts, mut e1f, mut dib, mut ped, mut pee) = (
                 Vec::new(),
                 Vec::new(),
@@ -529,6 +542,8 @@ impl PayloadRx {
                 di.push(&bits, &mut dib);
                 pe.push(&bits, &mut ped, &mut pee);
                 ib.push(&bits, &mut ped, &mut pee);
+                sl.push(&bits, &mut slo);
+                slo.clear();
                 ped.clear();
                 pee.clear();
                 prev.extend_from_slice(&bits);
@@ -567,6 +582,13 @@ impl PayloadRx {
                     framed(ib.stats.frames * crate::ibs::DATA as u64),
                     Format::Ibs,
                 ),
+                // Its packets and the flags between them: a site with
+                // nothing to say sends flags alone.
+                (
+                    framed(sl.covered())
+                        .filter(|_| sl.good() >= crate::slotpkt::FOUND || sl.flags() >= 512),
+                    Format::Slots,
+                ),
             ];
             for (score, fmt) in candidates {
                 if let Some(n) = score
@@ -595,6 +617,7 @@ impl PayloadRx {
                     (Format::DiPlus, _) => "E1 timeslots, Comtech D&I++ framing",
                     (Format::ParadiseEsc, _) => "Paradise closed network + ESC framing",
                     (Format::Ibs, _) => "IBS/SMS framing (IESS-309, 16/15)",
+                    (Format::Slots, _) => "64 kbit/s timeslots in HDLC packets (inverted line)",
                     (Format::Idle, _) => "idle fill between bursts (format not known)",
                     (Format::Hdlc, Fcs::Crc16) => "HDLC (FCS-16)",
                     (Format::Hdlc, Fcs::Crc32) => "HDLC (FCS-32)",
@@ -644,6 +667,10 @@ impl PayloadRx {
             Format::Ibs => {
                 self.ibs.push(&bits, &mut out.inner, &mut out.esc);
                 self.stats.ibs = Some(self.ibs.stats.clone());
+            }
+            Format::Slots => {
+                self.slots.push(&bits, &mut out.slots);
+                self.stats.slots = Some(self.slots.stats.clone());
             }
             // Descrambled, for the text finder and the data file.
             Format::Idle => out.inner.extend_from_slice(&bits),
@@ -837,6 +864,52 @@ mod tests {
             "{}",
             bytes.len()
         );
+    }
+
+    #[test]
+    fn finds_timeslot_packets_and_their_idle_line() {
+        use crate::slotpkt::packet_bits;
+        const L: usize = 2223;
+        // Two timeslots, two packets each in turn, flags between bursts.
+        let idle: Vec<u8> = [1, 0, 0, 0, 0, 0, 0, 1].repeat(6);
+        let mut bits = Vec::new();
+        let mut sent = [Vec::new(), Vec::new(), Vec::new()];
+        for k in 0..400usize {
+            let ts = 1 + (k / 2 % 2) as u8;
+            let octets: Vec<u8> = (0..44).map(|i| (k * 44 + i) as u8).collect();
+            bits.extend(packet_bits(k as u8, ts, &octets));
+            sent[ts as usize].extend_from_slice(&octets);
+            if k % 4 == 3 {
+                bits.extend_from_slice(&idle);
+            }
+        }
+        let mut rx = PayloadRx::new(L);
+        let mut out = PayloadOut::default();
+        let mut got = [Vec::new(), Vec::new(), Vec::new()];
+        for f in bits.as_chunks::<L>().0 {
+            rx.push(f, &mut out);
+            for (ts, o) in out.slots.drain(..) {
+                got[ts as usize].extend(o);
+            }
+        }
+        assert_eq!(rx.format(), Some(Format::Slots), "{:?}", rx.stats);
+        // Held while probing, then replayed: every packet's octets from
+        // the first, in order (bar those in the last, unfinished chunk).
+        for ts in 1..=2 {
+            assert!(sent[ts].starts_with(&got[ts]), "{ts}");
+            assert!(
+                got[ts].len() + 4 * 44 >= sent[ts].len(),
+                "{ts}: {}",
+                got[ts].len()
+            );
+        }
+        // A site with nothing to say: flags alone.
+        let quiet = idle.repeat(2000);
+        let mut rx = PayloadRx::new(L);
+        for f in quiet.as_chunks::<L>().0 {
+            rx.push(f, &mut out);
+        }
+        assert_eq!(rx.format(), Some(Format::Slots), "{:?}", rx.stats);
     }
 
     #[test]

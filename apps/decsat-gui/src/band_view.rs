@@ -147,7 +147,8 @@ pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
             .fec
             .as_ref()
             .and_then(|f| f.e1.as_ref())
-            .and_then(|e| e.voice.iter().flatten().next().copied());
+            // A channel speaking, else any with G.728.
+            .and_then(|e| e.voice.iter().flatten().copied().max_by_key(|v| v.1));
         return match (&st.carrier, voice) {
             (None, _) => format!("acq {:.0} %", st.progress * 100.0),
             (Some(_), Some((_, true))) => format!("{lock} · G.728 speech"),

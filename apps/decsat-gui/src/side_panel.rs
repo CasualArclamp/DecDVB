@@ -846,9 +846,12 @@ fn call_voice_card(
         .map(|c| c.to_string())
         .collect();
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Call voice (G.728)").strong()).on_hover_text(
-            "G.728 LD-CELP at 16 kbit/s spread over four TDM channels, two bits a TDM word.              Where each channel's bits go is learnt from the voice equipment's silence fill;              one bit in 64 is in no channel and is guessed.",
-        );
+        ui.label(RichText::new("Call voice (G.728)").strong())
+            .on_hover_text(
+                "G.728 LD-CELP at 16 kbit/s spread over four TDM channels, two bits a TDM word. \
+             Where each channel's bits go is learnt from the voice equipment's silence fill; \
+             one bit in 64 is in no channel and is guessed.",
+            );
         if v.settings.tdm_play {
             volume_control(ui);
         }
@@ -909,38 +912,49 @@ fn call_voice_card(
 
 fn e1_card(ui: &mut Ui, e: &decsat_engine::E1View, v: &UiVfo, actions: &mut Vec<Action>) {
     ui.add_space(6.0);
+    let g728 = e.voice.iter().any(|v| v.is_some());
     ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("Voice: {} (G.711 A-law)", e.source)).strong());
-        if v.settings.e1_play.is_some() {
+        let codec = if g728 { "G.728" } else { "G.711 A-law" };
+        ui.label(RichText::new(format!("Voice: {} ({codec})", e.source)).strong());
+        if e.playing.is_some() {
             volume_control(ui);
         }
     });
     let st = &e.stats;
     ui.label(
-        RichText::new(format!(
-            "{} · {} frames · {} FAS errors{}",
-            if st.locked {
-                "frame aligned"
-            } else {
-                "looking for frame alignment"
-            },
-            st.frames,
-            st.fas_errors,
-            if st.cas { " · CAS in TS16" } else { "" }
-        ))
+        RichText::new(match e.packets {
+            Some((n, lost)) => format!("{n} timeslot packets · {lost} lost"),
+            None => format!(
+                "{} · {} frames · {} FAS errors{}",
+                if st.locked {
+                    "frame aligned"
+                } else {
+                    "looking for frame alignment"
+                },
+                st.frames,
+                st.fas_errors,
+                if st.cas { " · CAS in TS16" } else { "" }
+            ),
+        })
         .small(),
     );
     if let Some(err) = &e.error {
         ui.colored_label(Color32::from_rgb(230, 110, 110), err);
     }
+    let mixing = e.playing == Some(decsat_engine::VOICE_MIX);
+    let one_at_a_time = decsat_engine::floor::hold().is_some();
     if let Some(a) = &e.audio {
         let s = a.status();
+        let what = match (mixing, e.on_air) {
+            (true, Some(ch)) => format!("ch {ch} on air"),
+            (true, None) if one_at_a_time => "every G.728 channel, one voice at a time".into(),
+            (true, None) => "every G.728 channel".into(),
+            (false, _) => format!("TS {}", e.playing.unwrap_or_default()),
+        };
         ui.label(
             RichText::new(format!(
-                "playing TS {} · {:?} · buffer {} ms",
-                v.settings.e1_play.unwrap_or_default(),
-                s.state,
-                s.buffer_ms
+                "playing {what} · {:?} · buffer {} ms",
+                s.state, s.buffer_ms
             ))
             .small()
             .weak(),
@@ -983,7 +997,12 @@ fn e1_card(ui: &mut Ui, e: &decsat_engine::E1View, v: &UiVfo, actions: &mut Vec<
                         let what = if ts == 16 && st.cas {
                             "signalling"
                         } else if let Some((_, talking)) = voice {
-                            if talking { "G.728 speech" } else { "G.728, silent" }
+                            match (talking, mixing && one_at_a_time) {
+                                (true, true) if e.on_air == Some(ts) => "G.728 speech · on air",
+                                (true, true) => "G.728 speech · waiting",
+                                (true, false) => "G.728 speech",
+                                (false, _) => "G.728, silent",
+                            }
                         } else if db < -60.0 {
                             "idle"
                         } else if matches!(coding, Coding::SubRate(_)) {
@@ -1014,7 +1033,8 @@ fn e1_card(ui: &mut Ui, e: &decsat_engine::E1View, v: &UiVfo, actions: &mut Vec<
                         }
                         // Playing because G.728 speech was found (the CDM-600
                         // voice preset): ⏹ turns that off for this VFO.
-                        let auto_on = play.is_none() && e.playing == Some(ts);
+                        let auto_on = play.is_none()
+                            && (e.playing == Some(ts) || (mixing && voice.is_some()));
                         let on = play == Some(ts) || auto_on;
                         if ui
                             .small_button(if on { "⏹" } else { "▶" })
@@ -2527,7 +2547,7 @@ fn audio_card(ui: &mut Ui, g: &GseView, id: VfoId, external: bool, actions: &mut
 }
 
 /// The app-wide mute button and volume slider (laid out right to left).
-fn volume_control(ui: &mut Ui) {
+pub(crate) fn volume_control(ui: &mut Ui) {
     let mut v = decsat_audio::volume();
     ui.spacing_mut().slider_width = 90.0;
     let r = ui

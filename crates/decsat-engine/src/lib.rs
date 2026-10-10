@@ -9,6 +9,7 @@ pub mod cid;
 pub mod demod;
 pub mod estimate;
 pub mod fec;
+pub mod floor;
 pub mod frontend;
 pub mod identify;
 pub mod period;
@@ -25,7 +26,10 @@ pub use decsat_modem::tdm257::{
 pub use decsat_modem::text::{ByteTextView, TextView};
 pub use demod::{Demod, LockState, PlFrame};
 pub use estimate::{BandEstimate, estimate_band};
-pub use fec::{BbFrame, CallVoiceView, E1View, FecDecoder, FecOutput, FecStats, GseView, TsView};
+pub use fec::{
+    BbFrame, CallVoiceView, E1View, FecDecoder, FecOutput, FecStats, GseView, MIX as VOICE_MIX,
+    TsView,
+};
 pub use frontend::{Engine, EngineOptions, FrontStatus, SourceState};
 pub use identify::{
     ConstellationGuess, Identification, RateSource, Verdict, identify, identify_in,

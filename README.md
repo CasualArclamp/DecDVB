@@ -35,11 +35,11 @@ TPC 2964 carrier). Every carrier was found and identified blind.*
 | DVB-S2/S2X PL demodulation: frame lock, MODCOD per frame (ACM) | ✅ |
 | Carrier recovery: a locked constellation and MER, for Identify and DVB-S2 VFOs | ✅ |
 | **DVB-S → MPEG-TS** (EN 300 421): code rate, rotation and inversion found blind; Viterbi, RS, the same TS outputs | ✅ |
-| **TPC 2964 → IP / TS / voice** (Intelsat IESS-315 turbo product code, BPSK/QPSK): frame structure, scrambling and payload found from the signal; HDLC → IP, MPEG-TS, E1 and Comtech D&I++ voice | ✅ confirmed on a live Comtech CDM-600L carrier |
+| **TPC 2964 → IP / TS / voice** (Intelsat IESS-315 turbo product code, BPSK/QPSK): frame structure, scrambling and payload found from the signal; HDLC → IP, MPEG-TS, E1, Comtech D&I++ voice and 64 kbit/s timeslots in HDLC packets | ✅ confirmed on a live Comtech CDM-600L carrier |
 | **Q-Flex FastLink → data and voice** (Paradise, QPSK 0.710): sync word, the (2880, 2048) LDPC code and the frame scrambler, all measured from a live carrier; inside, Paradise's closed-network + ESC framing and a 257-bit TDM multiplex (sixteen 8 kbit/s channels, metered live so speech shows); a call's G.728 voice put together from its four channels — listen, record `.wav` | ✅ decodes a live Q-Flex down to the calls' speech |
 | **Viterbi K=7 → data** (IESS-308/309 SCPC and the like): rate 1/2–7/8, puncturing and orientation found blind and followed when the carrier turns; then the payload search — with or without differential decoding — for HDLC, TS, E1, D&I++, Paradise or IBS/SMS (IESS-309, 16/15) framing, or just the scrambler from the idle fill | ✅ decodes a live 10.24 kBd IESS-308 carrier to its IBS frames (rate 1/2, differential, V.35) |
 | **Carrier ID (DVB-CID, ETSI TS 103 129)**: the spread-spectrum identifier under a carrier — the uplink modulator's unique ID (and MAC), position, telephone and text | ✅ to the specification, on synthetic carriers (no CID among the recordings yet) |
-| **Comtech CDM-600 voice** (a decoder preset): the TPC 2964 chain to the D&I/E1 timeslots, and the G.728 voice in them played as soon as speech is found — no ▶, so several carriers can be heard at once | ✅ on a live CDM-600L |
+| **Comtech CDM-600 voice** (a decoder preset): the TPC 2964 chain to the D&I/E1 timeslots (or, at multi-radio sites, timeslots in HDLC packets), and the G.728 voice in every one of them played as soon as speech is found — no ▶, so several carriers can be heard at once, one voice at a time if you like | ✅ on a live CDM-600L; multi-radio trunks checked on recordings (idle) |
 | **E1 voice**: G.704 E1 or Comtech Drop & Insert++ timeslots, G.711 A-law — levels per channel, listen, record `.wav`; G.728 LD-CELP 16 kbit/s voice in two bits of a timeslot found and decoded | ✅ (G.728 confirmed on a live CDM-600L's D&I voice) |
 | **Generic PSK/APSK/QAM → symbols** (`.bin`, one byte per symbol), BPSK…32APSK and 8/16/64QAM, for non-DVB carriers | ✅ |
 | Narrow carriers: VFOs down to 500 Hz, ~10 kBd SCPC carriers lock | ✅ |
@@ -226,8 +226,25 @@ decoded; while someone speaks, the VFO lights up green with 🔊 in the
 waterfall and the VFO list. The voice equipment behind a CDM-600L seen on Horizons 3e sends it
 in bits 2–3 of its timeslot, framed G.728's own way (§3.11): the shape
 index's top bit carries a sync bit, once every 20 ms different, which the
-decoder locks to; its silence fill is muted. The decoder is written from
-the Recommendation and matches its Appendix I test vectors (112 dB SNR or better).
+decoder locks to; its silence fill is muted, and recognised: a channel
+sending it reads **G.728, silent** before anyone has spoken. The decoder is
+written from the Recommendation and matches its Appendix I test vectors
+(112 dB SNR or better).
+
+**Multi-radio sites** send their timeslots differently: as HDLC packets on an
+inverted line (idle flags read `00000011` repeated), each packet a sequence
+count, a channel (`10h`, `20h`, …), a type byte `13h` and 44 octets — 5.5 ms —
+of one 64 kbit/s timeslot. Each channel's packets join into a continuous
+timeslot with the same G.728 sub-channel in bits 2–3, so the **Voice** card
+lists them as ch 1, 2, … and finds, plays and records each as above. A site
+with nothing to say sends only a status packet every two seconds.
+
+The **CDM-600 voice** preset plays every channel with G.728 by itself.
+**One voice at a time** (the toolbar, on by default) works like a scanner's
+hang time across all carriers and channels: whoever speaks first is heard,
+and the others wait until they have been quiet for the **hold** (3 s, set
+beside it); off, everyone is mixed. A channel played with ▶ is always heard.
+The toolbar's **Volume** and 🔊 mute are the master for everything played.
 Offline:
 
 ```bash
@@ -343,6 +360,15 @@ for more); hovering names the one under the pointer, clicking a name makes a
 VFO on that carrier with its name and width, and a VFO drawn or claimed on a
 plan carrier takes its name. The plan stays your own file: only its path is
 remembered (right-click the button to stop using it).
+
+An LNB's oscillator is rarely exactly on 10600 MHz and drifts as it warms,
+so the carriers sit a few kHz off their plan frequencies. **LO trim** in the
+toolbar corrects the RF scale for that on the fly (drag or type kHz;
+right-click for zero) without retuning anything; **⟲ Align** sets it from
+the carriers in view — the trim at which most of them land on plan carriers
+of like width, searching ±3 MHz — and **keep** repeats that every 5 s in
+small steps as the LNB drifts. The frequency bar shows the trim; it is saved
+with the session.
 
 ### Command line
 
