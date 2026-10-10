@@ -204,7 +204,7 @@ After BBFRAMEs exist, GS-mode payload is GSE. Implement:
 - Windows 11 primary, Linux x86_64 too. egui/eframe with the **glow** (OpenGL) renderer (as DecDRM — keeps the Rust-version floor sane). `rustfft` for DSP.
 - Rust throughout, with two C libraries (2026-10-10), there being no mature Rust decoders for them: **libopus** (BSD; `third_party/opus`, xiph/opus v1.6.1, built by CMake in `decsat-opus-sys`, as DecDRM) and **libxaac**'s decoder (Apache-2.0, GPL-3-compatible; `third_party/libxaac`, ittiam-systems v0.1.13, built by `cc` from its own CMake source lists in `decsat-xaac-sys`) for AAC with SBR and PS. FDK-AAC, which DecDRM decodes with, is not used: its licence is not GPL-compatible. A build needs CMake and a C compiler; CI checks out submodules.
 - Portable static-CRT exes in `exe/` + attached to GitHub releases; CI on GitHub Actions (Linux+Windows tests, clippy, smoke); release.yml drafts portable exes from a pushed tag. See memory [[feedback-release-and-ci]].
-- Repo: planned public `CasualArclamp/DecDVB`, **GPL-3.0-or-later**. Commit identity `Arclamp <45412977+CasualArclamp@users.noreply.github.com>`.
+- Repo: public `CasualArclamp/DecSAT` (DecDVB until 2026-10-10; GitHub forwards the old name), **GPL-3.0-or-later**. Commit identity `Arclamp <45412977+CasualArclamp@users.noreply.github.com>`.
 
 ## 9. Milestones
 

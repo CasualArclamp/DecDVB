@@ -6,7 +6,7 @@ members = ["crates/*", "apps/*"]
 version = "0.7.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/CasualArclamp/DecDVB"
+repository = "https://github.com/CasualArclamp/DecSAT"
 rust-version = "1.88"
 
 [workspace.dependencies]

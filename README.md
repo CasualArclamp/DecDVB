@@ -353,7 +353,7 @@ Rust 1.95 or newer, a C compiler and CMake: libopus (Opus radio) and
 libxaac (AAC with SBR and PS) are built from the `third_party/` submodules.
 
 ```bash
-git clone --recurse-submodules https://github.com/CasualArclamp/DecDVB
+git clone --recurse-submodules https://github.com/CasualArclamp/DecSAT
 cargo build --release
 ```
 

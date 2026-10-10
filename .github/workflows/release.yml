@@ -101,7 +101,7 @@ jobs:
           | `decsat-scene_8Msps.cs8` | Test signal, 8 MS/s, 4 s: DVB-S2 (IP over GSE, and an S2X ACM carrier with MPEG-TS), DVB-S, a TPC 2964 modem carrier and a CW tone |
           | `decsat-cid_3360000sps.cs8` | Test signal, 3.36 MS/s, 30 s: DVB-S2 QPSK 1/2 at +700 kHz with a DVB-CID under it (identifier and position decode) |
 
-          Open a test signal in the GUI (Open IQ…; the sample rate is in the file name) and click a carrier, or run `decsat test-signals` to make them yourself ([tests/README.md](https://github.com/CasualArclamp/DecDVB/blob/main/tests/README.md)).
+          Open a test signal in the GUI (Open IQ…; the sample rate is in the file name) and click a carrier, or run `decsat test-signals` to make them yourself ([tests/README.md](https://github.com/CasualArclamp/DecSAT/blob/main/tests/README.md)).
 
           A HackRF One works receive-only with no DLLs; on Windows it must use the WinUSB driver (Zadig, or the one the official HackRF tools install). IQ files need nothing.
           Windows SmartScreen may warn on first start because the files are unsigned ("More info" → "Run anyway").
