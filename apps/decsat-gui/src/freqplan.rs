@@ -57,9 +57,89 @@ pub fn at(plan: &[Bookmark], rf_hz: f64, bw_hz: f64) -> Option<&Bookmark> {
         })
 }
 
+/// The LO trim (Hz, added to the RF scale) that lines detected carriers up
+/// with the plan: `carriers` are their (untrimmed) RF centres and widths.
+/// Each pairing of a carrier with a plan carrier of like width (0.6–1.7×)
+/// within `search` of `around` proposes a trim; the trim proposed by the
+/// most carriers within `tol` of each other wins (their median). With the
+/// number of carriers that agree; `None` when fewer than two do (one, if
+/// only one carrier is seen).
+pub fn align(
+    plan: &[Bookmark],
+    carriers: &[(f64, f64)],
+    around: f64,
+    search: f64,
+    tol: f64,
+) -> Option<(f64, usize)> {
+    // (trim, carrier index)
+    let mut cand: Vec<(f64, usize)> = Vec::new();
+    for (i, &(rf, bw)) in carriers.iter().enumerate() {
+        for b in plan {
+            let t = b.freq_hz - rf;
+            let ratio = bw / b.bandwidth_hz.max(1.0);
+            if (t - around).abs() <= search && (0.6..=1.7).contains(&ratio) {
+                cand.push((t, i));
+            }
+        }
+    }
+    cand.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut best: Option<(usize, f64)> = None;
+    for (k, &(t0, _)) in cand.iter().enumerate() {
+        let window: Vec<&(f64, usize)> = cand[k..].iter().take_while(|c| c.0 - t0 <= tol).collect();
+        let mut who: Vec<usize> = window.iter().map(|c| c.1).collect();
+        who.sort_unstable();
+        who.dedup();
+        let n = who.len();
+        if best.is_none_or(|(m, _)| n > m) {
+            best = Some((n, window[window.len() / 2].0));
+        }
+    }
+    let need = if carriers.len() == 1 { 1 } else { 2 };
+    best.filter(|&(n, _)| n >= need).map(|(n, t)| (t, n))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lo_trim_that_lines_carriers_up_with_the_plan() {
+        let b = |f: f64, w: f64| Bookmark {
+            name: String::new(),
+            freq_hz: f,
+            bandwidth_hz: w,
+        };
+        // A plan of CDM-600-like carriers 59 kHz apart and a wider Q-Flex.
+        let plan = vec![
+            b(12_352_038_770.0, 58_837.0),
+            b(12_352_097_820.0, 58_837.0),
+            b(12_352_156_870.0, 58_837.0),
+            b(12_352_215_920.0, 58_837.0),
+            b(12_359_096_300.0, 114_019.0),
+        ];
+        // Three of them seen with an LNB 7.3 kHz low (they read 7.3 kHz
+        // low), give or take a bin, and a stray carrier the plan lacks.
+        let seen = [
+            (12_352_038_770.0 - 7_300.0 + 400.0, 57_000.0),
+            (12_352_156_870.0 - 7_300.0 - 300.0, 60_000.0),
+            (12_359_096_300.0 - 7_300.0 + 100.0, 110_000.0),
+            (12_355_000_000.0, 50_000.0),
+        ];
+        let (t, n) = align(&plan, &seen, 0.0, 3e6, 2_000.0).unwrap();
+        assert_eq!(n, 3);
+        assert!((t - 7_300.0).abs() < 500.0, "{t}");
+        // Nothing to line up with: no answer.
+        assert!(
+            align(
+                &plan,
+                &[(13e9, 58_000.0), (13.1e9, 58_000.0)],
+                0.0,
+                3e6,
+                2e3
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn reads_an_sdrpp_bookmark_list() {

@@ -153,6 +153,13 @@ struct App {
     session_at: std::time::Instant,
     /// The frequency plan (named carriers), if one is loaded.
     plan: Vec<freqplan::Bookmark>,
+    /// The LNB's error, Hz: added to the RF scale (axis, plan, readout) so
+    /// the carriers line up with their plan frequencies; the radio's tuning
+    /// is unchanged. Kept aligned with the plan every few seconds when
+    /// `plan_keep`.
+    lo_trim_hz: f64,
+    plan_keep: bool,
+    plan_keep_at: std::time::Instant,
 }
 
 impl Default for App {
@@ -189,6 +196,9 @@ impl Default for App {
             session_saved: String::new(),
             session_at: std::time::Instant::now(),
             plan: Vec::new(),
+            lo_trim_hz: 0.0,
+            plan_keep: false,
+            plan_keep_at: std::time::Instant::now(),
         }
     }
 }
@@ -217,6 +227,11 @@ impl App {
     /// settings and the VFOs (see `session`).
     fn session_pairs(&self) -> Vec<(String, String)> {
         let mut p = vec![
+            ("radio.lo_trim_hz".to_string(), self.lo_trim_hz.to_string()),
+            (
+                "radio.plan_keep".to_string(),
+                u8::from(self.plan_keep).to_string(),
+            ),
             ("source.rate".to_string(), self.sample_rate.to_string()),
             (
                 "source.format".to_string(),
@@ -267,6 +282,10 @@ impl App {
                 .find(|(k, _)| k == key)
                 .map(|(_, v)| v.as_str())
         };
+        if let Some(v) = get("radio.lo_trim_hz").and_then(|v| v.parse().ok()) {
+            self.lo_trim_hz = v;
+        }
+        self.plan_keep = get("radio.plan_keep") == Some("1");
         if let Some(v) = get("source.rate").and_then(|v| v.parse().ok()) {
             self.sample_rate = v;
         }
@@ -330,11 +349,61 @@ impl App {
     /// RF frequency at the span's centre. With no file open this is the
     /// radio's tuning (plus LO), whether or not it is running yet.
     fn rf_center(&self) -> f64 {
+        let rf = self.rf_untrimmed();
+        if rf > 0.0 { rf + self.lo_trim_hz } else { rf }
+    }
+
+    /// The span's RF centre as the radio's tuning and LO (or the file's
+    /// centre) give it, before the LO trim.
+    fn rf_untrimmed(&self) -> f64 {
         #[cfg(feature = "hackrf")]
         if self.path.is_none() {
             return self.radio.rf_center();
         }
         self.rf_center_mhz * 1e6
+    }
+
+    /// Set the LO trim so the detected carriers line up with the plan: a
+    /// search of ±3 MHz, or (`keep`) a small step from where it is.
+    fn align_to_plan(&mut self, keep: bool) {
+        let raw = self.rf_untrimmed();
+        if raw <= 0.0 || self.plan.is_empty() {
+            if !keep {
+                self.note =
+                    "Aligning needs a plan and the RF centre (tuning + LO, or the file's)".into();
+            }
+            return;
+        }
+        let seen: Vec<(f64, f64)> = self
+            .front
+            .carriers
+            .iter()
+            .filter(|c| !c.narrow)
+            .map(|c| (raw + c.center_hz, c.bandwidth_hz))
+            .collect();
+        // Two bins of the spectrum: how well a carrier's centre is known.
+        let tol = (2.0 * self.sample_rate / 4096.0).max(1_000.0);
+        let search = if keep { 20_000.0 } else { 3e6 };
+        match freqplan::align(&self.plan, &seen, self.lo_trim_hz, search, tol) {
+            Some((t, _)) if keep => {
+                // Drift is slow: move part of the way.
+                self.lo_trim_hz += 0.5 * (t - self.lo_trim_hz);
+            }
+            Some((t, n)) => {
+                self.lo_trim_hz = t;
+                self.note = format!(
+                    "LO trim {:+.1} kHz: {n} carriers line up with the plan",
+                    t / 1e3
+                );
+            }
+            None if !keep => {
+                self.note = format!(
+                    "No alignment found: {} carriers seen, none (or one) on plan carriers within ±3 MHz",
+                    seen.len()
+                );
+            }
+            None => {}
+        }
     }
 
     /// Run `source` through a fresh engine, keeping the VFOs.
@@ -628,6 +697,8 @@ impl App {
     /// Set the RF frequency of the span's centre: retune a live HackRF (RF −
     /// LO), relabel a file's axis, or pre-set the radio before Start.
     fn set_rf_center(&mut self, rf: f64) {
+        // The readout shows the trimmed RF; the tuning is without the trim.
+        let rf = if rf > 0.0 { rf - self.lo_trim_hz } else { rf };
         #[cfg(feature = "hackrf")]
         if self.path.is_none() {
             let tuned = (rf - self.radio.lnb_lo_mhz * 1e6).clamp(1e6, 6e9).round() as u64;
@@ -656,9 +727,14 @@ impl App {
                 #[cfg(feature = "hackrf")]
                 if self.path.is_none() {
                     let live = self.hackrf.is_some();
+                    let trim = if self.lo_trim_hz != 0.0 {
+                        format!("  ·  trim {:+.3} kHz", self.lo_trim_hz / 1e3)
+                    } else {
+                        String::new()
+                    };
                     ui.label(
                         RichText::new(format!(
-                            "{} {}  ·  LO {}",
+                            "{} {}  ·  LO {}{trim}",
                             if live { "tuned" } else { "radio" },
                             format::freq(self.radio.settings.center_hz as f64),
                             format::freq(self.radio.lnb_lo_mhz * 1e6),
@@ -741,6 +817,45 @@ impl App {
                 self.plan.clear();
                 let _ = prefs::set_freqplan_path(None);
                 self.note = "Frequency plan put away".into();
+            }
+            // The LNB's error, trimmed out of the RF scale on the fly.
+            ui.label("LO trim");
+            let mut k = self.lo_trim_hz / 1e3;
+            let r = ui
+                .add(
+                    egui::DragValue::new(&mut k)
+                        .speed(0.05)
+                        .range(-20_000.0..=20_000.0)
+                        .max_decimals(3)
+                        .suffix(" kHz"),
+                )
+                .on_hover_text(
+                    "The LNB's frequency error, added to the RF scale (the axis, the \
+                     readout, the plan's labels) so the carriers sit at their real \
+                     frequencies. The radio's tuning stays as it is. Drag or type; \
+                     right-click for zero.",
+                );
+            if r.changed() {
+                self.lo_trim_hz = k * 1e3;
+            }
+            if r.secondary_clicked() {
+                self.lo_trim_hz = 0.0;
+            }
+            if !self.plan.is_empty() {
+                if ui
+                    .button("⟲ Align")
+                    .on_hover_text(
+                        "Set the LO trim so the carriers in view line up with the plan \
+                         (searching ±3 MHz).",
+                    )
+                    .clicked()
+                {
+                    self.align_to_plan(false);
+                }
+                ui.checkbox(&mut self.plan_keep, "keep").on_hover_text(
+                    "Keep the LO trim aligned with the plan as the LNB drifts: every 5 s, \
+                     a small correction from the carriers in view.",
+                );
             }
             if ui.button("📂 Open IQ…").clicked()
                 && let Some(p) = rfd::FileDialog::new()
@@ -933,6 +1048,14 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.sync_clock_ppm();
         self.keep_session();
+        if self.plan_keep
+            && !self.plan.is_empty()
+            && self.engine.is_some()
+            && self.plan_keep_at.elapsed() >= std::time::Duration::from_secs(5)
+        {
+            self.plan_keep_at = std::time::Instant::now();
+            self.align_to_plan(true);
+        }
         // Files dropped on the window.
         // egui 0.36: a dropped file is a trait object; on native it has a path.
         let dropped = ctx.input(|i| {
