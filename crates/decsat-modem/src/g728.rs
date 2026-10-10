@@ -535,6 +535,14 @@ const SYNC_PERIOD: usize = 32;
 /// every 64): [`Framer`] takes it as unknown.
 pub const UNCARRIED: u8 = 2;
 
+/// Sync bits a block of speech may have unknown: one bit in 64 lost puts
+/// about one in a block's 64 sync places.
+const MAX_UNKNOWN_SYNC: usize = 3;
+
+/// Codewords of a block of silence fill that may break its pattern (see
+/// `Framer::fill_at`).
+const FILL_BROKEN: usize = 8;
+
 /// G.728 codewords out of a bit stream framed by a sync bit in place of
 /// every codeword's bit 9 (see the module notes), decoded. Bits in (0, 1
 /// or [`UNCARRIED`]); speech out 40 ms at a time, five samples a codeword
@@ -587,6 +595,13 @@ impl Framer {
     fn sync_at(&self, p: usize) -> Option<(u8, usize)> {
         let s = |i: usize| self.raw[p + 10 * i];
         let known = (0..BLOCK).filter(|&i| s(i) != UNCARRIED).count();
+        // A carrier that loses one bit in 64 (the Q-Flex multiplex) leaves
+        // a sync bit or two unknown in a block; more, and the block is a
+        // wrong reading of the channels, whose unknown bits would pass the
+        // test below as easily as a sync bit's.
+        if known + MAX_UNKNOWN_SYNC < BLOCK {
+            return None;
+        }
         let ones = (0..BLOCK).filter(|&i| s(i) == 1).count();
         let majority = u8::from(ones * 2 > known);
         let odd: Vec<usize> = (0..BLOCK)
@@ -605,16 +620,26 @@ impl Framer {
     /// Is this a block of silence fill with codewords starting at bit `p`:
     /// the sync bit and the five below it alike in every codeword, the low
     /// four bits counting one up a codeword (down on an inverted line)?
+    /// A few codewords may break the pattern, and a few steps the count:
+    /// the Q-Flex's equipment keeps its sync marker (once in 32 codewords)
+    /// going through the fill, and its stream, put together from four TDM
+    /// channels, has the odd bit wrong. Speech is nowhere near: about 60
+    /// codewords of 64 break the pattern, and 1 step in 16 fits by chance.
     fn fill_at(&self, p: usize) -> bool {
         let unit = |i: usize| &self.raw[p + 10 * i..p + 10 * i + 10];
-        let Some(v) = (0..BLOCK)
+        let ones = (0..BLOCK)
             .flat_map(|i| unit(i)[..6].iter().copied())
-            .find(|&b| b != UNCARRIED)
-        else {
-            return false;
-        };
-        let fixed = (0..BLOCK).all(|i| unit(i)[..6].iter().all(|&b| b == v || b == UNCARRIED));
-        if !fixed {
+            .filter(|&b| b == 1)
+            .count();
+        let zeros = (0..BLOCK)
+            .flat_map(|i| unit(i)[..6].iter().copied())
+            .filter(|&b| b == 0)
+            .count();
+        let v = u8::from(ones > zeros);
+        let broken = (0..BLOCK)
+            .filter(|&i| unit(i)[..6].iter().any(|&b| b != v && b != UNCARRIED))
+            .count();
+        if broken > FILL_BROKEN {
             return false;
         }
         // The count, where all four of its bits are carried.
@@ -630,23 +655,28 @@ impl Framer {
                 ok += usize::from(b.wrapping_sub(a) & 15 == step);
             }
         }
-        steps >= BLOCK / 2 && ok * 10 >= steps * 9
+        steps >= BLOCK / 2 && ok * 4 >= steps * 3
     }
 
     fn block(&mut self, decode: bool, out: &mut Vec<f32>) {
+        // The silence fill first: read a bit off its phase, the Q-Flex's
+        // fill (which keeps its sync marker) passes for speech's sync, and
+        // would be decoded as loud noise.
+        let p0 = self.phase.unwrap_or(0);
+        let fill = (0..10).map(|k| (p0 + k) % 10).find(|&p| self.fill_at(p));
         // Rust note: `or_else` only searches the other phases when the
         // locked one fails.
-        let found = self
-            .phase
-            .and_then(|p| self.sync_at(p).map(|s| (p, s)))
-            .or_else(|| (0..10).find_map(|p| self.sync_at(p).map(|s| (p, s))));
+        let found = match fill {
+            Some(_) => None,
+            None => self
+                .phase
+                .and_then(|p| self.sync_at(p).map(|s| (p, s)))
+                .or_else(|| (0..10).find_map(|p| self.sync_at(p).map(|s| (p, s)))),
+        };
         self.talking = found.is_some();
-        if found.is_none() {
-            let p0 = self.phase.unwrap_or(0);
-            if let Some(p) = (0..10).map(|k| (p0 + k) % 10).find(|&p| self.fill_at(p)) {
-                self.phase = Some(p);
-                self.fill_blocks += 1;
-            }
+        if let Some(p) = fill {
+            self.phase = Some(p);
+            self.fill_blocks += 1;
         }
         if let Some((p, (invert, odd))) = found {
             self.phase = Some(p);
@@ -851,6 +881,48 @@ mod tests {
         voice.push(&timeslot(&fill), true, &mut out);
         assert!(!voice.lane().unwrap().talking());
         assert!(out.len() <= n + BLOCK * IDIM, "at most the block in flight");
+    }
+
+    /// The Q-Flex's silence fill as it comes out of its four TDM channels:
+    /// inverted units 111111cccc counting down, a sync marker in one
+    /// codeword of 32, and the odd bit wrong. Read from any bit, the marker
+    /// looks like speech's sync; it must still be taken for fill (it once
+    /// played as bursts of loud noise between calls).
+    #[test]
+    fn the_qflex_fill_with_its_marker_is_not_speech() {
+        let mut x = 5u32;
+        let mut bits = Vec::new();
+        for i in 0..BLOCK * 12 {
+            let mut unit = [1u8; 10];
+            let c = 15 - (i % 16) as u8;
+            for k in 0..4 {
+                unit[6 + k] = c >> (3 - k) & 1;
+            }
+            if i % SYNC_PERIOD == 7 {
+                unit[1] = 0;
+            }
+            bits.extend_from_slice(&unit);
+        }
+        for b in bits.iter_mut() {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            if x >> 24 == 0 {
+                *b ^= 1; // about one bit in 256 wrong
+            }
+        }
+        for start in 0..10 {
+            let mut f = Framer::new();
+            let mut out = Vec::new();
+            for &b in &bits[start..] {
+                f.push(b, true, &mut out);
+            }
+            assert_eq!(f.talk_blocks, 0, "read from bit {start}");
+            assert!(out.is_empty());
+            assert!(
+                f.fill_blocks >= 8,
+                "read from bit {start}: {}",
+                f.fill_blocks
+            );
+        }
     }
 
     #[test]
