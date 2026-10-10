@@ -347,7 +347,12 @@ the **Q-Flex FastLink** decoder decodes it — down to the calls in its TDM
 multiplex: G.728 voice spread over four channels, two bits a TDM word.
 Where each channel's bits go is learnt from the voice equipment's silence
 fill (a known pattern) while the channels idle; the **Call voice** card
-then says when someone speaks, and ▶/● play and record it. A carrier too slow to show three frames in the first look is marked
+then says when someone speaks, and ▶/● play and record it. With **Voice:
+play when G.728 speech is found** (on by default) a call plays by itself
+once anyone has spoken, taking turns with the Comtech channels under **one
+voice at a time**; ⏹ turns that off for the VFO.
+
+A carrier too slow to show three frames in the first look is marked
 *provisional* while it listens longer. Between identifications it keeps
 demodulating with what it found, so the constellation and Es/N0 stay live.
 

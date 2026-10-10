@@ -361,11 +361,14 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
                 ui.end_row();
             }
 
-            if s.decoder == DecoderKind::Cdm600Voice {
+            if matches!(s.decoder, DecoderKind::Cdm600Voice | DecoderKind::FastLink) {
                 ui.label("Voice");
                 ui.checkbox(&mut s.voice_auto, "play when G.728 speech is found")
                     .on_hover_text(
-                        "Play the G.728 voice in the D&I/E1 timeslots as soon as speech is                          found — no ▶ needed, so several carriers can be heard at once.                          Silence between talk spurts is muted.",
+                        "Play the G.728 voice (the D&I/E1 timeslots' channels, or a Q-Flex \
+                         call) as soon as speech is found — no ▶ needed, so several carriers \
+                         can be heard, one voice at a time if that is on. Silence between talk \
+                         spurts is muted.",
                     );
                 ui.end_row();
             }
@@ -852,14 +855,23 @@ fn call_voice_card(
              Where each channel's bits go is learnt from the voice equipment's silence fill; \
              one bit in 64 is in no channel and is guessed.",
             );
-        if v.settings.tdm_play {
+        if out.is_some_and(|o| o.playing) {
             volume_control(ui);
         }
     });
     let mut s = v.settings.clone();
+    // Playing by itself (speech found under the voice preset): ⏹ turns that
+    // off for this VFO.
+    let auto_on = out.is_some_and(|o| o.auto && o.playing);
+    let one_at_a_time = decsat_engine::floor::hold().is_some();
     ui.horizontal(|ui| {
         if voice.talking {
-            ui.colored_label(scope::LOCK, "speech");
+            let what = match (auto_on && one_at_a_time, out.is_some_and(|o| o.on_air)) {
+                (true, true) => "speech · on air",
+                (true, false) => "speech · waiting",
+                (false, _) => "speech",
+            };
+            ui.colored_label(scope::LOCK, what);
         } else {
             ui.label("silent");
         }
@@ -872,12 +884,17 @@ fn call_voice_card(
             .small()
             .weak(),
         );
+        let on = s.tdm_play || auto_on;
         if ui
-            .small_button(if s.tdm_play { "⏹" } else { "▶" })
-            .on_hover_text(if s.tdm_play { "Stop" } else { "Listen" })
+            .small_button(if on { "⏹" } else { "▶" })
+            .on_hover_text(if on { "Stop" } else { "Listen" })
             .clicked()
         {
-            s.tdm_play = !s.tdm_play;
+            if auto_on {
+                s.voice_auto = false;
+            } else {
+                s.tdm_play = !s.tdm_play;
+            }
         }
         if ui
             .small_button(if s.tdm_record { "⏹" } else { "●" })

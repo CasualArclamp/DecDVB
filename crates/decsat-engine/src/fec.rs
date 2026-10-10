@@ -363,6 +363,10 @@ pub struct FecStats {
 #[derive(Debug, Clone, Default)]
 pub struct CallVoiceView {
     pub playing: bool,
+    /// Playing by itself (speech was found, `voice_auto`), not by ▶.
+    pub auto: bool,
+    /// Playing by itself and holding the voice floor: heard now.
+    pub on_air: bool,
     pub audio: Option<AudioHandle>,
     pub recording: bool,
     /// The recording (current or last) and its bytes.
@@ -375,6 +379,12 @@ pub struct CallVoiceView {
 /// goes: 16 samples a 2 ms TDM frame, silence when there is no speech.
 struct CallVoice {
     play: bool,
+    /// Playing by itself, as the voice floor allows, and whether the
+    /// floor lets it be heard now.
+    auto: bool,
+    heard: bool,
+    /// Its number on the voice floor.
+    source: u64,
     player: Option<AudioPlayer>,
     play_q: VecDeque<u8>,
     play_buf: Vec<u8>,
@@ -394,6 +404,9 @@ impl CallVoice {
     fn new() -> Self {
         Self {
             play: false,
+            auto: false,
+            heard: false,
+            source: crate::floor::new_source(),
             player: None,
             play_q: VecDeque::new(),
             play_buf: Vec::new(),
@@ -409,9 +422,14 @@ impl CallVoice {
         }
     }
 
-    fn follow(&mut self, o: &FecOutput) {
-        if o.tdm_play != self.play {
-            self.play = o.tdm_play;
+    /// `voice`: the call's stream, once found. With `voice_auto` it plays
+    /// by itself once it has spoken (▶ plays it regardless).
+    fn follow(&mut self, o: &FecOutput, voice: Option<decsat_modem::tdm257::VoiceView>) {
+        let spoken = voice.is_some_and(|v| v.talk_blocks > 0);
+        self.auto = !o.tdm_play && o.voice_auto && spoken;
+        let want = o.tdm_play || self.auto;
+        if want != self.play {
+            self.play = want;
             self.player = None;
             self.play_q.clear();
             self.play_buf.clear();
@@ -453,9 +471,13 @@ impl CallVoice {
     fn feed(&mut self, rx: &mut decsat_modem::tdm257::TdmRx) {
         use decsat_ip::mcast::rtp_packet;
         rx.decode_voice = self.play || self.record;
+        // Playing by itself, it waits its turn on the voice floor; ▶
+        // plays it whatever the floor says.
+        let talking = rx.stats.voice.is_some_and(|v| v.talking);
+        self.heard = !self.auto || crate::floor::may_play((self.source, 0), talking);
         for &x in &rx.voice_pcm {
             let b = decsat_modem::e1::alaw_encode(x);
-            if self.play {
+            if self.play && self.heard {
                 self.play_q.push_back(b);
             }
             if self.record {
@@ -497,6 +519,8 @@ impl CallVoice {
     fn view(&self) -> CallVoiceView {
         CallVoiceView {
             playing: self.player.is_some(),
+            auto: self.auto,
+            on_air: self.auto && self.heard && self.player.is_some(),
             audio: self.player.as_ref().map(|p| p.handle()),
             recording: self.recorder.is_some(),
             record_file: match &self.recorder {
@@ -2063,7 +2087,7 @@ fn run(
                         let rx = tdm.get_or_insert_with(decsat_modem::tdm257::TdmRx::new);
                         rx.push(&payload_out.inner);
                         let cv = call_voice.get_or_insert_with(CallVoice::new);
-                        cv.follow(&o);
+                        cv.follow(&o, rx.stats.voice);
                         cv.feed(rx);
                     }
                     if let Some(bits) = unread {
@@ -2330,6 +2354,40 @@ mod tests {
     /// A D&I timeslot carrying G.728 (as the CDM-600L's: bits 2–3 of each
     /// octet, codewords inverted, a sync bit 0 once in 32) plays by itself
     /// under the CDM-600 voice preset, and not otherwise.
+    /// A Q-Flex call plays by itself once it has spoken, under the voice
+    /// preset; ▶ plays it regardless; with neither it stays quiet.
+    #[test]
+    fn a_qflex_call_plays_by_itself_once_spoken() {
+        use decsat_modem::tdm257::VoiceView;
+        let quiet = VoiceView {
+            channels: 0b1000_0000_0000_0111,
+            talking: false,
+            talk_blocks: 0,
+        };
+        let spoken = VoiceView {
+            talk_blocks: 12,
+            ..quiet
+        };
+        let out = |auto: bool, play: bool| FecOutput {
+            voice_auto: auto,
+            tdm_play: play,
+            ..FecOutput::default()
+        };
+        for (o, voice, playing, auto) in [
+            (out(true, false), None, false, false),
+            (out(true, false), Some(quiet), false, false),
+            (out(true, false), Some(spoken), true, true),
+            (out(false, false), Some(spoken), false, false),
+            (out(false, true), Some(quiet), true, false),
+            (out(true, true), Some(spoken), true, false),
+        ] {
+            let mut cv = CallVoice::new();
+            cv.follow(&o, voice);
+            let v = cv.view();
+            assert_eq!((v.playing, v.auto), (playing, auto), "{voice:?}");
+        }
+    }
+
     /// A deleted VFO's FEC thread leaves its queue: told to quit, it
     /// handles nothing more; otherwise it works through what was queued.
     #[test]

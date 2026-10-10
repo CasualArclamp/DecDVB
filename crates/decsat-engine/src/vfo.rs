@@ -1757,7 +1757,8 @@ fn fec_output(s: &VfoSettings, ddc: &Ddc) -> FecOutput {
         e1_record: s.e1_record,
         tdm_play: s.tdm_play,
         tdm_record: s.tdm_record,
-        voice_auto: s.voice_auto && s.decoder == DecoderKind::Cdm600Voice,
+        voice_auto: s.voice_auto
+            && matches!(s.decoder, DecoderKind::Cdm600Voice | DecoderKind::FastLink),
     }
 }
 
