@@ -1444,3 +1444,52 @@ polarities: what scores as voiced is a pitch at multiples of 5 samples —
 the codeword period showing through — not speech. (Voicing now measured on
 the first difference with the peak kept off the range edge: speech 0.45,
 random codewords 0.14.)
+
+## The CDM-600L's TS1 voice decoded: G.728 with a robbed sync bit (2026-10-10)
+
+The codec is ITU-T G.728 LD-CELP at 16 kbit/s. What looked like a talk
+flag is a frame sync: in talk the bit is (raw) 0 in 31 codewords and 1 in
+the 32nd — a 20 ms frame of 32 codewords; in silence it stays 1. It is
+G.728 §3.11's synchronization by bit robbing with N = 1: the encoder
+searches only half the shape codebook and the shape index's MSB (codeword
+bit 9) carries the sync bit. So on the TS1 sub-channel (bits 2–3 of each
+octet, 16 kbit/s):
+
+- a codeword is 10 contiguous bits starting at the sync bit, MSB first,
+  all bits inverted: bit 9 sync (inverted 1 → shapes 64–127, once per
+  20 ms 0 → 0–63), bits 8–3 the rest of the shape index, bit 2 the gain
+  sign, bits 1–0 the gain magnitude (G.728 §3.9, Table 5/5.2 layout);
+- the silence fill is not codec output: raw units 1111 cccc 11 with a
+  4-bit counter stepping down one a codeword (inverted, codewords 0…15
+  over and over), which decodes near-silent.
+
+Evidence, before any decode: the gain-magnitude field's distribution
+(0.25/0.38/0.28/0.09) is G.728's on noisy speech (0.26/0.38/0.29/0.07 at
+5 dB SNR, from the reference encoder restricted to half the shape codebook
+on synthetic speech); the joint histogram of the other nine bits matches
+that encoder's with the plain bit order (r 0.80, the next-best of all 5040
+orders 0.61); the gain field's autocorrelation peaks at 12–14 codewords, a
+~120 Hz pitch. Decoded with the ITU reference decoder (local test tool),
+the talk spurts are telephone-band speech (300 Hz highpass), pitch
+harmonics ~110–130 Hz, voicing 0.47 on 11.8–14.4 s — as real G.728 speech
+scores. The first spurt (0–3.4 s) is noisier (voicing 0.03).
+
+Why the earlier sweep missed it: this reading was in it, but scored 0.16
+over its two windows — the noisy first spurt and silence-fill codewords
+inside the window drag it down — below readings whose "pitch" was the
+codeword period. The decoder is robust to the things that were worried
+about (cycle phase, a dropped or zeroed codeword in 32: all within 0.04 of
+the true voicing on the reference).
+
+Q-Flex: the calls carry the same framing (sync bit 1 in 32, 81 % ones two
+places before it — a cleaner talker), but their four-channel reassembly is
+not yet right: each channel slips on its own clock (channel 0's data
+window moved a bit between 397 s and 407 s), so a shared offset per pair
+scrambles alternate bits; with per-channel offsets the sync spacing holds
+94 % but the gain-bit pair is still weak (17 mbit against 84 on the
+CDM-600L). Next: the silence fill is a known plaintext to pin the mapping.
+
+Not in the app yet: DecDVB has no G.728 decoder of its own (the ITU code
+is under its own licence and stays out of the repo). Plan: one written from
+the Recommendation, checked against the reference decoder, behind the
+CDM-600L TS1 sub-channel and the Q-Flex calls.
