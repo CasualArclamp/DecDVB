@@ -1490,7 +1490,32 @@ scrambles alternate bits; with per-channel offsets the sync spacing holds
 94 % but the gain-bit pair is still weak (17 mbit against 84 on the
 CDM-600L). Next: the silence fill is a known plaintext to pin the mapping.
 
-Not in the app yet: DecDVB has no G.728 decoder of its own (the ITU code
-is under its own licence and stays out of the repo). Plan: one written from
-the Recommendation, checked against the reference decoder, behind the
-CDM-600L TS1 sub-channel and the Q-Flex calls.
+## G.728 in the app (2026-10-10)
+
+`decdvb-modem::g728`: a G.728 decoder written from the Recommendation —
+§5.14's blocks 29–33 and the postfilter (71–85), Annex E's update timing,
+Table 1's constants, Annexes A–C's tables as printed (pulled from the text
+by a script, checked against the text's own floating-point tables and
+Table 1's factors) and Annex D's filter. The 2012 text has misprints: five
+shape-codebook entries without their minus signs (indices 36 and 82) and
+Annex D's coefficients' signs garbled ("2–2.3403658918"); the codebook signs
+are the ones under which the Appendix I test vectors decode, the filter's
+the ones giving it unit DC gain and its 4 kHz zero. Against Appendix I
+(CW1–6 → OUTA1–6 postfilter off, CW4 → OUTB4 on): 112.6–209 dB SNR, i.e.
+equal but for rounding. The vectors are ITU's and not in the repo: the
+`#[ignore]` test `decodes_the_itu_test_vectors` reads them from
+`DECDVB_G728_VECTORS`.
+
+`g728::Lane` finds the channel in two bits of each octet: 40 ms at a time,
+the 10-bit grid whose first bit is alike in all codewords but two, 32
+apart; polarity from that bit (1 in 31 of 32 once right); the odd one ends
+an adaptation cycle; blocks without the pattern (silence fill, onsets) are
+not decoded. `g728::Voice` tries every pair of neighbouring bits a sub-rate
+timeslot changes. The engine's E1 stage keeps one on each sub-rate timeslot
+(kept once found: a few garbled frames can make a half second judge G.711)
+and plays and records the found one decoded, as A-law through the existing
+player and recorder. GUI: "G.728 speech" / "G.728, silent"; CLI: "G.728
+voice in bits 2–3". Checked: the CDM-600L recording decodes end to end
+(`decdvb decode … --decoder tpc --e1-record 1`) to the same speech as the
+reference decoder, the silence fill muted; only the first half second,
+before the timeslot is judged, plays raw.

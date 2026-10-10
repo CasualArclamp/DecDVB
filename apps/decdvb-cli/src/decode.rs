@@ -339,7 +339,16 @@ fn report(st: &VfoStatus) {
         for (ts, db) in e.levels_db.iter().enumerate().skip(1) {
             if *db > -60.0 {
                 use decdvb_modem::e1::Coding;
+                let voice = e.voice.get(ts).copied().flatten();
                 let note = match e.coding.get(ts).copied().unwrap_or_default() {
+                    _ if voice.is_some() => {
+                        let (b, talking) = voice.unwrap_or_default();
+                        format!(
+                            " · G.728 voice in bits {b}–{} ({}; recorded decoded)",
+                            b + 1,
+                            if talking { "speaking" } else { "silent now" }
+                        )
+                    }
                     Coding::SubRate(m) => format!(
                         " · not G.711: only bits {} change (sub-rate channels or compressed voice)",
                         Coding::bits_text(m)

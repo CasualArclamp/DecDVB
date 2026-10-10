@@ -34,7 +34,7 @@ TPC 2964 carrier). Every carrier was found and identified blind.*
 | **Q-Flex FastLink → data** (Paradise, QPSK 0.710): sync word, the (2880, 2048) LDPC code and the frame scrambler, all measured from a live carrier; inside, Paradise's closed-network + ESC framing and a 257-bit TDM multiplex (sixteen 8 kbit/s channels, metered live so speech shows) | ✅ decodes a live Q-Flex down to the multiplex (the voice codec not yet known) |
 | **Viterbi K=7 → data** (IESS-308/309 SCPC and the like): rate 1/2–7/8, puncturing and orientation found blind and followed when the carrier turns; then the payload search — with or without differential decoding — for HDLC, TS, E1, D&I++, Paradise or IBS/SMS (IESS-309, 16/15) framing, or just the scrambler from the idle fill | ✅ decodes a live 10.24 kBd IESS-308 carrier to its IBS frames (rate 1/2, differential, V.35) |
 | **Carrier ID (DVB-CID, ETSI TS 103 129)**: the spread-spectrum identifier under a carrier — the uplink modulator's unique ID (and MAC), position, telephone and text | ✅ to the specification, on synthetic carriers (no CID among the recordings yet) |
-| **E1 voice**: G.704 E1 or Comtech Drop & Insert++ timeslots, G.711 A-law — levels per channel, listen, record `.wav` | ✅ |
+| **E1 voice**: G.704 E1 or Comtech Drop & Insert++ timeslots, G.711 A-law — levels per channel, listen, record `.wav`; G.728 LD-CELP 16 kbit/s voice in two bits of a timeslot found and decoded | ✅ (G.728 confirmed on a live CDM-600L's D&I voice) |
 | **Generic PSK/APSK/QAM → symbols** (`.bin`, one byte per symbol), BPSK…32APSK and 8/16/64QAM, for non-DVB carriers | ✅ |
 | Narrow carriers: VFOs down to 500 Hz, ~10 kBd SCPC carriers lock | ✅ |
 | IQ recorder and spectrum-only VFOs | ✅ |
@@ -212,7 +212,16 @@ lists the channels with their levels: **▶** listens (the app's player and
 volume), **●** records a `.wav`. A timeslot whose sign bit never changes is
 not G.711 audio — sub-rate channels or compressed voice, which played as
 A-law is digital noise — and is marked **not G.711** with the bits that do
-change. Offline:
+change.
+
+When those bits carry **G.728** (LD-CELP, 16 kbit/s: a 10-bit codeword every
+five samples), the card says **G.728 speech** and ▶/● play and record it
+decoded. The voice equipment behind a CDM-600L seen on Horizons 3e sends it
+in bits 2–3 of its timeslot, framed G.728's own way (§3.11): the shape
+index's top bit carries a sync bit, once every 20 ms different, which the
+decoder locks to; its silence fill is muted. The decoder is written from
+the Recommendation and matches its Appendix I test vectors (112 dB SNR or better).
+Offline:
 
 ```bash
 decdvb decode capture_148148Sps.cf32 --decoder tpc --out dir --e1-record 1

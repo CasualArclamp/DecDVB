@@ -11,6 +11,8 @@
 //! - [`payload`]: what a modem's data carry (HDLC, MPEG-TS) and how they are
 //!   scrambled, found from the data.
 //! - [`text`]: live text search in any bit stream, every reading at once.
+//! - [`g728`]: ITU-T G.728 LD-CELP 16 kbit/s voice, and finding it in two
+//!   bits of a timeslot (the CDM-600L's Drop & Insert voice).
 
 pub mod cid;
 pub mod conv;
@@ -18,6 +20,7 @@ pub mod dandi;
 pub mod dvbs;
 pub mod e1;
 pub mod fastlink;
+pub mod g728;
 pub mod ibs;
 pub mod interleave;
 pub mod paradise;

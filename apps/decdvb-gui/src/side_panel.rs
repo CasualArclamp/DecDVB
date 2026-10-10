@@ -876,8 +876,11 @@ fn e1_card(ui: &mut Ui, e: &decdvb_engine::E1View, v: &UiVfo, actions: &mut Vec<
                         level_bar(ui, db);
                         use decdvb_engine::E1Coding as Coding;
                         let coding = e.coding.get(ts as usize).copied().unwrap_or_default();
+                        let voice = e.voice.get(ts as usize).copied().flatten();
                         let what = if ts == 16 && st.cas {
                             "signalling"
+                        } else if let Some((_, talking)) = voice {
+                            if talking { "G.728 speech" } else { "G.728, silent" }
                         } else if db < -60.0 {
                             "idle"
                         } else if matches!(coding, Coding::SubRate(_)) {
@@ -890,7 +893,13 @@ fn e1_card(ui: &mut Ui, e: &decdvb_engine::E1View, v: &UiVfo, actions: &mut Vec<
                             "active"
                         };
                         let label = ui.label(RichText::new(format!("{db:5.0} dB {what}")).small());
-                        if let Coding::SubRate(mask) = coding {
+                        if let Some((bit, _)) = voice {
+                            label.on_hover_text(format!(
+                                "G.728 LD-CELP voice (16 kbit/s) in bits {}–{}, framed by a sync bit in each codeword (G.728 §3.11). ▶ and ● play and record it decoded.",
+                                bit,
+                                bit + 1
+                            ));
+                        } else if let Coding::SubRate(mask) = coding {
                             label.on_hover_text(format!(
                                 "Only bits {} change and the sign bit never does, so this is not G.711 audio: sub-rate channels (I.460) or compressed voice. Played as A-law it sounds like digital noise.",
                                 Coding::bits_text(mask)

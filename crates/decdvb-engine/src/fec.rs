@@ -17,7 +17,7 @@
 //! code, then the payload — HDLC frames to IP, or MPEG-TS — and, while
 //! recording, the raw data to a `.bin` file).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -372,6 +372,10 @@ pub struct E1View {
     /// What each timeslot carries, judged from which bits change: G.711, or
     /// something that only sounds like noise played as A-law.
     pub coding: Vec<decdvb_modem::e1::Coding>,
+    /// G.728 voice found in a sub-rate timeslot: the first of its two bits
+    /// (G.704 numbering) and whether it is speaking now. Such a timeslot
+    /// plays and records decoded.
+    pub voice: Vec<Option<(u8, bool)>>,
     /// The timeslot playing, and its player.
     pub playing: Option<u8>,
     pub audio: Option<AudioHandle>,
@@ -406,6 +410,24 @@ struct E1Stage {
     dandi: Option<u8>,
     dandi_frame: [u8; decdvb_modem::e1::TIMESLOTS],
     dandi_next: usize,
+    /// A G.728 finder on each sub-rate timeslot (the CDM-600L's D&I voice
+    /// is G.728 in bits 2–3); only the played or recorded one decodes.
+    voice: Vec<Option<decdvb_modem::g728::Voice>>,
+    voice_pcm: Vec<f32>,
+    /// Its speech as A-law, waiting to go out a byte a frame in place of
+    /// the timeslot's own bytes.
+    play_voice: VecDeque<u8>,
+    record_voice: VecDeque<u8>,
+}
+
+/// Decoded G.728 waiting to play or record, at most (in samples): it comes
+/// 40 ms at a time and leaves a sample a frame, so it never needs more.
+const VOICE_BACKLOG: usize = 1600;
+
+/// The next byte of a timeslot's decoded voice, A-law silence when there is
+/// none (between talk spurts the finder sends nothing).
+fn voice_byte(q: &mut VecDeque<u8>) -> u8 {
+    q.pop_front().unwrap_or(0xD5)
 }
 
 /// Frames in a level chunk (10 ms), and chunks in a reading (half a
@@ -454,7 +476,68 @@ impl E1Stage {
             dandi: None,
             dandi_frame: [0xD5; decdvb_modem::e1::TIMESLOTS],
             dandi_next: 0,
+            voice: (0..decdvb_modem::e1::TIMESLOTS).map(|_| None).collect(),
+            voice_pcm: Vec::new(),
+            play_voice: VecDeque::new(),
+            record_voice: VecDeque::new(),
         }
+    }
+
+    /// A G.728 finder on every sub-rate timeslot (replaced when the
+    /// changing bits do, kept once it has found G.728), and the played or
+    /// recorded one's speech queued as A-law.
+    fn voice(&mut self, f: &[u8; decdvb_modem::e1::TIMESLOTS]) {
+        use decdvb_modem::e1::Coding;
+        use decdvb_modem::g728::Voice;
+        for ts in 1..decdvb_modem::e1::TIMESLOTS {
+            // Once G.728 is found it stays: a few garbled frames can make
+            // the sign bit seem to move (a half second judged G.711), and
+            // silence fill can still other bits.
+            let found = self.voice[ts]
+                .as_ref()
+                .and_then(|v| v.lane())
+                .map(|l| l.bits[0] | l.bits[1]);
+            match self.activity.coding()[ts] {
+                Coding::SubRate(m)
+                    if self.voice[ts].as_ref().map(|v| v.mask) != Some(m)
+                        && found.is_none_or(|b| m & b != b) =>
+                {
+                    self.voice[ts] = Some(Voice::new(m));
+                }
+                Coding::G711 if found.is_none() => self.voice[ts] = None,
+                _ => {}
+            }
+            let Some(v) = &mut self.voice[ts] else {
+                continue;
+            };
+            let (play, rec) = (
+                self.play_want == Some(ts as u8),
+                self.record_want == Some(ts as u8),
+            );
+            self.voice_pcm.clear();
+            v.push(&f[ts..=ts], play || rec, &mut self.voice_pcm);
+            for &x in &self.voice_pcm {
+                let b = decdvb_modem::e1::alaw_encode(x);
+                if play {
+                    self.play_voice.push_back(b);
+                }
+                if rec {
+                    self.record_voice.push_back(b);
+                }
+            }
+        }
+        for q in [&mut self.play_voice, &mut self.record_voice] {
+            if q.len() > VOICE_BACKLOG {
+                q.drain(..q.len() - VOICE_BACKLOG / 2);
+            }
+        }
+    }
+
+    /// Whether timeslot `t` plays and records as decoded G.728.
+    fn is_voice(&self, t: u8) -> bool {
+        self.voice
+            .get(t as usize)
+            .is_some_and(|v| v.as_ref().is_some_and(|v| v.lane().is_some()))
     }
 
     /// D&I++ bytes, `n` timeslots taking turns: made into E1-shaped frames
@@ -483,6 +566,7 @@ impl E1Stage {
             self.play_want = o.e1_play;
             self.player = None;
             self.play_buf.clear();
+            self.play_voice.clear();
             if let Some(t) = o.e1_play {
                 match AudioPlayer::start(&e1_stream(t), AUDIO_OUTPUT) {
                     Ok(p) => self.player = Some(p),
@@ -496,6 +580,7 @@ impl E1Stage {
                 self.record_last = r.path().map(|p| (p.to_path_buf(), r.bytes));
             }
             self.record_buf.clear();
+            self.record_voice.clear();
             if let Some(t) = o.e1_record {
                 let stamp = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -519,6 +604,7 @@ impl E1Stage {
         use decdvb_ip::mcast::rtp_packet;
         for f in frames {
             self.activity.push(f);
+            self.voice(f);
             for (a, &b) in self.acc.iter_mut().zip(f) {
                 let v = decdvb_modem::e1::alaw(b) as f64;
                 *a += v * v;
@@ -546,8 +632,19 @@ impl E1Stage {
                 self.chunks.clear();
             }
             // One RTP packet per 20 ms of the chosen timeslot.
-            if let (Some(t), Some(p)) = (self.play_want, &mut self.player) {
-                self.play_buf.push(f[t as usize]);
+            // A timeslot carrying G.728 goes out decoded.
+            let play_byte = match self.play_want {
+                Some(t) if self.is_voice(t) => Some(voice_byte(&mut self.play_voice)),
+                Some(t) => Some(f[t as usize]),
+                None => None,
+            };
+            let record_byte = match self.record_want {
+                Some(t) if self.is_voice(t) => Some(voice_byte(&mut self.record_voice)),
+                Some(t) => Some(f[t as usize]),
+                None => None,
+            };
+            if let (Some(t), Some(p), Some(b)) = (self.play_want, &mut self.player, play_byte) {
+                self.play_buf.push(b);
                 if self.play_buf.len() == E1_CHUNK {
                     let (seq, ts) = &mut self.play_rtp;
                     p.packet(&rtp_packet(
@@ -562,8 +659,9 @@ impl E1Stage {
                     self.play_buf.clear();
                 }
             }
-            if let (Some(t), Some(r)) = (self.record_want, &mut self.recorder) {
-                self.record_buf.push(f[t as usize]);
+            if let (Some(t), Some(r), Some(b)) = (self.record_want, &mut self.recorder, record_byte)
+            {
+                self.record_buf.push(b);
                 if self.record_buf.len() == E1_CHUNK {
                     let (seq, ts) = &mut self.record_rtp;
                     r.packet(&rtp_packet(
@@ -591,6 +689,14 @@ impl E1Stage {
             stats,
             levels_db: self.levels_db.clone(),
             coding: self.activity.coding().to_vec(),
+            voice: self
+                .voice
+                .iter()
+                .map(|v| {
+                    let l = v.as_ref()?.lane()?;
+                    Some((l.bits[0].leading_zeros() as u8 + 1, l.talking))
+                })
+                .collect(),
             playing: self.play_want.filter(|_| self.player.is_some()),
             audio: self.player.as_ref().map(|p| p.handle()),
             recording: self.record_want.filter(|_| self.recorder.is_some()),
