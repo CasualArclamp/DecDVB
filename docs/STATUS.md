@@ -1714,3 +1714,22 @@ Rory's Horizons 3e plan (Comtech and Q-Flex sites; 58 837 Hz is
 listened: the weak lines at ~400, 1200 and 2000 Hz in the decoded calls come
 from the radio itself, not the decoding. Nothing to chase there.
 
+## A carrier that changes symbol rate is followed (2026-10-10)
+
+Rory's ASA253 MAL-BN (a Q-Flex site, `decsat-ASA253_MAL-BN-+1668302Hz-
+217391Sps-….cf32`) "doesn't decode as Q-Flex". It isn't FastLink: QPSK with
+K=7 rate-1/2 Viterbi, differential coding and V.35 (taps 3, 20) — and the
+modem changed from 64.000 kS/s (64 kbit/s) to 48.000 kS/s (48 kbit/s) four
+seconds into the recording, at the same frequency and power. Its data were
+idle (zeros after descrambling) throughout. DecSAT acquired 64 kS/s from its
+first look and demodulated on at that rate after the change, its timing loop
+wandering to 63 kS/s while still reporting a lock, so nothing decoded.
+
+`identify::symbol_rate_moved`: the carrier's own cyclic line (±1 %) gone and
+a clear one (>15 dB) elsewhere in 0.3–2.5× the rate. A modem or PSK VFO whose
+rate was found blind checks every 2 s of baseband (`Worker::watch_rate`) and,
+moved twice in a row, acquires afresh (its FEC thread told to quit first).
+The whole MAL-BN recording now decodes: re-acquired at 47 999 S/s, rate 1/2,
+channel BER 8e-4. Test: QPSK switching 20 → 16 kBd is followed (and without
+the check stays at 19.8 kS/s, "locked").
+

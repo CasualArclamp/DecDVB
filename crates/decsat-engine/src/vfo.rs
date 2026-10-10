@@ -655,7 +655,14 @@ struct Worker {
     /// and baseband samples since the last look.
     followed: f64,
     follow_samples: usize,
+    /// Baseband gathered to check a blind symbol rate still holds, and
+    /// checks in a row that found it moved.
+    rate_watch: Vec<Iq>,
+    rate_moves: u8,
 }
+
+/// How much signal (s) each check of a blind symbol rate looks at.
+const RATE_WATCH_SECS: f64 = 2.0;
 
 /// How often a locked carrier's drift is followed (s), and the least
 /// offset (Hz, and share of the symbol rate) worth a move.
@@ -708,6 +715,8 @@ impl Worker {
             lossless: false,
             followed: 0.0,
             follow_samples: 0,
+            rate_watch: Vec::new(),
+            rate_moves: 0,
         }
     }
 
@@ -936,6 +945,7 @@ impl Worker {
                     let n = self.bb.len();
                     self.decode();
                     self.follow(n);
+                    self.watch_rate();
                     // Load: processing time over the block's real duration.
                     let real = block.len() as f64 / self.in_rate;
                     let used = t0.elapsed().as_secs_f64() / real.max(1e-9);
@@ -957,6 +967,43 @@ impl Worker {
                 let _ = w.flush();
             }
             _ => {}
+        }
+    }
+
+    /// A modem or PSK carrier whose symbol rate was found blind: every two
+    /// seconds, check the carrier still runs at it; found moved twice in a
+    /// row (a modem reconfigured on the fly), acquire it afresh.
+    fn watch_rate(&mut self) {
+        let rs = match &self.decoder {
+            Decoder::Modem { demod: Some(d), .. } | Decoder::Psk { demod: Some(d), .. }
+                if self.settings.symbol_rate.is_none() =>
+            {
+                d.symbol_rate()
+            }
+            _ => {
+                self.rate_watch.clear();
+                self.rate_moves = 0;
+                return;
+            }
+        };
+        let out_rate = self.ddc.out_rate();
+        self.rate_watch.extend_from_slice(&self.bb);
+        if (self.rate_watch.len() as f64) < RATE_WATCH_SECS * out_rate {
+            return;
+        }
+        let moved = crate::identify::symbol_rate_moved(&self.rate_watch, out_rate, rs);
+        self.rate_watch.clear();
+        self.rate_moves = if moved.is_some() {
+            self.rate_moves + 1
+        } else {
+            0
+        };
+        if self.rate_moves >= 2 {
+            self.rate_moves = 0;
+            // The FEC thread's queue is at the old rate: leave it.
+            self.quit_threads();
+            self.decoder = Self::make_decoder(&self.settings, &self.ddc);
+            self.identification = None;
         }
     }
 
@@ -2085,6 +2132,37 @@ mod tests {
             *v = *v * Iq::new(ph.cos() as f32, ph.sin() as f32) + noise;
         }
         x
+    }
+
+    /// A modem reconfigured on the fly (a Q-Flex went from 64 to 48 kS/s
+    /// mid-recording): the VFO notices and acquires the new rate.
+    #[test]
+    fn a_carrier_changing_symbol_rate_is_followed() {
+        // 80 kS/s: 20 kBd (4 a symbol) for 4 s, then 16 kBd (5 a symbol).
+        let cst = Constellation::qpsk();
+        let mut x = carrier(&cst, 80_000, 4, 20_000.0, 0.0, 0.0, 21);
+        x.extend(carrier(&cst, 112_000, 5, 16_000.0, 0.0, 0.0, 22));
+        let mut s = VfoSettings::new("rate", 0.0, 40_000.0, DecoderKind::PskSymbols);
+        s.psk_modulation = Some(decsat_core::Modulation::Qpsk);
+        let status = Arc::new(Mutex::new(VfoStatus::default()));
+        let mut wk = Worker::new(80_000.0, s, status.clone(), Arc::new(AtomicU64::new(0)));
+        for c in x.chunks(8_192) {
+            wk.bb.clear();
+            wk.ddc.process(c, &mut wk.bb);
+            let n = wk.bb.len();
+            wk.decode();
+            wk.follow(n);
+            wk.watch_rate();
+            wk.publish(n);
+        }
+        let st = status.lock().unwrap().clone();
+        let rs = st.symbol_rate.expect("a symbol rate");
+        assert!(
+            (rs - 16_000.0).abs() < 100.0,
+            "still at {rs}: {}",
+            st.message
+        );
+        assert!(st.carrier.is_some_and(|c| c.locked), "{}", st.message);
     }
 
     /// Run a generic PSK VFO over `x`; return its status and output folder.

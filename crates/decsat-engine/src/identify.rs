@@ -340,6 +340,25 @@ pub fn cyclic_symbol_rate(x: &[Iq], rate: f64, guess: f64, search: f64) -> Optio
     (strength > 12.0).then_some((f, strength))
 }
 
+/// Has a carrier demodulated at `rs` changed its symbol rate? Its own
+/// cyclic line gone, and a clear one at another rate in its place: that
+/// rate. (A modem reconfigured on the fly — a Q-Flex went from 64 to 48 kS/s
+/// in the middle of a recording; demodulating on at the old rate decodes
+/// nothing.) A neighbour's line in a wide VFO never counts while the
+/// carrier's own is still there.
+pub fn symbol_rate_moved(x: &[Iq], rate: f64, rs: f64) -> Option<f64> {
+    if cyclic_symbol_rate(x, rate, rs, 0.01).is_some() {
+        return None;
+    }
+    let (lo, hi) = (0.3 * rs, (2.5 * rs).min(0.45 * rate));
+    if hi <= lo {
+        return None;
+    }
+    let env: Vec<Iq> = x.iter().map(|s| Iq::new(s.norm_sqr(), 0.0)).collect();
+    let (f, strength) = strongest_line(&env, rate, lo, hi)?;
+    (strength > 15.0 && (f - rs).abs() > 0.02 * rs).then_some(f)
+}
+
 /// Raised-cosine power-spectrum shape (0..1) at offset `f` from centre.
 fn rc_shape(f: f64, rs: f64, alpha: f64) -> f64 {
     let a = f.abs();
@@ -969,6 +988,24 @@ mod tests {
                 s * Iq::new(ph.cos() as f32, ph.sin() as f32) + nz.gauss() * sigma
             })
             .collect()
+    }
+
+    #[test]
+    fn a_changed_symbol_rate_is_noticed() {
+        // A carrier at 1 (rate 4): demodulated at 1 nothing has moved; at
+        // 4/3 (it was faster, and is now this) it has moved to 1.
+        let x = dvbs2_signal(
+            &[FrameSpec::new(4, false, true)],
+            60_000,
+            4,
+            0.35,
+            0.0,
+            10.0,
+            5,
+        );
+        assert_eq!(symbol_rate_moved(&x, 4.0, 1.0), None);
+        let moved = symbol_rate_moved(&x, 4.0, 4.0 / 3.0).expect("moved");
+        assert!((moved - 1.0).abs() < 0.01, "{moved}");
     }
 
     #[test]
