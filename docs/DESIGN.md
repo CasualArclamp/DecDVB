@@ -1,4 +1,4 @@
-# DecDVB — Design
+# DecSAT — Design
 
 A Rust **DVB-S2 / DVB-S2X** receiver with **ACM** (Adaptive Coding & Modulation), **GSE** de-encapsulation to **IP (PCAP)**, **TS** extraction, and a matching **modulator** for loopback and ACM test-signal generation. HackRF One based, with IQ-file replay.
 
@@ -75,7 +75,7 @@ IqSource (HackRF 20 MS/s, or a wideband file)
   dragging on the waterfall, or by clicking a detected carrier (which sizes it
   correctly for you). Several decode at once, one worker thread each, with a CPU
   meter per VFO and an enable/disable that does not delete it.
-- **Carrier detection** sweeps the band estimator (§ `decdvb-engine::estimate`)
+- **Carrier detection** sweeps the band estimator (§ `decsat-engine::estimate`)
   across the span and marks each candidate with its centre and estimated symbol
   rate. The estimate is good to a few percent, which is close enough to seed a
   VFO.
@@ -123,7 +123,7 @@ over-claiming here would be worse than useless.
 **Reported as a guess, labelled as one:**
 - Anything with no PLHEADER. QPSK with no PLHEADER peak is *consistent with*
   DVB-S, but confirming it needs Viterbi plus the 204-byte RS frame sync, which
-  DecDVB does not implement; the UI will say "QPSK, no DVB-S2 PLHEADER —
+  DecSAT does not implement; the UI will say "QPSK, no DVB-S2 PLHEADER —
   possibly DVB-S" and not pretend otherwise.
 - Unrecognised signals get their measured parameters and an explicit "does not
   match DVB-S2/S2X", which is honest and still useful.
@@ -132,34 +132,34 @@ over-claiming here would be worse than useless.
 
 ## 4. Workspace layout
 
-Cargo workspace `decdvb`, modelled on DecDRM.
+Cargo workspace `decsat`, modelled on DecDRM.
 
 ```
 crates/
-  decdvb-core     shared types: MODCOD tables, FECFRAME params, roll-offs,
+  decsat-core     shared types: MODCOD tables, FECFRAME params, roll-offs,
                   BBHEADER/MATYPE, config, error types, SNR/metrics structs
-  decdvb-dsp      AGC, DC/IQ correction, resampler, RRC filter, Gardner TED,
+  decsat-dsp      AGC, DC/IQ correction, resampler, RRC filter, Gardner TED,
                   carrier recovery (coarse FFT + fine PLL), interpolators
-  decdvb-fec      LDPC decoder+encoder (all rates, 3 frame lengths), BCH,
+  decsat-fec      LDPC decoder+encoder (all rates, 3 frame lengths), BCH,
                   bit (de)interleaver, (de)mapper + LLR for QPSK..256APSK, pi/2-BPSK
-  decdvb-frame    PLHEADER (SOF + PLS 64-bit), MODCOD/type decode, dummy frames,
+  decsat-frame    PLHEADER (SOF + PLS 64-bit), MODCOD/type decode, dummy frames,
                   pilot insertion/removal, PL (de)scrambler, VL-SNR header,
                   superframe (Annex E), BBFRAME assembly, BBHEADER + CRC-8
-  decdvb-gse      GSE de-encapsulation + reassembly; standard + proprietary
+  decsat-gse      GSE de-encapsulation + reassembly; standard + proprietary
                   variants (header-len, split frag-id); label/protocol handling
-  decdvb-ts       TS-mode BBFRAME → MPEG-TS; null-packet reinsertion, sync,
+  decsat-ts       TS-mode BBFRAME → MPEG-TS; null-packet reinsertion, sync,
                   Generic/Newtec CRC variants
-  decdvb-ip       IPv4/IPv6 parse, PCAP writer, stream classification + stats,
+  decsat-ip       IPv4/IPv6 parse, PCAP writer, stream classification + stats,
                   blind IP-header-checksum fallback search
-  decdvb-audio    multicast radio in the app: RTP/RFC 2250/3016/3640/7587
+  decsat-audio    multicast radio in the app: RTP/RFC 2250/3016/3640/7587
                   and raw ES depacketising, MPEG audio (Symphonia), AAC
                   with SBR/PS (libxaac), Opus (libopus), resampling, sound output
                   (cpal), recording as broadcast
-  decdvb-opus-sys libopus (BSD), the third_party/opus submodule (v1.6.1),
+  decsat-opus-sys libopus (BSD), the third_party/opus submodule (v1.6.1),
                   built with CMake; FFI bindings (from DecDRM)
-  decdvb-xaac-sys libxaac's AAC decoder (Apache-2.0), the third_party/libxaac
+  decsat-xaac-sys libxaac's AAC decoder (Apache-2.0), the third_party/libxaac
                   submodule (v0.1.13), built with cc; FFI bindings
-  decdvb-modem    other satellite modem formats: DVB-S (Viterbi K = 7 with
+  decsat-modem    other satellite modem formats: DVB-S (Viterbi K = 7 with
                   puncturing, RS(204,188), Forney interleaving, energy dispersal),
                   generic RS over GF(256); turbo product codes and IESS-315
                   tpc_2964 (structure found blind); modem payloads (HDLC,
@@ -167,13 +167,13 @@ crates/
                   G.711, and G.728 LD-CELP (decoder from the Recommendation,
                   plus the robbed-sync-bit framing that finds it in a
                   timeslot's sub-rate bits)
-  decdvb-io       HackRF source (libhackrf FFI / soapy), IQ file reader/writer
+  decsat-io       HackRF source (libhackrf FFI / soapy), IQ file reader/writer
                   (cs8/cs16/cf32), HackRF TX sink, ring buffers
-  decdvb-engine   orchestrates RX (and TX) chain; ACM state; multistream/ISI
+  decsat-engine   orchestrates RX (and TX) chain; ACM state; multistream/ISI
                   filter; gold-code handling; metrics aggregation
 apps/
-  decdvb-cli      headless decode / modulate
-  decdvb-gui      egui/glow: constellation, spectrum, ACM timeline, stream table
+  decsat-cli      headless decode / modulate
+  decsat-gui      egui/glow: constellation, spectrum, ACM timeline, stream table
 docs/ DESIGN.md, reference/ (git-ignored), samples/ (git-ignored), exe/, scripts/, .github/
 ```
 
@@ -192,7 +192,7 @@ After BBFRAMEs exist, GS-mode payload is GSE. Implement:
 - Standard GSE (EN 301 545 / TS 102 606): Start/End fragment flags, 1-byte vs no fragment-id, length field, LT (label type) 6B/3B/broadcast/reuse, PROTOCOL-TYPE / extension headers, total-length + CRC-32 on reassembly.
 - **Proprietary variants** (from dontlookup, MIT): (a) non-standard **2-byte header-length** field (`hdrlen-2`); (b) **split fragment-id** = 6-bit frag-id + 2-bit counter instead of 8-bit. → run the 4 combinations and let the user/validator pick the one that yields valid IP (IP-header checksum + sane lengths).
 - **Blind IP search** fallback: scan BBFRAME payload byte offsets for an IPv4 header whose checksum validates (dontlookup's approach) when framing is unknown; also a byte-pair-swap pass.
-- Reassemble fragments per frag-id → IP datagram → **PCAP** (DLT_RAW or DLT_EN10MB with a synthetic MAC) + live stats (per src/dst, protocol, pps, bps). TS-mode handled in `decdvb-ts`.
+- Reassemble fragments per frag-id → IP datagram → **PCAP** (DLT_RAW or DLT_EN10MB with a synthetic MAC) + live stats (per src/dst, protocol, pps, bps). TS-mode handled in `decsat-ts`.
 
 ## 7. Input / output
 
@@ -202,7 +202,7 @@ After BBFRAMEs exist, GS-mode payload is GSE. Implement:
 ## 8. Platform, build, release
 
 - Windows 11 primary, Linux x86_64 too. egui/eframe with the **glow** (OpenGL) renderer (as DecDRM — keeps the Rust-version floor sane). `rustfft` for DSP.
-- Rust throughout, with two C libraries (2026-10-10), there being no mature Rust decoders for them: **libopus** (BSD; `third_party/opus`, xiph/opus v1.6.1, built by CMake in `decdvb-opus-sys`, as DecDRM) and **libxaac**'s decoder (Apache-2.0, GPL-3-compatible; `third_party/libxaac`, ittiam-systems v0.1.13, built by `cc` from its own CMake source lists in `decdvb-xaac-sys`) for AAC with SBR and PS. FDK-AAC, which DecDRM decodes with, is not used: its licence is not GPL-compatible. A build needs CMake and a C compiler; CI checks out submodules.
+- Rust throughout, with two C libraries (2026-10-10), there being no mature Rust decoders for them: **libopus** (BSD; `third_party/opus`, xiph/opus v1.6.1, built by CMake in `decsat-opus-sys`, as DecDRM) and **libxaac**'s decoder (Apache-2.0, GPL-3-compatible; `third_party/libxaac`, ittiam-systems v0.1.13, built by `cc` from its own CMake source lists in `decsat-xaac-sys`) for AAC with SBR and PS. FDK-AAC, which DecDRM decodes with, is not used: its licence is not GPL-compatible. A build needs CMake and a C compiler; CI checks out submodules.
 - Portable static-CRT exes in `exe/` + attached to GitHub releases; CI on GitHub Actions (Linux+Windows tests, clippy, smoke); release.yml drafts portable exes from a pushed tag. See memory [[feedback-release-and-ci]].
 - Repo: planned public `CasualArclamp/DecDVB`, **GPL-3.0-or-later**. Commit identity `Arclamp <45412977+CasualArclamp@users.noreply.github.com>`.
 
@@ -232,22 +232,22 @@ one-to-one onto our crates, so each milestone knows where to read first:
 
 | Our crate / milestone | gr-dvbs2rx files |
 |---|---|
-| `decdvb-dsp` timing (M1) | `symbol_sync_cc_impl.cc`, `delay_line.h` |
-| `decdvb-dsp` carrier (M1) | `pl_freq_sync.cc/.h`, `rotator_cc_impl.cc` |
-| `decdvb-frame` PL sync (M1) | `pl_frame_sync.cc/.h`, `plsync_cc_impl.cc` |
-| `decdvb-frame` PLS decode (M1) | `pl_signaling.cc`, `reed_muller.cc` — the 64-bit PLS code is a **Reed–Muller** code |
-| `decdvb-frame` descramble (M1) | `pl_descrambler.cc`, `pl_defs.h` |
-| `decdvb-fec` demap/LLR (M2–M3) | `xfecframe_demapper_cb_impl.cc`, `qpsk.h`, `psk.hh`, `qam.hh`, `pi2_bpsk.cc` |
-| `decdvb-fec` LDPC (M2–M3) | `ldpc_decoder_bb_impl.cc`, `dvb_s2_tables.hh` (55 KB), `dvb_s2x_tables.hh` (131 KB) |
-| `decdvb-fec` BCH (M2) | `bch.cc`, `gf.cc`, `gf_util.h`, `reed_solomon_error_correction.hh` |
-| `decdvb-fec` params (M2) | `fec_params.cc` — K/N per MODCOD |
-| `decdvb-frame` BBHEADER (M2) | `bbdeheader_bb_impl.cc`, `bbdescrambler_bb_impl.cc`, `crc.h` |
+| `decsat-dsp` timing (M1) | `symbol_sync_cc_impl.cc`, `delay_line.h` |
+| `decsat-dsp` carrier (M1) | `pl_freq_sync.cc/.h`, `rotator_cc_impl.cc` |
+| `decsat-frame` PL sync (M1) | `pl_frame_sync.cc/.h`, `plsync_cc_impl.cc` |
+| `decsat-frame` PLS decode (M1) | `pl_signaling.cc`, `reed_muller.cc` — the 64-bit PLS code is a **Reed–Muller** code |
+| `decsat-frame` descramble (M1) | `pl_descrambler.cc`, `pl_defs.h` |
+| `decsat-fec` demap/LLR (M2–M3) | `xfecframe_demapper_cb_impl.cc`, `qpsk.h`, `psk.hh`, `qam.hh`, `pi2_bpsk.cc` |
+| `decsat-fec` LDPC (M2–M3) | `ldpc_decoder_bb_impl.cc`, `dvb_s2_tables.hh` (55 KB), `dvb_s2x_tables.hh` (131 KB) |
+| `decsat-fec` BCH (M2) | `bch.cc`, `gf.cc`, `gf_util.h`, `reed_solomon_error_correction.hh` |
+| `decsat-fec` params (M2) | `fec_params.cc` — K/N per MODCOD |
+| `decsat-frame` BBHEADER (M2) | `bbdeheader_bb_impl.cc`, `bbdescrambler_bb_impl.cc`, `crc.h` |
 
 `leansdr`'s `dvbs2.h` is the compact alternative worth comparing for
 acquisition behaviour at low SNR. `gr-dtv` is the modulator reference for M6.
 
 Those directories are untrusted downloaded code: read them, never build or run
-them as part of DecDVB's own test loop.
+them as part of DecSAT's own test loop.
 
 ## Appendix B — GSE wire format
 
@@ -320,5 +320,5 @@ resort.
 TS-mode BBFRAMEs carry 188-byte MPEG-TS packets with the sync byte replaced per
 the BBHEADER's `SYNC`/`SYNCD` fields, and optional null-packet deletion (NPD).
 dontlookup also implements two CRC variants seen in the wild — "Generic" and
-"Newtec" — which `decdvb-ts` should offer alongside the standard handling.
+"Newtec" — which `decsat-ts` should offer alongside the standard handling.
 

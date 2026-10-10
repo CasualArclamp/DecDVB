@@ -1,5 +1,9 @@
 # Status
 
+> **Renamed DecSAT on 2026-10-10** (it does far more than DVB). Entries
+> before that use the old name — crates `decdvb-*`, binaries `decdvb` /
+> `decdvb-gui`, recordings `decdvb-…` — as they were then.
+
 Running log of what is done and what is next. `docs/DESIGN.md` holds the plan.
 
 ## M0 — skeleton (done, 2026-10-08)

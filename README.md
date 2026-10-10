@@ -1,17 +1,22 @@
-# DecDVB
+# DecSAT
 
-A **DVB-S2 / DVB-S2X** receiver in Rust, for a **HackRF One** or recorded IQ,
-built like **SDR++**: a big waterfall over the whole span, and VFOs you drop on
-it, each running the decoder of your choice — including a blind **"what is
+A **satellite receiver** in Rust, for a **HackRF One** or recorded IQ, built
+like **SDR++**: a big waterfall over the whole span, and VFOs you drop on it,
+each running the decoder of your choice — including a blind **"what is
 this?"** mode that finds a carrier's symbol rate and tells you what it is.
 
 It decodes DVB-S2 and DVB-S2X with adaptive coding and modulation (**ACM**),
 frame by frame: **GSE** to **IP** written as a PCAP, **MPEG-TS** to a file or
-a media player, multicast radio played in the app.
+a media player, multicast radio played in the app. Beyond DVB it takes the
+SCPC modems behind thin-route links apart — Intelsat TPC 2964 (Comtech),
+Paradise Q-Flex FastLink, K = 7 Viterbi (IESS-308/309) — down to their E1,
+Drop & Insert and TDM channels, and plays the voice in them (G.711, and
+G.728 LD-CELP found by itself); DVB-CID carrier IDs too. It was called
+**DecDVB** until October 2026.
 
-![DecDVB: carriers in an 8 MS/s span, each claimed by an Identify VFO; the selected one is identified as a DVB-S2X ACM carrier at 500 kS/s with its four MODCODs listed](docs/images/waterfall.png)
+![DecSAT: carriers in an 8 MS/s span, each claimed by an Identify VFO; the selected one is identified as a DVB-S2X ACM carrier at 500 kS/s with its four MODCODs listed](docs/images/waterfall.png)
 
-*A synthetic 8 MS/s test scene (`decdvb scene`): a DVB-S2 CCM carrier, an
+*A synthetic 8 MS/s test scene (`decsat scene`): a DVB-S2 CCM carrier, an
 ACM carrier mixing S2 and S2X MODCODs (QPSK 1/2 → 8PSK 25/36 → 16APSK 26/45 →
 32APSK 32/45), a DVB-S carrier and a CW tone (the scene has since gained a
 TPC 2964 carrier). Every carrier was found and identified blind.*
@@ -55,12 +60,12 @@ TPC 2964 carrier). Every carrier was found and identified blind.*
 ## Using it
 
 ```bash
-cargo run --release -p decdvb-gui -- capture_8Msps.cs8
+cargo run --release -p decsat-gui -- capture_8Msps.cs8
 ```
 
 Or open a capture from the toolbar, or drop it on the window. The sample rate,
 centre frequency and format are read from the file name when it carries them
-(gqrx, SDR++ and DecDVB's own recordings do); otherwise set them in the toolbar.
+(gqrx, SDR++ and DecSAT's own recordings do); otherwise set them in the toolbar.
 
 On the waterfall:
 
@@ -80,7 +85,7 @@ digit or click its upper/lower half to step it, right-click to zero that digit
 and every one below it. With the HackRF running it retunes the radio.
 
 **📁 Output folder…** in the toolbar sets where IQ recordings, symbol files,
-PCAP and TS files go (default `Documents\DecDVB`); it is remembered between
+PCAP and TS files go (default `Documents\DecSAT`); it is remembered between
 runs and applies to existing VFOs too.
 
 The side bar lists the VFOs with their CPU load (✕ removes one), and shows the
@@ -97,7 +102,7 @@ flows; press **● Record** next to *PCAP* to write the packets to a `.pcap`
 (raw IP, opens in Wireshark).
 
 Real links do not all follow the standard. As in
-[dontlookup](https://github.com/ucsdsysnet/dontlookup), DecDVB reads every
+[dontlookup](https://github.com/ucsdsysnet/dontlookup), DecSAT reads every
 data field four ways at once — GSE_LENGTH counting the 2-byte header or not,
 the fragment id as 8 bits or as 6 bits plus a 2-bit counter — and keeps
 whichever yields valid IP (checksums, lengths). The *GSE* setting can force
@@ -144,7 +149,7 @@ IPv4 fragments are put back together first — a multiplex packing several
 AUs into a 2.3 kB RTP packet sends each as two. `<nowplaying>` messages
 (title, artist, station) are listed under **Now playing**.
 
-- **▶ Play** decodes it in DecDVB: MPEG audio layers I–III, AAC-LC and
+- **▶ Play** decodes it in DecSAT: MPEG audio layers I–III, AAC-LC and
   HE-AAC v1/v2 with SBR and PS (libxaac; from ADTS, LATM/LOAS or RFC 3640),
   Opus (libopus) and PCM/G.711, with **⏸ Pause** (resumes live), **⏹ Stop**,
   a level meter, and the volume slider and 🔊 mute at the top of the list
@@ -225,7 +230,7 @@ the Recommendation and matches its Appendix I test vectors (112 dB SNR or better
 Offline:
 
 ```bash
-decdvb decode capture_148148Sps.cf32 --decoder tpc --out dir --e1-record 1
+decsat decode capture_148148Sps.cf32 --decoder tpc --out dir --e1-record 1
 ```
 
 ### Carrier ID (DVB-CID)
@@ -247,10 +252,10 @@ acquisition itself: correlation over the 4096 code phases, and code phase ×
 frequency around the peak. Offline:
 
 ```bash
-decdvb decode capture_1000000Sps.cf32 --decoder cid --fast
+decsat decode capture_1000000Sps.cf32 --decoder cid --fast
 ```
 
-No CID to hand? `decdvb cid` writes one under a DVB-S2 carrier, with your
+No CID to hand? `decsat cid` writes one under a DVB-S2 carrier, with your
 choice of identifier, position, telephone and text (see
 [`tests/`](tests/README.md)).
 
@@ -259,7 +264,7 @@ choice of identifier, position, telephone and text (see
 For carriers that are not DVB-S2 — SCPC data, telemetry, DVB-S — a VFO locks
 the carrier and shows its constellation; press **● Record** and it writes the
 hard-decided symbols to
-`decdvb-<VFO>-<freq>Hz-<rate>Bd-<modulation>-<time>.bin`, one byte per symbol:
+`decsat-<VFO>-<freq>Hz-<rate>Bd-<modulation>-<time>.bin`, one byte per symbol:
 the symbol's bit label under the DVB-S2 mapping (BPSK: 0 = +1). The symbol rate
 and constellation come from Identify, or set them by hand. Without a preamble
 the carrier phase is ambiguous by the constellation's symmetry (90° for QPSK),
@@ -318,7 +323,7 @@ looks for fingerprints of proprietary waveforms:
 
 Comtech VersaFEC and the TPC/LDPC modes of SCPC modems publish no sync
 word or frame layout, so they can only be recognised by such measurements;
-captures of them would let DecDVB name them. Paradise FastLink was worked
+captures of them would let DecSAT name them. Paradise FastLink was worked
 out that way from a capture of a Q-Flex (QPSK 0.710): Identify names it, and
 the **Q-Flex FastLink** decoder decodes it — down to the calls in its TDM
 multiplex: G.728 voice spread over four channels, two bits a TDM word.
@@ -331,15 +336,15 @@ demodulating with what it found, so the constellation and MER stay live.
 ### Command line
 
 ```bash
-decdvb scan capture_8Msps.cs8     # find every carrier and identify each
-decdvb scene                      # write the 8 MS/s test scene above
-decdvb cid                        # a DVB-S2 carrier with a DVB-CID under it
-decdvb test-signals tests         # both, into tests/ (see tests/README.md)
-decdvb mcast recording.ts --decode --record out   # the radio in a .ts (MPE)
-decdvb payload fastlink.bin --tdm-out frames.bin  # a modem .bin through the payload stage
-decdvb decode --hackrf 1635.0 --decoder fastlink --offset 640e3 --bandwidth 200e3   --out dir --record-on-activity     # watch a FastLink live, record when a channel speaks
-decdvb decode qflex_333333Sps.cf32 --decoder fastlink --out dir --tdm-record   # a Q-Flex's call voice to a .wav
-decdvb modcods                    # the DVB-S2 MODCOD table
+decsat scan capture_8Msps.cs8     # find every carrier and identify each
+decsat scene                      # write the 8 MS/s test scene above
+decsat cid                        # a DVB-S2 carrier with a DVB-CID under it
+decsat test-signals tests         # both, into tests/ (see tests/README.md)
+decsat mcast recording.ts --decode --record out   # the radio in a .ts (MPE)
+decsat payload fastlink.bin --tdm-out frames.bin  # a modem .bin through the payload stage
+decsat decode --hackrf 1635.0 --decoder fastlink --offset 640e3 --bandwidth 200e3   --out dir --record-on-activity     # watch a FastLink live, record when a channel speaks
+decsat decode qflex_333333Sps.cf32 --decoder fastlink --out dir --tdm-record   # a Q-Flex's call voice to a .wav
+decsat modcods                    # the DVB-S2 MODCOD table
 ```
 
 ## Build
@@ -363,7 +368,7 @@ and **Start**. Frequency and gains apply live. **LNB LO** only labels the axis
 
 The driver is pure Rust over USB ([`seify-hackrfone`](https://crates.io/crates/seify-hackrfone)
 on `nusb`): no libhackrf, no libusb, nothing to install beyond the WinUSB driver
-the HackRF already uses on Windows (Zadig, or the official tools). DecDVB only
+the HackRF already uses on Windows (Zadig, or the official tools). DecSAT only
 ever **receives**, and keeps the antenna-port power **off** — feed an LNB from
 an external inserter.
 

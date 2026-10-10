@@ -1,0 +1,1021 @@
+//! The band view: spectrum on top, waterfall below, VFOs over both — the
+//! SDR++-style centrepiece.
+//!
+//! Mouse:
+//! - **wheel** zooms about the cursor; **right- or middle-drag** pans;
+//! - **drag a VFO** moves it; **drag its edge** resizes it symmetrically;
+//! - **drag on empty space** draws a new VFO; **double-click** drops one;
+//! - **click** with a VFO selected tunes it there; **click a VFO** selects it;
+//! - **click a detected carrier's bracket** claims it with a VFO sized to fit.
+//!
+//! Painted directly rather than with `egui_plot`, which cannot host the
+//! waterfall texture under draggable VFO boxes.
+
+use std::collections::BTreeMap;
+
+use decsat_engine::{DecoderKind, FrontStatus, LockState, Verdict, VfoId, VfoSettings, VfoStatus};
+use eframe::egui::{
+    self, Align2, Color32, CornerRadius, CursorIcon, FontId, Mesh, PointerButton, Pos2, Rect,
+    Sense, Stroke, StrokeKind, TextureId, Ui, pos2, vec2,
+};
+
+use crate::format;
+
+/// A VFO as the GUI holds it.
+#[derive(Debug, Clone)]
+pub struct UiVfo {
+    pub id: VfoId,
+    pub settings: VfoSettings,
+}
+
+/// What the user did, for the app to apply.
+#[derive(Debug, Clone)]
+pub enum Action {
+    Select(Option<VfoId>),
+    Update(VfoId, VfoSettings),
+    Create(VfoSettings),
+    Remove(VfoId),
+    /// Move the radio's centre frequency by this many Hz.
+    Retune(f64),
+    /// Open a media player on a VFO's TS stream (starting its TCP server).
+    Play(VfoId, crate::player::Player),
+    /// Open the TS analyser window on a VFO.
+    OpenTsViewer(VfoId),
+    /// Play a VFO's multicast audio stream (group:port): in the app, or in
+    /// an external player.
+    PlayAudio(VfoId, std::net::SocketAddr, Option<crate::player::Player>),
+    /// Stop playing a VFO's multicast audio.
+    StopAudio(VfoId),
+    /// Record a VFO's multicast audio stream to a file, or stop (`None`).
+    RecordAudio(VfoId, Option<std::net::SocketAddr>),
+}
+
+/// Everything the view draws from.
+pub struct BandInput<'a> {
+    pub front: &'a FrontStatus,
+    /// RF frequency of the span's centre, for axis labels (0 = show offsets).
+    pub rf_center: f64,
+    pub vfos: &'a [UiVfo],
+    pub statuses: &'a BTreeMap<VfoId, VfoStatus>,
+    pub selected: Option<VfoId>,
+    pub waterfall: Option<(TextureId, Rect)>,
+    /// Display levels, dB.
+    pub levels: (f32, f32),
+    /// Decoder for VFOs created from the view.
+    pub new_decoder: DecoderKind,
+    /// Name for the next VFO.
+    pub next_name: String,
+    /// A live radio is the source: dragging past the span's edge tunes it.
+    pub can_retune: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+enum Drag {
+    #[default]
+    None,
+    Pan,
+    Move {
+        id: VfoId,
+        grab_hz: f64,
+    },
+    Resize {
+        id: VfoId,
+    },
+    Create {
+        start_hz: f64,
+    },
+}
+
+/// A delete cross, drawn rather than typed: egui's fonts have no ✕.
+pub fn paint_x(painter: &egui::Painter, center: Pos2, half: f32, color: Color32) {
+    let stroke = Stroke::new(1.6, color);
+    let (a, b) = (vec2(half, half), vec2(half, -half));
+    painter.line_segment([center - a, center + a], stroke);
+    painter.line_segment([center - b, center + b], stroke);
+}
+
+/// Distinct colours for VFOs, by id.
+pub fn vfo_color(id: VfoId) -> Color32 {
+    const C: [Color32; 8] = [
+        Color32::from_rgb(80, 200, 255),
+        Color32::from_rgb(255, 170, 60),
+        Color32::from_rgb(120, 230, 120),
+        Color32::from_rgb(240, 110, 200),
+        Color32::from_rgb(250, 230, 90),
+        Color32::from_rgb(170, 140, 255),
+        Color32::from_rgb(90, 240, 220),
+        Color32::from_rgb(255, 110, 110),
+    ];
+    C[(id as usize).wrapping_sub(1) % C.len()]
+}
+
+/// A short status badge for a VFO's label.
+pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
+    let Some(st) = st else { return "…".into() };
+    if !s.enabled {
+        return "off".into();
+    }
+    if s.decoder == DecoderKind::Cdm600Voice {
+        let lock = if st.carrier.is_some_and(|c| c.locked) {
+            "LOCK"
+        } else {
+            "no lock"
+        };
+        let voice = st
+            .fec
+            .as_ref()
+            .and_then(|f| f.e1.as_ref())
+            .and_then(|e| e.voice.iter().flatten().next().copied());
+        return match (&st.carrier, voice) {
+            (None, _) => format!("acq {:.0} %", st.progress * 100.0),
+            (Some(_), Some((_, true))) => format!("{lock} · G.728 speech"),
+            (Some(_), Some((_, false))) => format!("{lock} · G.728 silent"),
+            (Some(_), None) => format!("{lock} · voice?"),
+        };
+    }
+    match s.decoder.chain() {
+        DecoderKind::Identify if st.provisional => {
+            let rs = st.symbol_rate.map(format::rate).unwrap_or_default();
+            format!("{rs}? {:.0} %", st.progress * 100.0)
+        }
+        DecoderKind::Identify => match &st.identification {
+            Some(id) => match &id.verdict {
+                Verdict::NoSignal => "no signal".into(),
+                Verdict::Carrier => "carrier".into(),
+                Verdict::DvbS2(d) => {
+                    let mode = if d.variable_coding() { "ACM" } else { "CCM" };
+                    let rs = id.symbol_rate.map(format::rate).unwrap_or_default();
+                    let kind = if d.is_s2x() { "DVB-S2X" } else { "DVB-S2" };
+                    format!("{kind} {mode} {rs}")
+                }
+                Verdict::NotDvbS2 { .. } => {
+                    let c = id
+                        .constellation
+                        .map(|c| c.label())
+                        .unwrap_or_else(|| "?".into());
+                    let rs = id.symbol_rate.map(format::rate).unwrap_or_default();
+                    format!("{c} {rs}")
+                }
+            },
+            None => format!("{:.0} %", st.progress * 100.0),
+        },
+        DecoderKind::Dvbs2Ip | DecoderKind::Dvbs2Ts => match st.lock {
+            Some(LockState::Locked) => {
+                let mc = st
+                    .last_modcod
+                    .map_or_else(|| "dummy".into(), decsat_core::modcod_name);
+                match &st.fec {
+                    Some(f) if f.ok > 0 && f.payload_bps > 0.0 => {
+                        let rec = f.gse.as_ref().is_some_and(|g| g.pcap_active)
+                            || f.ts.as_ref().is_some_and(|t| t.file_active);
+                        format!(
+                            "LOCK {mc} · {}{}",
+                            format::bitrate(f.payload_bps),
+                            if rec { " ● REC" } else { "" }
+                        )
+                    }
+                    Some(f) if f.frames > 0 && f.ok == 0 => format!("LOCK {mc} · FEC fail"),
+                    _ => format!("LOCK {mc}"),
+                }
+            }
+            Some(LockState::Found) => "found".into(),
+            Some(LockState::Searching) => "search".into(),
+            None => format!("acq {:.0} %", st.progress * 100.0),
+        },
+        DecoderKind::DvbsTs => match (&st.carrier, st.fec.as_ref()) {
+            (Some(c), Some(f)) if f.dvbs.as_ref().is_some_and(|d| d.rate.is_some()) => {
+                let d = f.dvbs.as_ref().unwrap();
+                let rec = f.ts.as_ref().is_some_and(|t| t.file_active);
+                format!(
+                    "{} {} · {}{}",
+                    if c.locked { "LOCK" } else { "no lock" },
+                    d.rate.map_or("?", |r| r.name()),
+                    format::bitrate(f.payload_bps),
+                    if rec { " ● REC" } else { "" }
+                )
+            }
+            (Some(c), _) => format!("{} · rate?", if c.locked { "LOCK" } else { "no lock" }),
+            (None, _) => format!("acq {:.0} %", st.progress * 100.0),
+        },
+        DecoderKind::Tpc2964 | DecoderKind::Cdm600Voice => {
+            let t = st.fec.as_ref().and_then(|f| f.tpc.as_ref().map(|t| (f, t)));
+            match (&st.carrier, t) {
+                (Some(c), Some((f, t))) if t.structure.is_some() => format!(
+                    "{} TPC · {}{}",
+                    if c.locked { "LOCK" } else { "no lock" },
+                    format::bitrate(f.payload_bps),
+                    if f.raw_active { " ● REC" } else { "" }
+                ),
+                (Some(c), Some((_, t))) if t.uw_locked => format!(
+                    "{} · UW · structure?",
+                    if c.locked { "LOCK" } else { "no lock" }
+                ),
+                (Some(c), _) => format!("{} · UW?", if c.locked { "LOCK" } else { "no lock" }),
+                (None, _) => format!("acq {:.0} %", st.progress * 100.0),
+            }
+        }
+        DecoderKind::FastLink => {
+            let t = st
+                .fec
+                .as_ref()
+                .and_then(|f| f.fastlink.as_ref().map(|t| (f, t)));
+            match (&st.carrier, t) {
+                (Some(c), Some((f, t))) if t.locked => format!(
+                    "{} FL · {}{}",
+                    if c.locked { "LOCK" } else { "no lock" },
+                    format::bitrate(f.payload_bps),
+                    if f.raw_active { " ● REC" } else { "" }
+                ),
+                (Some(c), _) => format!("{} · sync?", if c.locked { "LOCK" } else { "no lock" }),
+                (None, _) => format!("acq {:.0} %", st.progress * 100.0),
+            }
+        }
+        DecoderKind::Viterbi => {
+            let v = st
+                .fec
+                .as_ref()
+                .and_then(|f| f.viterbi.as_ref().map(|v| (f, v)));
+            match (&st.carrier, v) {
+                (Some(c), Some((f, v))) if v.rate.is_some() => format!(
+                    "{} VIT {} · {}{}",
+                    if c.locked { "LOCK" } else { "no lock" },
+                    v.rate.map_or("?", |r| r.name()),
+                    format::bitrate(f.payload_bps),
+                    if f.raw_active { " ● REC" } else { "" }
+                ),
+                (Some(c), _) => format!("{} · rate?", if c.locked { "LOCK" } else { "no lock" }),
+                (None, _) => format!("acq {:.0} %", st.progress * 100.0),
+            }
+        }
+        DecoderKind::CarrierId => match &st.cid {
+            Some(c) => match c.stats.report.guid {
+                Some(g) => format!("CID {}", decsat_engine::cid::guid_text(g)),
+                None if c.stats.acquired => format!("CID found {:+.0} Hz", c.stats.offset_hz),
+                None => "CID?".into(),
+            },
+            None => format!("acq {:.0} %", st.progress * 100.0),
+        },
+        DecoderKind::PskSymbols => match &st.carrier {
+            Some(c) => {
+                let lock = if c.locked { "LOCK" } else { "no lock" };
+                let rs = st.symbol_rate.map(format::rate).unwrap_or_default();
+                let rec = if st.recording_active { " ● REC" } else { "" };
+                format!("{} {lock} {rs}{rec}", c.modulation.name())
+            }
+            None => format!("acq {:.0} %", st.progress * 100.0),
+        },
+        DecoderKind::IqRecord => st
+            .recording
+            .as_ref()
+            .map(|(_, b)| format!("{:.1} MB", *b as f64 / 1e6))
+            .unwrap_or_default(),
+        DecoderKind::Spectrum => format!("{:.1} dB", st.level_db),
+    }
+}
+
+pub struct BandView {
+    /// Visible range, Hz relative to the span centre.
+    pub lo: f64,
+    pub hi: f64,
+    span: f64,
+    drag: Drag,
+    create_to: f64,
+}
+
+impl Default for BandView {
+    fn default() -> Self {
+        BandView {
+            lo: -0.5,
+            hi: 0.5,
+            span: 1.0,
+            drag: Drag::None,
+            create_to: 0.0,
+        }
+    }
+}
+
+impl BandView {
+    /// Set the full span (a new source); resets the view to show all of it.
+    pub fn set_span(&mut self, span: f64) {
+        if span > 0.0 && span != self.span {
+            self.span = span;
+            self.lo = -span / 2.0;
+            self.hi = span / 2.0;
+        }
+    }
+
+    pub fn reset_zoom(&mut self) {
+        self.lo = -self.span / 2.0;
+        self.hi = self.span / 2.0;
+    }
+
+    pub fn show(&mut self, ui: &mut Ui, inp: &BandInput) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
+        let rect = resp.rect;
+        if rect.width() < 50.0 || rect.height() < 80.0 {
+            return actions;
+        }
+
+        let spec_h = (rect.height() * 0.32).clamp(90.0, 320.0);
+        let axis_h = 18.0;
+        let spec = Rect::from_min_size(rect.min, vec2(rect.width(), spec_h));
+        let axis =
+            Rect::from_min_size(pos2(rect.left(), spec.bottom()), vec2(rect.width(), axis_h));
+        let wf = Rect::from_min_max(pos2(rect.left(), axis.bottom()), rect.max);
+
+        let (lo, hi) = (self.lo, self.hi);
+        let w = rect.width();
+        let x_of = |hz: f64| rect.left() + ((hz - lo) / (hi - lo)) as f32 * w;
+        let hz_of = |x: f32| lo + ((x - rect.left()) / w) as f64 * (hi - lo);
+
+        // ---- backgrounds
+        painter.rect_filled(spec, CornerRadius::ZERO, Color32::from_rgb(10, 11, 17));
+        painter.rect_filled(axis, CornerRadius::ZERO, Color32::from_rgb(22, 23, 32));
+        painter.rect_filled(wf, CornerRadius::ZERO, Color32::from_rgb(0, 0, 4));
+
+        let have_signal = !inp.front.spectrum_db.is_empty() && self.span > 0.0;
+
+        // ---- waterfall
+        match inp.waterfall {
+            Some((tex, uv)) if have_signal => {
+                let u0 = ((lo + self.span / 2.0) / self.span) as f32;
+                let u1 = ((hi + self.span / 2.0) / self.span) as f32;
+                let uv = Rect::from_min_max(pos2(u0, uv.min.y), pos2(u1, uv.max.y));
+                painter.image(tex, wf, uv, Color32::WHITE);
+            }
+            _ => {
+                painter.text(
+                    wf.center(),
+                    Align2::CENTER_CENTER,
+                    "Open an IQ capture (or drop one here) to start",
+                    FontId::proportional(16.0),
+                    Color32::from_gray(140),
+                );
+            }
+        }
+
+        // ---- dB scale for the spectrum
+        let (lv_lo, lv_hi) = inp.levels;
+        let dmin = lv_lo - 5.0;
+        let dmax = lv_hi + 12.0;
+        let y_of =
+            |db: f32| spec.bottom() - ((db - dmin) / (dmax - dmin)).clamp(0.0, 1.0) * spec.height();
+        let grid = Color32::from_rgba_unmultiplied(255, 255, 255, 18);
+        let grid_text = Color32::from_gray(110);
+        let mut db = (dmin / 10.0).ceil() * 10.0;
+        while db < dmax {
+            let y = y_of(db);
+            painter.line_segment(
+                [pos2(spec.left(), y), pos2(spec.right(), y)],
+                Stroke::new(1.0, grid),
+            );
+            painter.text(
+                pos2(spec.left() + 3.0, y - 1.0),
+                Align2::LEFT_BOTTOM,
+                format!("{db:.0}"),
+                FontId::monospace(10.0),
+                grid_text,
+            );
+            db += 10.0;
+        }
+
+        // ---- frequency grid and axis
+        let step = format::nice_step(hi - lo, (w / 110.0) as f64);
+        let mut t = (lo / step).ceil() * step;
+        while t <= hi {
+            let x = x_of(t);
+            painter.line_segment(
+                [pos2(x, spec.top()), pos2(x, spec.bottom())],
+                Stroke::new(1.0, grid),
+            );
+            painter.line_segment(
+                [pos2(x, axis.top()), pos2(x, axis.top() + 4.0)],
+                Stroke::new(1.0, Color32::from_gray(150)),
+            );
+            let label = format::tick(inp.rf_center + t, step);
+            painter.text(
+                pos2(x, axis.center().y + 2.0),
+                Align2::CENTER_CENTER,
+                label,
+                FontId::monospace(10.5),
+                Color32::from_gray(190),
+            );
+            t += step;
+        }
+
+        // ---- spectrum trace
+        if have_signal {
+            let s = &inp.front.spectrum_db;
+            let n = s.len();
+            let bin = |hz: f64| ((hz / self.span + 0.5) * n as f64).floor() as isize;
+            let (b0, b1) = (
+                bin(lo).clamp(0, n as isize - 1) as usize,
+                bin(hi).clamp(0, n as isize - 1) as usize,
+            );
+            // At most one point per pixel, keeping the maximum so peaks survive.
+            let cols = (w as usize).max(2);
+            let mut pts: Vec<Pos2> = Vec::with_capacity(cols);
+            let per_col = ((b1 - b0 + 1) as f64 / cols as f64).max(1.0);
+            let mut k = b0 as f64;
+            while (k as usize) <= b1 {
+                let k0 = k as usize;
+                let k1 = ((k + per_col) as usize).min(b1 + 1).max(k0 + 1);
+                let m = s[k0..k1].iter().copied().fold(f32::MIN, f32::max);
+                let hz = ((k0 + k1) as f64 / 2.0 / n as f64 - 0.5) * self.span;
+                pts.push(pos2(x_of(hz), y_of(m)));
+                k += per_col;
+            }
+            let fill = Color32::from_rgba_unmultiplied(70, 150, 255, 36);
+            let mut mesh = Mesh::default();
+            for p in &pts {
+                let i = mesh.vertices.len() as u32;
+                mesh.colored_vertex(*p, fill);
+                mesh.colored_vertex(pos2(p.x, spec.bottom()), fill);
+                if i >= 2 {
+                    mesh.add_triangle(i - 2, i - 1, i);
+                    mesh.add_triangle(i - 1, i + 1, i);
+                }
+            }
+            painter.add(egui::Shape::mesh(mesh));
+            painter.add(egui::Shape::line(
+                pts,
+                Stroke::new(1.2, Color32::from_rgb(150, 205, 255)),
+            ));
+        }
+
+        // ---- VFOs
+        let pointer = resp.hover_pos().or(resp.interact_pointer_pos());
+        let edge_px = 5.0;
+        // Which VFO / edge / carrier is under a point.
+        let hit_vfo = |p: Pos2| -> Option<(VfoId, bool)> {
+            // Selected first, so it wins where VFOs overlap.
+            let order = inp
+                .vfos
+                .iter()
+                .filter(|v| Some(v.id) == inp.selected)
+                .chain(inp.vfos.iter().filter(|v| Some(v.id) != inp.selected));
+            for v in order {
+                let s = &v.settings;
+                let x0 = x_of(s.offset_hz - s.bandwidth_hz / 2.0);
+                let x1 = x_of(s.offset_hz + s.bandwidth_hz / 2.0);
+                let wide = x1 - x0 > 3.0 * edge_px;
+                if wide && ((p.x - x0).abs() <= edge_px || (p.x - x1).abs() <= edge_px) {
+                    return Some((v.id, true));
+                }
+                if p.x >= x0 - 2.0 && p.x <= x1 + 2.0 {
+                    return Some((v.id, false));
+                }
+            }
+            None
+        };
+
+        // The ✕ on each VFO's label, for the click handler below.
+        let mut close_boxes: Vec<(VfoId, Rect)> = Vec::new();
+        for v in inp.vfos {
+            let s = &v.settings;
+            let x0 = x_of(s.offset_hz - s.bandwidth_hz / 2.0);
+            let x1 = x_of(s.offset_hz + s.bandwidth_hz / 2.0);
+            if x1 < rect.left() || x0 > rect.right() {
+                continue;
+            }
+            let sel = Some(v.id) == inp.selected;
+            let c = vfo_color(v.id);
+            let a = if !s.enabled {
+                14
+            } else if sel {
+                46
+            } else {
+                26
+            };
+            let body = Rect::from_min_max(
+                pos2(x0.max(rect.left()), rect.top()),
+                pos2(x1.min(rect.right()), rect.bottom()),
+            );
+            painter.rect_filled(
+                body,
+                CornerRadius::ZERO,
+                Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a),
+            );
+            let edge = Stroke::new(
+                if sel { 2.0 } else { 1.0 },
+                c.gamma_multiply(if sel { 1.0 } else { 0.7 }),
+            );
+            painter.line_segment([pos2(x0, rect.top()), pos2(x0, rect.bottom())], edge);
+            painter.line_segment([pos2(x1, rect.top()), pos2(x1, rect.bottom())], edge);
+            let xc = x_of(s.offset_hz);
+            painter.line_segment(
+                [pos2(xc, rect.top()), pos2(xc, rect.bottom())],
+                Stroke::new(1.0, c.gamma_multiply(0.45)),
+            );
+
+            // Label pill at the top of the spectrum.
+            let label = format!(
+                "{} · {} · {}",
+                s.name,
+                s.decoder.short(),
+                badge(s, inp.statuses.get(&v.id))
+            );
+            let font = FontId::proportional(11.5);
+            let galley = painter.layout_no_wrap(label, font, Color32::BLACK);
+            // Room for a ✕ at the right end that deletes the VFO.
+            let lw = galley.size().x + 10.0 + 16.0;
+            let lx = xc.clamp(rect.left() + lw / 2.0, rect.right() - lw / 2.0);
+            let lr = Rect::from_center_size(pos2(lx, spec.top() + 11.0), vec2(lw, 17.0));
+            painter.rect_filled(
+                lr,
+                CornerRadius::same(4),
+                c.gamma_multiply(if sel { 1.0 } else { 0.8 }),
+            );
+            painter.galley(
+                lr.left_top() + vec2(5.0, (17.0 - galley.size().y) / 2.0),
+                galley,
+                Color32::BLACK,
+            );
+            let xr = Rect::from_min_max(pos2(lr.right() - 16.0, lr.top()), lr.right_bottom());
+            let over = pointer.is_some_and(|p| xr.contains(p));
+            if over {
+                painter.rect_filled(xr, CornerRadius::same(4), Color32::from_rgb(170, 50, 50));
+            }
+            paint_x(
+                &painter,
+                xr.center(),
+                3.5,
+                if over { Color32::WHITE } else { Color32::BLACK },
+            );
+            close_boxes.push((v.id, xr));
+        }
+
+        // ---- DVB-CIDs locked: where each spread signal sits under its carrier,
+        // and how far under — its despread SNR a bit, less the 36 dB of
+        // processing gain (4096 chips), is its spectral density against what
+        // lies on it (the host and the noise, read off the spectrum there).
+        if have_signal {
+            let s = &inp.front.spectrum_db;
+            let n = s.len();
+            let bin = |hz: f64| {
+                ((hz / self.span + 0.5) * n as f64)
+                    .floor()
+                    .clamp(0.0, (n - 1) as f64) as usize
+            };
+            for v in inp.vfos {
+                let Some(c) = inp.statuses.get(&v.id).and_then(|st| st.cid.as_ref()) else {
+                    continue;
+                };
+                if !c.stats.acquired || c.chip_rate <= 0.0 {
+                    continue;
+                }
+                let rc = c.chip_rate;
+                // RRC, α 0.35 (TS 103 129 §5.6).
+                let alpha = 0.35;
+                let f = v.settings.offset_hz + c.center_hz + c.stats.offset_hz;
+                let edge = 0.5 * (1.0 + alpha) * rc;
+                let (x0, x1) = (x_of(f - edge), x_of(f + edge));
+                if x1 < rect.left() || x0 > rect.right() {
+                    continue;
+                }
+                // What lies on it: the spectrum's mean power over its flat part.
+                let (b0, b1) = (bin(f - 0.3 * rc), bin(f + 0.3 * rc).max(bin(f - 0.3 * rc)));
+                let lin = s[b0..=b1]
+                    .iter()
+                    .map(|&d| 10f64.powf(f64::from(d) / 10.0))
+                    .sum::<f64>()
+                    / (b1 - b0 + 1) as f64;
+                let snr = (10f64.powf(f64::from(c.stats.snr_db) / 10.0) - 1.0).max(1e-3);
+                let under = 10.0 * (decsat_engine::cid::CHIPS as f64).log10() - 10.0 * snr.log10();
+                let top = (10.0 * lin.log10() - under) as f32;
+                let colour = Color32::from_rgb(255, 170, 60);
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        pos2(x0.max(rect.left()), spec.top()),
+                        pos2(x1.min(rect.right()), spec.bottom()),
+                    ),
+                    CornerRadius::ZERO,
+                    Color32::from_rgba_unmultiplied(255, 170, 60, 16),
+                );
+                // The raised-cosine power shape at that level — or, below the
+                // display's floor, a small dashed hump on it, so where it is
+                // and its shape still show (the label gives the level).
+                let floor = y_of(top) >= spec.bottom() - 1.0;
+                let shape: Vec<Pos2> = (0..=96)
+                    .map(|i| {
+                        let hz = f - edge + 2.0 * edge * f64::from(i) / 96.0;
+                        let u = (hz - f).abs() / rc;
+                        let flat = 0.5 * (1.0 - alpha);
+                        let h = if u <= flat {
+                            1.0
+                        } else {
+                            0.5 * (1.0 + (std::f64::consts::PI / alpha * (u - flat)).cos())
+                        };
+                        let y = if floor {
+                            spec.bottom() - 16.0 * h as f32
+                        } else {
+                            y_of(top + (10.0 * h.max(1e-4).log10()) as f32)
+                        };
+                        pos2(x_of(hz), y)
+                    })
+                    .collect();
+                let fill =
+                    Color32::from_rgba_unmultiplied(255, 170, 60, if floor { 30 } else { 60 });
+                let mut mesh = Mesh::default();
+                for p in &shape {
+                    let i = mesh.vertices.len() as u32;
+                    mesh.colored_vertex(*p, fill);
+                    mesh.colored_vertex(pos2(p.x, spec.bottom()), fill);
+                    if i >= 2 {
+                        mesh.add_triangle(i - 2, i - 1, i);
+                        mesh.add_triangle(i - 1, i + 1, i);
+                    }
+                }
+                painter.add(egui::Shape::mesh(mesh));
+                if floor {
+                    painter.extend(egui::Shape::dashed_line(
+                        &shape,
+                        Stroke::new(1.5, colour),
+                        5.0,
+                        3.0,
+                    ));
+                } else {
+                    painter.add(egui::Shape::line(shape, Stroke::new(1.5, colour)));
+                }
+                let xc = x_of(f);
+                let y_top = if floor {
+                    spec.bottom() - 16.0
+                } else {
+                    y_of(top)
+                };
+                painter.line_segment(
+                    [
+                        pos2(xc, (y_top - 6.0).max(spec.top() + 44.0)),
+                        pos2(xc, spec.bottom()),
+                    ],
+                    Stroke::new(1.0, colour.gamma_multiply(0.8)),
+                );
+                painter.text(
+                    pos2(
+                        xc,
+                        (y_top - 8.0).clamp(spec.top() + 44.0, spec.bottom() - 4.0),
+                    ),
+                    Align2::CENTER_BOTTOM,
+                    format!(
+                        "DSSS · {:.0} kHz · {:.0} dB under{}",
+                        2.0 * edge / 1e3,
+                        under,
+                        if floor { " (below the floor)" } else { "" }
+                    ),
+                    FontId::proportional(11.0),
+                    colour,
+                );
+            }
+        }
+
+        // ---- detected carriers: brackets near the top of the spectrum
+        let carrier_y = spec.top() + 34.0;
+        let covered = |hz: f64| {
+            inp.vfos
+                .iter()
+                .any(|v| (hz - v.settings.offset_hz).abs() <= v.settings.bandwidth_hz / 2.0)
+        };
+        let mut carrier_hit: Option<usize> = None;
+        for (i, c) in inp.front.carriers.iter().enumerate() {
+            let x0 = x_of(c.center_hz - c.bandwidth_hz / 2.0);
+            let x1 = x_of(c.center_hz + c.bandwidth_hz / 2.0).max(x0 + 4.0);
+            if x1 < rect.left() || x0 > rect.right() {
+                continue;
+            }
+            let hit = Rect::from_min_max(
+                pos2(x0 - 3.0, carrier_y - 14.0),
+                pos2(x1 + 3.0, carrier_y + 6.0),
+            );
+            let hovered =
+                pointer.is_some_and(|p| hit.contains(p)) && matches!(self.drag, Drag::None);
+            if hovered {
+                carrier_hit = Some(i);
+            }
+            // A narrow line is a small tick. It may be a CW or a spur — or a
+            // slow carrier (10 kS/s is ~5 bins at 10 MS/s / 4096), so it can
+            // still be claimed; Identify then says which.
+            if c.narrow {
+                let x = x_of(c.center_hz);
+                let col = if hovered {
+                    Color32::WHITE
+                } else {
+                    Color32::from_rgba_unmultiplied(200, 200, 200, 110)
+                };
+                painter.line_segment(
+                    [pos2(x, carrier_y - 4.0), pos2(x, carrier_y + 4.0)],
+                    Stroke::new(if hovered { 2.0 } else { 1.0 }, col),
+                );
+                continue;
+            }
+            let taken = covered(c.center_hz);
+            // Green for a clean carrier; orange for a rough lump (overload
+            // products, several signals, or something not linearly
+            // modulated), whose "symbol rate" would mean nothing.
+            let base = if c.rough {
+                Color32::from_rgb(240, 170, 80)
+            } else {
+                Color32::from_rgb(130, 230, 150)
+            };
+            let col = if hovered {
+                Color32::from_rgb(255, 255, 255)
+            } else if taken {
+                base.gamma_multiply(0.4)
+            } else {
+                base
+            };
+            let st = Stroke::new(if hovered { 2.0 } else { 1.3 }, col);
+            painter.line_segment([pos2(x0, carrier_y), pos2(x1, carrier_y)], st);
+            painter.line_segment([pos2(x0, carrier_y - 4.0), pos2(x0, carrier_y + 4.0)], st);
+            painter.line_segment([pos2(x1, carrier_y - 4.0), pos2(x1, carrier_y + 4.0)], st);
+            if !c.narrow && x1 - x0 > 28.0 {
+                let label = if c.rough {
+                    "lump".to_string()
+                } else {
+                    format::rate(c.symbol_rate_hz)
+                };
+                painter.text(
+                    pos2((x0 + x1) / 2.0, carrier_y - 3.0),
+                    Align2::CENTER_BOTTOM,
+                    label,
+                    FontId::proportional(10.5),
+                    col,
+                );
+            }
+        }
+
+        // ---- create-drag preview
+        if let Drag::Create { start_hz } = self.drag {
+            let (a, b) = (
+                x_of(start_hz.min(self.create_to)),
+                x_of(start_hz.max(self.create_to)),
+            );
+            let r = Rect::from_min_max(pos2(a, rect.top()), pos2(b, rect.bottom()));
+            painter.rect_filled(
+                r,
+                CornerRadius::ZERO,
+                Color32::from_rgba_unmultiplied(255, 255, 255, 22),
+            );
+            painter.rect_stroke(
+                r,
+                CornerRadius::ZERO,
+                Stroke::new(1.0, Color32::from_gray(220)),
+                StrokeKind::Inside,
+            );
+        }
+
+        // ---- cursor readout
+        if let Some(p) = resp.hover_pos() {
+            let hz = hz_of(p.x);
+            painter.line_segment(
+                [pos2(p.x, rect.top()), pos2(p.x, rect.bottom())],
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 60)),
+            );
+            let mut text = format::freq(inp.rf_center + hz);
+            if have_signal {
+                let s = &inp.front.spectrum_db;
+                let k = (((hz / self.span) + 0.5) * s.len() as f64) as usize;
+                if let Some(d) = s.get(k.min(s.len() - 1)) {
+                    text.push_str(&format!("   {d:.1} dB"));
+                }
+            }
+            if let Some(i) = carrier_hit {
+                let c = &inp.front.carriers[i];
+                text = if c.narrow {
+                    format!(
+                        "click: {} on narrow line at {} ({:.0} dB) — a CW, a spur, or a slow carrier",
+                        inp.new_decoder.short(),
+                        format::freq(inp.rf_center + c.center_hz),
+                        c.snr_db
+                    )
+                } else {
+                    format!(
+                        "click: {} on {} carrier, ~{}, {:.0} dB S/N",
+                        inp.new_decoder.short(),
+                        format::freq(inp.rf_center + c.center_hz),
+                        format::rate(c.symbol_rate_hz),
+                        c.snr_db
+                    )
+                };
+            }
+            let pos = pos2((p.x + 10.0).min(rect.right() - 4.0), spec.bottom() - 4.0);
+            painter.text(
+                pos,
+                Align2::LEFT_BOTTOM,
+                text,
+                FontId::monospace(11.0),
+                Color32::from_gray(230),
+            );
+        }
+
+        // ---- interaction
+        if !have_signal {
+            return actions;
+        }
+        let bin_hz = self.span / inp.front.fft_size.max(1) as f64;
+        // Zoom stops at 32 bins across the view: past that the waterfall is
+        // all blocks. VFOs may be far narrower — two bins, and never under
+        // 500 Hz — so a 10 kS/s carrier gets a VFO that fits it rather than
+        // a forced 60 kHz (the old limit was 24 bins for both).
+        let min_view = (bin_hz * 32.0).max(1.0);
+        let min_vfo = (bin_hz * 2.0).max(500.0);
+
+        // Zoom about the cursor.
+        if let Some(p) = resp.hover_pos() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                let f = (-(scroll as f64) * 0.002).exp();
+                let c = hz_of(p.x);
+                let new_w = ((hi - lo) * f).clamp(min_view, self.span);
+                let frac = (c - lo) / (hi - lo);
+                self.lo = c - frac * new_w;
+                self.hi = self.lo + new_w;
+                self.clamp_view();
+            }
+        }
+
+        // Pan: the spectrum follows the mouse. Within the span that moves
+        // the view; whatever the span's edge stops (all of it at full span)
+        // tunes a live radio instead, as dragging does in SDR++.
+        if resp.dragged_by(PointerButton::Secondary) || resp.dragged_by(PointerButton::Middle) {
+            let d = resp.drag_delta().x as f64 / w as f64 * (hi - lo);
+            let want = self.lo - d;
+            self.lo -= d;
+            self.hi -= d;
+            self.clamp_view();
+            let rest = want - self.lo;
+            if inp.can_retune && rest != 0.0 {
+                actions.push(Action::Retune(rest));
+            }
+            self.drag = Drag::Pan;
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        }
+
+        let find = |id: VfoId| inp.vfos.iter().find(|v| v.id == id);
+
+        if resp.drag_started_by(PointerButton::Primary) {
+            let origin = ui
+                .input(|i| i.pointer.press_origin())
+                .unwrap_or(rect.center());
+            self.drag = match hit_vfo(origin) {
+                Some((id, true)) => {
+                    actions.push(Action::Select(Some(id)));
+                    Drag::Resize { id }
+                }
+                Some((id, false)) => {
+                    actions.push(Action::Select(Some(id)));
+                    let off = find(id).map_or(0.0, |v| v.settings.offset_hz);
+                    Drag::Move {
+                        id,
+                        grab_hz: hz_of(origin.x) - off,
+                    }
+                }
+                None => {
+                    let h = hz_of(origin.x);
+                    self.create_to = h;
+                    Drag::Create { start_hz: h }
+                }
+            };
+        }
+
+        if resp.dragged_by(PointerButton::Primary)
+            && let Some(p) = resp.interact_pointer_pos()
+        {
+            let h = hz_of(p.x).clamp(-self.span / 2.0, self.span / 2.0);
+            match self.drag {
+                Drag::Move { id, grab_hz } => {
+                    if let Some(v) = find(id) {
+                        let mut s = v.settings.clone();
+                        s.offset_hz = (h - grab_hz).clamp(-self.span / 2.0, self.span / 2.0);
+                        actions.push(Action::Update(id, s));
+                    }
+                    ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                }
+                Drag::Resize { id } => {
+                    if let Some(v) = find(id) {
+                        let mut s = v.settings.clone();
+                        s.bandwidth_hz = (2.0 * (h - s.offset_hz).abs()).clamp(min_vfo, self.span);
+                        actions.push(Action::Update(id, s));
+                    }
+                    ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+                }
+                Drag::Create { .. } => self.create_to = h,
+                _ => {}
+            }
+        }
+
+        if resp.drag_stopped() {
+            if let Drag::Create { start_hz } = self.drag {
+                let (a, b) = (start_hz.min(self.create_to), start_hz.max(self.create_to));
+                if x_of(b) - x_of(a) > 6.0 {
+                    let mut s = VfoSettings::new(
+                        inp.next_name.clone(),
+                        (a + b) / 2.0,
+                        (b - a).max(min_vfo),
+                        inp.new_decoder,
+                    );
+                    s.record_dir = default_record_dir();
+                    actions.push(Action::Create(s));
+                }
+            }
+            self.drag = Drag::None;
+        }
+
+        let close_hit = |p: Pos2| {
+            close_boxes
+                .iter()
+                .find(|(_, r)| r.contains(p))
+                .map(|(id, _)| *id)
+        };
+
+        // Hover cursor hints.
+        if matches!(self.drag, Drag::None)
+            && let Some(p) = resp.hover_pos()
+        {
+            if carrier_hit.is_some() || close_hit(p).is_some() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            } else {
+                match hit_vfo(p) {
+                    Some((_, true)) => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),
+                    Some((_, false)) => ui.ctx().set_cursor_icon(CursorIcon::Grab),
+                    None => {}
+                }
+            }
+        }
+
+        if resp.clicked()
+            && let Some(p) = resp.interact_pointer_pos()
+        {
+            if let Some(id) = close_hit(p) {
+                // The ✕ on a VFO's label.
+                actions.push(Action::Remove(id));
+            } else if let Some(i) = carrier_hit {
+                let c = inp.front.carriers[i];
+                // A narrow line gets room for a slow carrier and its drift;
+                // either way the VFO stops short of the next carrier.
+                let want = if c.narrow {
+                    c.suggested_vfo_bandwidth().max(bin_hz * 8.0)
+                } else {
+                    c.suggested_vfo_bandwidth()
+                };
+                let bw = c.fit_among(want, &inp.front.carriers);
+                let mut s = VfoSettings::new(
+                    inp.next_name.clone(),
+                    c.center_hz,
+                    bw.max(min_vfo),
+                    inp.new_decoder,
+                );
+                s.record_dir = default_record_dir();
+                actions.push(Action::Create(s));
+            } else if let Some((id, _)) = hit_vfo(p) {
+                actions.push(Action::Select(Some(id)));
+            } else if let Some(sel) = inp.selected.and_then(find) {
+                // Tune the selected VFO here.
+                let mut s = sel.settings.clone();
+                s.offset_hz = hz_of(p.x);
+                actions.push(Action::Update(sel.id, s));
+            } else {
+                actions.push(Action::Select(None));
+            }
+        }
+
+        if resp.double_clicked()
+            && let Some(p) = resp.interact_pointer_pos()
+            && hit_vfo(p).is_none()
+            && carrier_hit.is_none()
+        {
+            let bw = ((hi - lo) / 25.0).max(min_vfo);
+            let mut s = VfoSettings::new(inp.next_name.clone(), hz_of(p.x), bw, inp.new_decoder);
+            s.record_dir = default_record_dir();
+            actions.push(Action::Create(s));
+        }
+
+        if resp.hovered()
+            && ui.input(|i| i.key_pressed(egui::Key::Delete))
+            && let Some(id) = inp.selected
+        {
+            actions.push(Action::Remove(id));
+        }
+
+        actions
+    }
+
+    fn clamp_view(&mut self) {
+        let half = self.span / 2.0;
+        let w = (self.hi - self.lo).min(self.span);
+        if self.lo < -half {
+            self.lo = -half;
+            self.hi = -half + w;
+        }
+        if self.hi > half {
+            self.hi = half;
+            self.lo = half - w;
+        }
+    }
+}
+
+/// Where a new VFO writes its output: the folder chosen with the toolbar's
+/// output-folder button, else Documents\DecSAT.
+pub fn default_record_dir() -> std::path::PathBuf {
+    crate::prefs::output_dir()
+}

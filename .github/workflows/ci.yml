@@ -20,7 +20,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      # libopus (third_party/opus) is a submodule, built by decdvb-opus-sys.
+      # libopus (third_party/opus) is a submodule, built by decsat-opus-sys.
       - uses: actions/checkout@v5
         with:
           submodules: recursive
@@ -47,7 +47,7 @@ jobs:
       # The HackRF front end is feature-gated and loads libhackrf at run time,
       # so it must still compile on a runner with no SDR SDK installed.
       - name: Build with the hackrf feature
-        run: cargo build -p decdvb-cli --features hackrf
+        run: cargo build -p decsat-cli --features hackrf
 
   clippy:
     runs-on: ubuntu-latest

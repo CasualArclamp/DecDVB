@@ -1,0 +1,31 @@
+[package]
+name = "decsat-cli"
+description = "DecSAT command line: analyse, decode and modulate DVB-S2/S2X"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "decsat"
+path = "src/main.rs"
+
+[features]
+# The HackRF driver is pure Rust (no SDK, no DLLs), so it is on by default.
+default = ["hackrf"]
+hackrf = ["decsat-io/hackrf"]
+
+[dependencies]
+decsat-core = { path = "../../crates/decsat-core" }
+decsat-io = { path = "../../crates/decsat-io" }
+decsat-dsp = { path = "../../crates/decsat-dsp" }
+decsat-engine = { path = "../../crates/decsat-engine" }
+decsat-mod = { path = "../../crates/decsat-mod" }
+decsat-modem = { path = "../../crates/decsat-modem" }
+decsat-gse = { path = "../../crates/decsat-gse" }
+decsat-ip = { path = "../../crates/decsat-ip" }
+decsat-ts = { path = "../../crates/decsat-ts" }
+decsat-audio = { path = "../../crates/decsat-audio" }
+anyhow.workspace = true
+clap = { version = "4.6", features = ["derive"] }

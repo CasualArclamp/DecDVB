@@ -1,4 +1,4 @@
-# DecDVB — working notes
+# DecSAT — working notes
 
 Read [`docs/DESIGN.md`](docs/DESIGN.md) first: it holds the agreed scope,
 the crate layout and the milestone plan. Update it when a decision changes.
@@ -9,17 +9,17 @@ the crate layout and the milestone plan. Update it when a decision changes.
 cargo check --workspace --all-targets   # fast feedback
 cargo test --workspace                  # unit tests
 cargo clippy --workspace --all-targets -- -D warnings
-cargo run --release -p decdvb-gui       # the GUI
-cargo run --release -p decdvb-cli -- modcods
+cargo run --release -p decsat-gui       # the GUI
+cargo run --release -p decsat-cli -- modcods
 ```
 
 libopus (Opus radio) is the `third_party/opus` submodule (tag v1.6.1), built
-by `decdvb-opus-sys` with CMake, as in DecDRM; libxaac (AAC with SBR/PS,
+by `decsat-opus-sys` with CMake, as in DecDRM; libxaac (AAC with SBR/PS,
 Apache-2.0) is `third_party/libxaac` (v0.1.13), its decoder built by
-`decdvb-xaac-sys` with `cc`. Not FDK-AAC: its licence does not mix with the
+`decsat-xaac-sys` with `cc`. Not FDK-AAC: its licence does not mix with the
 GPL. `git submodule update --init` fetches both.
 
-The live HackRF front end is behind `--features hackrf` (on `decdvb-io`, re-exported
+The live HackRF front end is behind `--features hackrf` (on `decsat-io`, re-exported
 by both apps), so a plain build never needs the HackRF SDK and CI stays green.
 
 ## House rules

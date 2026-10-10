@@ -1,0 +1,28 @@
+[package]
+name = "decsat-engine"
+description = "DecSAT receive/transmit orchestration: ACM state, chain wiring, metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decsat-core = { path = "../decsat-core" }
+decsat-io = { path = "../decsat-io" }
+decsat-dsp = { path = "../decsat-dsp" }
+decsat-fec = { path = "../decsat-fec" }
+decsat-frame = { path = "../decsat-frame" }
+decsat-gse = { path = "../decsat-gse" }
+decsat-ts = { path = "../decsat-ts" }
+decsat-ip = { path = "../decsat-ip" }
+decsat-audio = { path = "../decsat-audio" }
+decsat-modem = { path = "../decsat-modem" }
+num-complex.workspace = true
+rustfft.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Test signals: real DVB-S2 PLFRAMEs, pulse-shaped.
+decsat-mod = { path = "../decsat-mod" }

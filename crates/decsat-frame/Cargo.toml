@@ -1,0 +1,13 @@
+[package]
+name = "decsat-frame"
+description = "PL framing: PLHEADER/PLS, pilots, scrambler, BBFRAME/BBHEADER, superframe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decsat-core = { path = "../decsat-core" }
+num-complex.workspace = true
+thiserror.workspace = true

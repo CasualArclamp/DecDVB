@@ -1,0 +1,20 @@
+[package]
+name = "decsat-audio"
+description = "DecSAT in-app audio: depacketise, decode and play multicast radio streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decsat-ip = { path = "../decsat-ip" }
+# Pure-Rust decoders (MPL-2.0, GPL-compatible): MPEG-1/2 layers I-III.
+symphonia-core = "0.6.1"
+symphonia-bundle-mp3 = "0.6.1"
+# AAC with SBR and PS: libxaac (Apache-2.0), vendored as the third_party/libxaac submodule.
+decsat-xaac-sys = { path = "../decsat-xaac-sys" }
+# Opus: libopus (BSD), vendored as the third_party/opus submodule and built by CMake.
+decsat-opus-sys = { path = "../decsat-opus-sys" }
+# Sound output: WASAPI on Windows, ALSA on Linux (needs libasound2-dev to build).
+cpal = "0.18.2"

@@ -584,37 +584,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
-name = "decdvb-audio"
+name = "decsat-audio"
 version = "0.7.0"
 dependencies = [
  "cpal",
- "decdvb-ip",
- "decdvb-opus-sys",
- "decdvb-xaac-sys",
+ "decsat-ip",
+ "decsat-opus-sys",
+ "decsat-xaac-sys",
  "symphonia-bundle-mp3",
  "symphonia-core",
 ]
 
 [[package]]
-name = "decdvb-cli"
+name = "decsat-cli"
 version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
- "decdvb-audio",
- "decdvb-core",
- "decdvb-dsp",
- "decdvb-engine",
- "decdvb-gse",
- "decdvb-io",
- "decdvb-ip",
- "decdvb-mod",
- "decdvb-modem",
- "decdvb-ts",
+ "decsat-audio",
+ "decsat-core",
+ "decsat-dsp",
+ "decsat-engine",
+ "decsat-gse",
+ "decsat-io",
+ "decsat-ip",
+ "decsat-mod",
+ "decsat-modem",
+ "decsat-ts",
 ]
 
 [[package]]
-name = "decdvb-core"
+name = "decsat-core"
 version = "0.7.0"
 dependencies = [
  "num-complex",
@@ -622,29 +622,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "decdvb-dsp"
+name = "decsat-dsp"
 version = "0.7.0"
 dependencies = [
- "decdvb-core",
+ "decsat-core",
  "num-complex",
  "thiserror 2.0.21",
 ]
 
 [[package]]
-name = "decdvb-engine"
+name = "decsat-engine"
 version = "0.7.0"
 dependencies = [
- "decdvb-audio",
- "decdvb-core",
- "decdvb-dsp",
- "decdvb-fec",
- "decdvb-frame",
- "decdvb-gse",
- "decdvb-io",
- "decdvb-ip",
- "decdvb-mod",
- "decdvb-modem",
- "decdvb-ts",
+ "decsat-audio",
+ "decsat-core",
+ "decsat-dsp",
+ "decsat-fec",
+ "decsat-frame",
+ "decsat-gse",
+ "decsat-io",
+ "decsat-ip",
+ "decsat-mod",
+ "decsat-modem",
+ "decsat-ts",
  "num-complex",
  "rustfft",
  "thiserror 2.0.21",
@@ -652,44 +652,44 @@ dependencies = [
 ]
 
 [[package]]
-name = "decdvb-fec"
+name = "decsat-fec"
 version = "0.7.0"
 dependencies = [
- "decdvb-core",
+ "decsat-core",
  "num-complex",
  "thiserror 2.0.21",
 ]
 
 [[package]]
-name = "decdvb-frame"
+name = "decsat-frame"
 version = "0.7.0"
 dependencies = [
- "decdvb-core",
+ "decsat-core",
  "num-complex",
  "thiserror 2.0.21",
 ]
 
 [[package]]
-name = "decdvb-gse"
+name = "decsat-gse"
 version = "0.7.0"
 dependencies = [
- "decdvb-core",
- "decdvb-ip",
+ "decsat-core",
+ "decsat-ip",
  "thiserror 2.0.21",
 ]
 
 [[package]]
-name = "decdvb-gui"
+name = "decsat-gui"
 version = "0.7.0"
 dependencies = [
  "anyhow",
- "decdvb-audio",
- "decdvb-core",
- "decdvb-engine",
- "decdvb-gse",
- "decdvb-io",
- "decdvb-ip",
- "decdvb-ts",
+ "decsat-audio",
+ "decsat-core",
+ "decsat-engine",
+ "decsat-gse",
+ "decsat-io",
+ "decsat-ip",
+ "decsat-ts",
  "eframe",
  "egui_plot",
  "image",
@@ -698,10 +698,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "decdvb-io"
+name = "decsat-io"
 version = "0.7.0"
 dependencies = [
- "decdvb-core",
+ "decsat-core",
  "num-complex",
  "seify-hackrfone",
  "thiserror 2.0.21",
@@ -709,55 +709,55 @@ dependencies = [
 ]
 
 [[package]]
-name = "decdvb-ip"
+name = "decsat-ip"
 version = "0.7.0"
 dependencies = [
- "decdvb-core",
+ "decsat-core",
  "thiserror 2.0.21",
 ]
 
 [[package]]
-name = "decdvb-mod"
+name = "decsat-mod"
 version = "0.7.0"
 dependencies = [
- "decdvb-core",
- "decdvb-dsp",
- "decdvb-fec",
- "decdvb-frame",
- "decdvb-gse",
- "decdvb-ip",
- "decdvb-ts",
+ "decsat-core",
+ "decsat-dsp",
+ "decsat-fec",
+ "decsat-frame",
+ "decsat-gse",
+ "decsat-ip",
+ "decsat-ts",
  "num-complex",
  "thiserror 2.0.21",
 ]
 
 [[package]]
-name = "decdvb-modem"
+name = "decsat-modem"
 version = "0.7.0"
 dependencies = [
- "decdvb-core",
+ "decsat-core",
  "rustfft",
 ]
 
 [[package]]
-name = "decdvb-opus-sys"
+name = "decsat-opus-sys"
 version = "0.7.0"
 dependencies = [
  "cmake",
 ]
 
 [[package]]
-name = "decdvb-ts"
+name = "decsat-ts"
 version = "0.7.0"
 dependencies = [
- "decdvb-core",
- "decdvb-frame",
- "decdvb-ip",
+ "decsat-core",
+ "decsat-frame",
+ "decsat-ip",
  "thiserror 2.0.21",
 ]
 
 [[package]]
-name = "decdvb-xaac-sys"
+name = "decsat-xaac-sys"
 version = "0.7.0"
 dependencies = [
  "cc",

@@ -1,0 +1,22 @@
+[package]
+name = "decsat-io"
+description = "DecSAT I/O: IQ file replay/record and the HackRF front end"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Live HackRF One front end, in pure Rust over USB (nusb): no libhackrf, no
+# libusb, no DLLs — the portable exe stays a single file. On Windows the HackRF
+# must use the WinUSB driver (Zadig, or the in-box winusb.inf).
+hackrf = ["dep:seify-hackrfone"]
+
+[dependencies]
+decsat-core = { path = "../decsat-core" }
+num-complex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+seify-hackrfone = { version = "0.2.2", optional = true }

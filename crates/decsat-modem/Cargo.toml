@@ -1,0 +1,12 @@
+[package]
+name = "decsat-modem"
+description = "DecSAT satellite modem formats: DVB-S (EN 300 421) and the Intelsat / turbo-code family"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decsat-core = { path = "../decsat-core" }
+rustfft.workspace = true

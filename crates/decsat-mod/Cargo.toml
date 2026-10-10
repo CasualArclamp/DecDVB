@@ -1,0 +1,19 @@
+[package]
+name = "decsat-mod"
+description = "Modulator (TX): PLFRAMEs to IQ, for loopback and ACM test signals"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decsat-core = { path = "../decsat-core" }
+decsat-dsp = { path = "../decsat-dsp" }
+decsat-fec = { path = "../decsat-fec" }
+decsat-frame = { path = "../decsat-frame" }
+decsat-gse = { path = "../decsat-gse" }
+decsat-ip = { path = "../decsat-ip" }
+decsat-ts = { path = "../decsat-ts" }
+num-complex.workspace = true
+thiserror.workspace = true

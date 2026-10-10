@@ -1,0 +1,42 @@
+[package]
+name = "decsat-gui"
+description = "DecSAT desktop GUI (egui): DVB-S2/S2X receiver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# eframe/egui 0.36 and egui_plot 0.37 need Rust 1.95, so the GUI cannot keep the
+# workspace MSRV (1.88) that the library crates and the CLI use.
+rust-version = "1.95"
+
+[[bin]]
+name = "decsat-gui"
+path = "src/main.rs"
+
+[features]
+# The HackRF driver is pure Rust (no SDK, no DLLs), so it is on by default.
+default = ["hackrf"]
+hackrf = ["decsat-io/hackrf"]
+
+[dependencies]
+decsat-core = { path = "../../crates/decsat-core" }
+decsat-gse = { path = "../../crates/decsat-gse" }
+decsat-ip = { path = "../../crates/decsat-ip" }
+decsat-ts = { path = "../../crates/decsat-ts" }
+decsat-io = { path = "../../crates/decsat-io" }
+decsat-engine = { path = "../../crates/decsat-engine" }
+decsat-audio = { path = "../../crates/decsat-audio" }
+anyhow.workspace = true
+# The glow (OpenGL) renderer instead of eframe's default wgpu: plenty for 2-D
+# plots and a much smaller build. "x11"/"wayland" only matter on Linux.
+eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+egui_plot = "0.37.0"
+# Native file dialogs (Win32 on Windows, XDG desktop portal on Linux).
+rfd = "0.17.2"
+# PNG output for --screenshot (documentation and smoke tests).
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+# eframe's defaults turn on winit's defaults; with eframe's defaults off we
+# re-enable them here (Linux only), so building needs no X11/Wayland dev packages.
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = "0.30.13"

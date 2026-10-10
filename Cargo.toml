@@ -26,7 +26,7 @@ opt-level = 3
 
 # The LDPC decoder's inner loops only vectorise when optimised; at opt-level 1
 # a single normal frame takes seconds and the FEC tests crawl.
-[profile.dev.package.decdvb-fec]
+[profile.dev.package.decsat-fec]
 opt-level = 3
 
 [profile.release]
