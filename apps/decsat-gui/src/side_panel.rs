@@ -11,7 +11,9 @@ use decsat_gse::{Source, Variant};
 use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, Ui, vec2};
 use egui_plot::{Line, Plot, PlotPoints, Points};
 
-use crate::band_view::{Action, UiVfo, badge, default_record_dir, paint_x, vfo_color};
+use crate::band_view::{
+    Action, UiVfo, badge, default_record_dir, paint_x, vfo_color, voice_active,
+};
 use crate::format;
 use crate::player::{self, Player};
 
@@ -82,7 +84,10 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
         let sel = Some(v.id) == inp.selected;
         let st = inp.statuses.get(&v.id);
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
-        let bg = if sel {
+        let speaking = v.settings.enabled && voice_active(st);
+        let bg = if speaking {
+            Color32::from_rgba_unmultiplied(90, 235, 120, 40)
+        } else if sel {
             ui.visuals().selection.bg_fill.gamma_multiply(0.5)
         } else if resp.hovered() {
             ui.visuals().widgets.hovered.weak_bg_fill
@@ -95,7 +100,8 @@ pub fn show(ui: &mut Ui, inp: &SideInput, new_decoder: &mut DecoderKind) -> Vec<
             .rect_filled(sw, CornerRadius::same(2), vfo_color(v.id));
         let load = st.map(|s| s.load).unwrap_or(0.0);
         let text = format!(
-            "{}  {}  {}",
+            "{}{}  {}  {}",
+            if speaking { "🔊 " } else { "" },
             v.settings.name,
             v.settings.decoder.short(),
             badge(&v.settings, st)

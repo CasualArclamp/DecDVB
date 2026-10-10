@@ -1623,3 +1623,12 @@ VHF radio" each) are not the first carrier's format: no D&I++ header
 (scrambled or not), no E1 FAS, no HDLC; unscrambled, idling on a repeating
 8-bit pattern (00000110 or 00000101) with bursts (VFO_4 busy, VFO_3 a third
 of the time, VFO_5 idle throughout). Their framing is still to be found.
+
+## DecSAT; speaking carriers light up (2026-10-10)
+
+Renamed DecSAT (crates, binaries, prefs with DecDVB's carried over; the
+GitHub repository is CasualArclamp/DecSAT, the old name forwarding). A VFO
+whose carrier has voice active — G.728 speech in an E1/D&I timeslot, or a
+TDM call talking (`band_view::voice_active`) — is drawn green with 🔊 in
+the waterfall and the VFO list. Checked on the CDM-600L recording (an
+unattended screenshot, TPC decoder so nothing plays).

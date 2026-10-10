@@ -58,7 +58,7 @@ impl Options {
                     let v = v.to_str().unwrap_or_default().to_ascii_lowercase();
                     o.decoder = Some(
                         decoder_by_name(&v)
-                            .ok_or("--decoder takes id, ip, ts, dvbs, tpc, psk, rec or spec")?,
+                            .ok_or("--decoder takes id, ip, ts, dvbs, tpc, cdm600, fastlink, viterbi, cid, psk, rec or spec")?,
                     );
                 }
                 Some("--select") => {
@@ -99,6 +99,7 @@ fn decoder_by_name(name: &str) -> Option<decsat_engine::DecoderKind> {
         "ts" => Dvbs2Ts,
         "dvbs" => DvbsTs,
         "tpc" | "tpc2964" => Tpc2964,
+        "cdm600" | "cdm600-voice" | "cdm" => Cdm600Voice,
         "fastlink" | "fl" => FastLink,
         "viterbi" | "vit" => Viterbi,
         "cid" | "carrier-id" => CarrierId,

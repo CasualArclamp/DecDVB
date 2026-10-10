@@ -222,7 +222,8 @@ it would be loud digital noise), and so does any timeslot not yet judged.
 
 When those bits carry **G.728** (LD-CELP, 16 kbit/s: a 10-bit codeword every
 five samples), the card says **G.728 speech** and ▶/● play and record it
-decoded. The voice equipment behind a CDM-600L seen on Horizons 3e sends it
+decoded; while someone speaks, the VFO lights up green with 🔊 in the
+waterfall and the VFO list. The voice equipment behind a CDM-600L seen on Horizons 3e sends it
 in bits 2–3 of its timeslot, framed G.728's own way (§3.11): the shape
 index's top bit carries a sync bit, once every 20 ms different, which the
 decoder locks to; its silence fill is muted. The decoder is written from

@@ -109,6 +109,23 @@ pub fn vfo_color(id: VfoId) -> Color32 {
     C[(id as usize).wrapping_sub(1) % C.len()]
 }
 
+/// Someone is speaking on this VFO's carrier now: G.728 speech in an E1 or
+/// D&I timeslot, or a TDM call's voice talking.
+pub fn voice_active(st: Option<&VfoStatus>) -> bool {
+    let Some(f) = st.and_then(|st| st.fec.as_ref()) else {
+        return false;
+    };
+    f.e1.as_ref()
+        .is_some_and(|e| e.voice.iter().flatten().any(|&(_, talking)| talking))
+        || f.tdm
+            .as_ref()
+            .and_then(|t| t.voice)
+            .is_some_and(|v| v.talking)
+}
+
+/// The colour a VFO lights up in while voice is active on it.
+const SPEECH: Color32 = Color32::from_rgb(90, 235, 120);
+
 /// A short status badge for a VFO's label.
 pub fn badge(s: &VfoSettings, st: Option<&VfoStatus>) -> String {
     let Some(st) = st else { return "…".into() };
@@ -480,8 +497,12 @@ impl BandView {
                 continue;
             }
             let sel = Some(v.id) == inp.selected;
-            let c = vfo_color(v.id);
-            let a = if !s.enabled {
+            // Voice active: the whole VFO lights up green.
+            let speaking = s.enabled && voice_active(inp.statuses.get(&v.id));
+            let c = if speaking { SPEECH } else { vfo_color(v.id) };
+            let a = if speaking {
+                70
+            } else if !s.enabled {
                 14
             } else if sel {
                 46
@@ -498,8 +519,14 @@ impl BandView {
                 Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a),
             );
             let edge = Stroke::new(
-                if sel { 2.0 } else { 1.0 },
-                c.gamma_multiply(if sel { 1.0 } else { 0.7 }),
+                if speaking {
+                    2.5
+                } else if sel {
+                    2.0
+                } else {
+                    1.0
+                },
+                c.gamma_multiply(if sel || speaking { 1.0 } else { 0.7 }),
             );
             painter.line_segment([pos2(x0, rect.top()), pos2(x0, rect.bottom())], edge);
             painter.line_segment([pos2(x1, rect.top()), pos2(x1, rect.bottom())], edge);
@@ -511,7 +538,8 @@ impl BandView {
 
             // Label pill at the top of the spectrum.
             let label = format!(
-                "{} · {} · {}",
+                "{}{} · {} · {}",
+                if speaking { "🔊 " } else { "" },
                 s.name,
                 s.decoder.short(),
                 badge(s, inp.statuses.get(&v.id))
@@ -525,7 +553,7 @@ impl BandView {
             painter.rect_filled(
                 lr,
                 CornerRadius::same(4),
-                c.gamma_multiply(if sel { 1.0 } else { 0.8 }),
+                c.gamma_multiply(if sel || speaking { 1.0 } else { 0.8 }),
             );
             painter.galley(
                 lr.left_top() + vec2(5.0, (17.0 - galley.size().y) / 2.0),
