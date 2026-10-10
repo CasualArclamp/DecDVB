@@ -205,10 +205,12 @@ impl Engine {
         }
     }
 
+    /// Delete a VFO. Returns at once: its threads stop after the block in
+    /// hand and are joined in the background.
     pub fn remove_vfo(&self, id: VfoId) {
         let h = self.shared.vfos.lock().unwrap().remove(&id);
         if let Some(h) = h {
-            h.stop();
+            h.discard();
         }
     }
 

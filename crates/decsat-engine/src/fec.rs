@@ -1155,6 +1155,8 @@ pub(crate) struct FecWorker {
     /// A frame was dropped since the thread last looked: streams that span
     /// frames (TS) must start over.
     gap: Arc<AtomicBool>,
+    /// Set to stop without working through the queue.
+    quit: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     lossless: bool,
 }
@@ -1166,19 +1168,27 @@ impl FecWorker {
         let stats = Arc::new(Mutex::new(FecStats::default()));
         let output = Arc::new(Mutex::new(output));
         let gap = Arc::new(AtomicBool::new(false));
-        let (s, o, g) = (stats.clone(), output.clone(), gap.clone());
+        let quit = Arc::new(AtomicBool::new(false));
+        let (s, o, g, q) = (stats.clone(), output.clone(), gap.clone(), quit.clone());
         let join = std::thread::Builder::new()
             .name("decsat-fec".into())
-            .spawn(move || run(rx, s, o, g, symbol_rate))
+            .spawn(move || run(rx, s, o, g, q, symbol_rate))
             .expect("spawn FEC thread");
         FecWorker {
             tx: Some(tx),
             stats,
             output,
             gap,
+            quit,
             join: Some(join),
             lossless: false,
         }
+    }
+
+    /// Have the thread stop after what it is doing now, leaving the rest
+    /// of its queue (a VFO deleted: nobody wants the rest).
+    pub fn quit(&self) {
+        self.quit.store(true, Ordering::Relaxed);
     }
 
     /// Wait for the thread instead of dropping input when it is behind (a
@@ -1941,6 +1951,7 @@ fn run(
     stats: Arc<Mutex<FecStats>>,
     output: Arc<Mutex<FecOutput>>,
     gap: Arc<AtomicBool>,
+    quit: Arc<AtomicBool>,
     symbol_rate: f64,
 ) {
     let mut dec = FecDecoder::new();
@@ -1964,6 +1975,9 @@ fn run(
     let mut tpc_text: Option<decsat_modem::text::TextFinder> = None;
     let mut e1: Option<E1Stage> = None;
     while let Ok(input) = rx.recv() {
+        if quit.load(Ordering::Relaxed) {
+            break;
+        }
         let t0 = Instant::now();
         let f = match input {
             FecInput::Frame(f) => f,
@@ -2316,6 +2330,35 @@ mod tests {
     /// A D&I timeslot carrying G.728 (as the CDM-600L's: bits 2–3 of each
     /// octet, codewords inverted, a sync bit 0 once in 32) plays by itself
     /// under the CDM-600 voice preset, and not otherwise.
+    /// A deleted VFO's FEC thread leaves its queue: told to quit, it
+    /// handles nothing more; otherwise it works through what was queued.
+    #[test]
+    fn a_quit_fec_thread_leaves_its_queue() {
+        let mut x = 7u32;
+        let block: Vec<Iq> = (0..4_000)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                Iq::new(
+                    (x >> 16) as f32 / 65_536.0 - 0.5,
+                    (x >> 8 & 0xFF) as f32 / 256.0 - 0.5,
+                )
+            })
+            .collect();
+        for quit in [false, true] {
+            let w = FecWorker::spawn(100e3, FecOutput::default());
+            if quit {
+                w.quit();
+            }
+            for _ in 0..8 {
+                w.offer_tpc(block.clone(), true);
+            }
+            let stats = Arc::clone(&w.stats);
+            drop(w);
+            let s = stats.lock().unwrap();
+            assert_eq!(s.tpc.is_some(), !quit, "quit {quit}");
+        }
+    }
+
     /// A multi-radio site's timeslots in HDLC packets: speech on one
     /// channel, the G.728 silence fill on the other. Both are found as
     /// G.728, and the preset plays them mixed.

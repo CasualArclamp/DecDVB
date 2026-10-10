@@ -62,6 +62,8 @@ pub(crate) struct CidWorker {
     low_snr: Arc<AtomicBool>,
     /// The clock correction, ppm, as an f64's bits (atomics hold integers).
     clock_ppm: Arc<AtomicU64>,
+    /// Set to stop without working through the queue.
+    quit: Arc<AtomicBool>,
 }
 
 impl CidWorker {
@@ -89,6 +91,8 @@ impl CidWorker {
         let low = Arc::clone(&low_snr);
         let clock_ppm = Arc::new(AtomicU64::new(0f64.to_bits()));
         let clock = Arc::clone(&clock_ppm);
+        let quit = Arc::new(AtomicBool::new(false));
+        let q = Arc::clone(&quit);
         let v = view.clone();
         let join = std::thread::Builder::new()
             .name("decsat-cid".into())
@@ -106,6 +110,9 @@ impl CidWorker {
                 let (mut mixed, mut at4, mut frames) = (Vec::new(), Vec::new(), Vec::new());
                 let mut to_chips = rate_for(ppm_now) / in_rate;
                 while let Ok(msg) = rx.recv() {
+                    if q.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let block = match msg {
                         Msg::Block(b) => b,
                         Msg::Gap(n) => {
@@ -142,10 +149,16 @@ impl CidWorker {
             gap: AtomicU64::new(0),
             low_snr,
             clock_ppm,
+            quit,
         }
     }
 
     /// The clock correction, ppm (taken up with the next block).
+    /// Have the thread stop after the block in hand, leaving the rest.
+    pub fn quit(&self) {
+        self.quit.store(true, Ordering::Relaxed);
+    }
+
     pub fn set_clock_ppm(&self, ppm: f64) {
         self.clock_ppm.store(ppm.to_bits(), Ordering::Relaxed);
     }

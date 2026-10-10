@@ -374,6 +374,9 @@ pub(crate) struct VfoHandle {
     /// Latest settings not yet taken by the worker.
     mailbox: Arc<Mutex<Option<VfoSettings>>>,
     stop: Arc<AtomicBool>,
+    /// Stop without working through what is queued (here and on the FEC
+    /// and CID threads).
+    quit: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -403,13 +406,36 @@ impl VfoHandle {
         let _ = self.tx.try_send(VfoMsg::Wake);
     }
 
+    /// Stop the VFO and wait for its threads. A file played losslessly
+    /// has its queues worked through first; anything else (live, real
+    /// time) stops after the block in hand.
     pub fn stop(mut self) {
+        if !self.lossless {
+            self.quit.store(true, Ordering::Relaxed);
+        }
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.tx.try_send(VfoMsg::Wake);
         // Dropping the sender also wakes a worker blocked on an empty queue.
         drop(self.tx);
         if let Some(j) = self.join.take() {
             let _ = j.join();
+        }
+    }
+
+    /// Stop the VFO (a deletion) without waiting: its threads finish the
+    /// block in hand, drop the rest, and are joined on a thread of their
+    /// own, so a decoder deep in a search never holds up the caller.
+    pub fn discard(mut self) {
+        self.quit.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.tx.try_send(VfoMsg::Wake);
+        drop(self.tx);
+        if let Some(j) = self.join.take() {
+            let _ = std::thread::Builder::new()
+                .name("vfo-reaper".into())
+                .spawn(move || {
+                    let _ = j.join();
+                });
         }
     }
 }
@@ -426,12 +452,14 @@ pub(crate) fn spawn(in_rate: f64, settings: VfoSettings, lossless: bool) -> VfoH
     let lost = Arc::new(AtomicU64::new(0));
     let mailbox = Arc::new(Mutex::new(None));
     let stop = Arc::new(AtomicBool::new(false));
+    let quit = Arc::new(AtomicBool::new(false));
     let join = {
         let status = Arc::clone(&status);
         let dropped = Arc::clone(&dropped);
         let lost = Arc::clone(&lost);
         let mailbox = Arc::clone(&mailbox);
         let stop = Arc::clone(&stop);
+        let quit = Arc::clone(&quit);
         let settings = settings.clone();
         std::thread::Builder::new()
             .name(format!("vfo-{}", settings.name))
@@ -439,7 +467,9 @@ pub(crate) fn spawn(in_rate: f64, settings: VfoSettings, lossless: bool) -> VfoH
                 let mut w = Worker::new(in_rate, settings, status, dropped);
                 w.lossless = lossless;
                 w.lost = lost;
-                w.run(rx, mailbox, stop)
+                // `run` takes the worker by value: it is dropped when the
+                // loop ends, which joins its FEC or CID thread.
+                w.run(rx, mailbox, stop, quit)
             })
             .expect("spawning a VFO thread")
     };
@@ -452,6 +482,7 @@ pub(crate) fn spawn(in_rate: f64, settings: VfoSettings, lossless: bool) -> VfoH
         lost,
         mailbox,
         stop,
+        quit,
         join: Some(join),
     }
 }
@@ -596,6 +627,17 @@ const FOLLOW_MIN_HZ: f64 = 5.0;
 const FOLLOW_MIN_RS: f64 = 1e-3;
 
 impl Worker {
+    /// Tell the FEC or CID thread to stop after its current input.
+    fn quit_threads(&self) {
+        match &self.decoder {
+            Decoder::Dvbs2 { fec: Some(f), .. } | Decoder::Modem { fec: Some(f), .. } => f.quit(),
+            Decoder::Cid {
+                worker: Some(w), ..
+            } => w.quit(),
+            _ => {}
+        }
+    }
+
     fn new(
         in_rate: f64,
         settings: VfoSettings,
@@ -793,6 +835,22 @@ impl Worker {
         rx: Receiver<VfoMsg>,
         mailbox: Arc<Mutex<Option<VfoSettings>>>,
         stop: Arc<AtomicBool>,
+        quit: Arc<AtomicBool>,
+    ) {
+        self.run_loop(&rx, &mailbox, &stop);
+        // A deletion: the FEC or CID thread is told to leave its queue, so
+        // the join when `self` is dropped (at the end of this function) is
+        // quick.
+        if quit.load(Ordering::Relaxed) {
+            self.quit_threads();
+        }
+    }
+
+    fn run_loop(
+        &mut self,
+        rx: &Receiver<VfoMsg>,
+        mailbox: &Arc<Mutex<Option<VfoSettings>>>,
+        stop: &Arc<AtomicBool>,
     ) {
         loop {
             // With no input for a while (a file that ended, a paused
