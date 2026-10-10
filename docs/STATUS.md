@@ -1733,3 +1733,26 @@ The whole MAL-BN recording now decodes: re-acquired at 47 999 S/s, rate 1/2,
 channel BER 8e-4. Test: QPSK switching 20 → 16 kBd is followed (and without
 the check stays at 19.8 kS/s, "locked").
 
+## 8PSK read as BPSK; false DVB-S2X on unlocked carriers (2026-10-10)
+
+Rory's `baseband_11662547900Hz_…_comtechs_and_idk.wav` (SDR++, cs16 10 MS/s):
+
+- **8PSK as BPSK** (`3819dcb`): two 711.111 kS/s 8PSK carriers (Rory: Comtech,
+  maybe "tpc_1630") read as BPSK, a 171 kS/s QPSK one too. Their frames
+  (988 symbols = 2964 bits, a 7-symbol word at frame position 151 that
+  flips 180° every frame; ~31 % of the frame repeats sign-flipped) put lines
+  in s² and s⁴ that are not the carrier's, and any s² line meant BPSK. A
+  line now counts only when the next power has one at twice its frequency.
+  The 8PSK frames are not TPC 2964's rows under any Gray mapping, alignment
+  or generator (searched) — layout still unknown.
+- **False DVB-S2X ACM**: two carriers (973 kS/s and 590 kS/s) demodulated
+  unlocked (residual offsets of −261 and −191 kHz) gave header candidates
+  thick and fast — 1 385 in 583 k symbols, 10 489 in 347 k — and one
+  "confirmation" was enough: 23 and 3 285 of them, near the 16 and 1 585
+  chance predicts, over every MODCOD including reserved ones. Real carriers:
+  15 of 16 and 19 of 21 confirm, chance ~0.004. `Dvbs2Info::confirmed` now
+  wants confirmations above 4× the chance expectation (candidates seen² ×
+  5 / symbols); the recurring-spacing hint (proprietary S2) also needs
+  sparse candidates. The test scene's CCM and ACM carriers still read as
+  DVB-S2; the two now read "2-ring amplitude/phase, no DVB-S2 PLHEADER".
+

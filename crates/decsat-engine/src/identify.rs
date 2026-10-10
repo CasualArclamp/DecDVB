@@ -116,9 +116,24 @@ pub struct Dvbs2Info {
     /// such as NovelSat NS3/NS4 (whose manuals describe S2-style headers and
     /// Gold-code scrambling) or a vendor's short frames.
     pub unconfirmed_spacing: Option<usize>,
+    /// Confirmations to expect by chance: headers seen, each with a
+    /// (2·[`GRID_TOLERANCE`] + 1)-symbol window where another would confirm
+    /// it, among this many seen in the symbols looked at.
+    pub chance_confirmations: f64,
 }
 
 impl Dvbs2Info {
+    /// DVB-S2 framing: confirmed headers, and far more of them than chance
+    /// gives. Real headers are sparse (one a frame) and nearly all confirm;
+    /// on an unlocked or noisy carrier, candidates above the threshold come
+    /// thick and fast, and as many land on a predicted spot by chance — on
+    /// a live 590 kS/s carrier, 10 489 candidates in 347 000 symbols gave
+    /// 3 285 "confirmations" spread over every MODCOD, reserved ones too.
+    pub fn confirmed(&self) -> bool {
+        self.headers_confirmed >= 1
+            && self.headers_confirmed as f64 > 4.0 * self.chance_confirmations
+    }
+
     /// True when more than one data MODCOD was seen — ACM or VCM in use.
     pub fn variable_coding(&self) -> bool {
         self.modcods.keys().filter(|&&m| m != 0).count() > 1
@@ -621,8 +636,11 @@ pub fn detect_dvbs2(sym: &[Iq]) -> Dvbs2Info {
         .map(|&(i, _)| i)
         .collect();
 
+    let seen = peaks.len() as f64;
     let mut info = Dvbs2Info {
         headers_seen: peaks.len(),
+        chance_confirmations: seen * seen * (2 * GRID_TOLERANCE + 1) as f64
+            / sym.len().max(1) as f64,
         ..Default::default()
     };
     let mut dec = PlscDecoder::new();
@@ -651,7 +669,9 @@ pub fn detect_dvbs2(sym: &[Iq]) -> Dvbs2Info {
             info.frames.push((i, pls.plsc));
         }
     }
-    if info.headers_confirmed == 0 && peaks.len() >= 3 {
+    // (With candidates dense enough to confirm by chance, spacings recur
+    // by chance too.)
+    if info.headers_confirmed == 0 && peaks.len() >= 3 && info.chance_confirmations < 0.5 {
         // The shortest spacing that recurs (a missed header makes a
         // multiple of it).
         let d: Vec<usize> = peaks.windows(2).map(|w| w[1] - w[0]).collect();
@@ -792,7 +812,7 @@ pub fn identify_in(x: &[Iq], rate: f64, bandwidth: Option<f64>) -> Identificatio
     //    one rather than two halves the listen a slow carrier needs (a normal
     //    QPSK frame lasts 3.3 s at 10 kS/s).
     let s2 = detect_dvbs2(&sym);
-    let is_s2 = s2.headers_confirmed >= 1;
+    let is_s2 = s2.confirmed();
 
     // 7. Carrier lock, so the constellation shows points rather than a ring.
     let lock = lock_carrier(&sym, cst, cfo.map(|hz| hz / rs), is_s2.then_some(&s2));
@@ -1048,6 +1068,48 @@ mod tests {
         let (guess, offset) = classify_constellation(&sym, 1.0);
         assert_eq!(guess, ConstellationGuess::Psk8);
         assert!((offset.unwrap() - df).abs() < 1e-3, "{offset:?}");
+    }
+
+    /// Headers thick on the ground but on no frame grid — as an unlocked or
+    /// noisy carrier's chance correlations are — confirm by chance, many of
+    /// them, every MODCOD; that is not DVB-S2. Real headers, sparse, are.
+    #[test]
+    fn dense_chance_headers_are_not_dvbs2() {
+        let x = PlFramer::new(0, 8).build_schedule(&[FrameSpec::new(4, false, true)], 150_000);
+        let real = detect_dvbs2(&x);
+        assert!(real.confirmed(), "{real:?}");
+        // Its 90-symbol headers, pasted 3 % of the time into random QPSK.
+        let headers: Vec<&[Iq]> = real.frames.iter().map(|&(i, _)| &x[i - 89..=i]).collect();
+        let mut r = 0x51ED_27A1u32;
+        let mut next = move || {
+            r ^= r << 13;
+            r ^= r >> 17;
+            r ^= r << 5;
+            r
+        };
+        let qpsk = |k: u32| {
+            let a = std::f32::consts::FRAC_1_SQRT_2;
+            Iq::new(
+                if k & 1 == 0 { a } else { -a },
+                if k & 2 == 0 { a } else { -a },
+            )
+        };
+        let mut sym = Vec::with_capacity(350_000);
+        while sym.len() < 350_000 {
+            if next() % 1000 < 30 {
+                sym.extend_from_slice(headers[next() as usize % headers.len()]);
+            } else {
+                sym.push(qpsk(next()));
+            }
+        }
+        let fake = detect_dvbs2(&sym);
+        assert!(fake.headers_seen > 1000, "{}", fake.headers_seen);
+        assert!(
+            !fake.confirmed(),
+            "{} confirmed, {:.0} by chance",
+            fake.headers_confirmed,
+            fake.chance_confirmations
+        );
     }
 
     #[test]
