@@ -257,7 +257,13 @@ impl App {
         self.note = if found.is_empty() {
             "No metadata in the file name: check the sample rate and format.".into()
         } else {
-            format!("From the file name: {}.", found.join(", "))
+            let wav = decdvb_io::probe_capture(&path).is_ok_and(|i| i.wav);
+            let from = if wav {
+                "From the WAV header"
+            } else {
+                "From the file name"
+            };
+            format!("{from}: {}.", found.join(", "))
         };
         self.path = Some(path);
         self.restart();
@@ -561,7 +567,8 @@ impl App {
                     .add_filter(
                         "IQ captures",
                         &[
-                            "cs8", "s8", "iq8", "cs16", "s16", "cf32", "fc32", "raw", "bin", "iq",
+                            "wav", "cs8", "s8", "iq8", "cu8", "u8", "cs16", "s16", "cf32", "fc32",
+                            "raw", "bin", "iq",
                         ],
                     )
                     .add_filter("All files", &["*"])
@@ -615,14 +622,21 @@ impl App {
                 .width(64.0)
                 .selected_text(match self.format {
                     SampleFormat::Cs8 => "cs8",
+                    SampleFormat::Cu8 => "cu8",
                     SampleFormat::Cs16 => "cs16",
+                    SampleFormat::Cs24 => "cs24",
                     SampleFormat::Cf32 => "cf32",
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.format, SampleFormat::Cs8, "cs8");
+                    ui.selectable_value(&mut self.format, SampleFormat::Cu8, "cu8")
+                        .on_hover_text("Unsigned 8-bit: RTL-SDR captures");
                     ui.selectable_value(&mut self.format, SampleFormat::Cs16, "cs16");
+                    ui.selectable_value(&mut self.format, SampleFormat::Cs24, "cs24");
                     ui.selectable_value(&mut self.format, SampleFormat::Cf32, "cf32");
-                });
+                })
+                .response
+                .on_hover_text("Sample format of a raw capture (a WAV file's header sets it)");
             // The FFT size applies at once, file or radio, with no restart.
             let fft_before = self.opts.fft_size;
             egui::ComboBox::from_id_salt("fft")

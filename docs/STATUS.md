@@ -1412,3 +1412,18 @@ split, each lane either way), gives a voicing score of at most 0.04 where
 real speech scores 0.57. The units show no sample-to-sample correlation
 either, so they are codec indices or data, not PCM. Still open: the codec,
 or a scrambling of the units.
+
+## WAV IQ import (2026-10-10)
+
+Two-channel WAV files (I left, Q right) open like raw captures, in the GUI
+(Open IQ…, the file dialog lists .wav) and every CLI command: `decdvb-io::wav`
+walks the RIFF (or RF64/BW64, with `ds64` sizes) chunks for `fmt ` — PCM
+8-bit (unsigned, new `SampleFormat::Cu8`, also RTL-SDR's `.cu8`), 16- and
+24-bit (new `Cs24`), IEEE float 32-bit, `WAVE_FORMAT_EXTENSIBLE` included —
+and `data`; the reader starts at the data chunk, stops at its end (trailing
+chunks are not samples) and rewinds to it. SDR#/HDSDR/SDRuno `auxi` chunks
+give the centre frequency (HDSDR-style `…_1635640kHz_…` names otherwise).
+The header wins over flags and name guesses (`probe_capture`,
+`capture_format_rate`). Checked: the 8 MS/s test scene as 16-bit WAV with
+an auxi centre scans to the same carriers and identifications without
+flags, and opens in the GUI at Cs16, 8 MS/s, 1.635640 GHz.

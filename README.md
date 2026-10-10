@@ -38,7 +38,7 @@ TPC 2964 carrier). Every carrier was found and identified blind.*
 | **Generic PSK/APSK/QAM → symbols** (`.bin`, one byte per symbol), BPSK…32APSK and 8/16/64QAM, for non-DVB carriers | ✅ |
 | Narrow carriers: VFOs down to 500 Hz, ~10 kBd SCPC carriers lock | ✅ |
 | IQ recorder and spectrum-only VFOs | ✅ |
-| IQ file replay (`cs8`, `cs16`, `cf32`), rate/centre from file names | ✅ |
+| IQ file replay (`cs8`, `cu8`, `cs16`, `cs24`, `cf32`; two-channel `.wav` from SDR#, HDSDR, SDRuno, SDR++ with format, rate and centre from the header), rate/centre from file names | ✅ |
 | **Live HackRF One**, 2–20 MS/s, pure Rust over USB (no DLLs), LNB LO | ✅ |
 | **LDPC + BCH → BBFRAMEs**: all 21 S2 and 31 S2X codes, BBHEADER, stream info, payload rate | ✅ |
 | **S2X**: 8-bit PLS code, all 55 normal/short MODCODs — 2+4+2 8APSK to 256APSK, the new interleavers | ✅ |

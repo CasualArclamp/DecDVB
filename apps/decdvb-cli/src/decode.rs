@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use decdvb_core::{Modulation, SampleFormat};
 use decdvb_engine::{DecoderKind, Engine, EngineOptions, SourceState, VfoSettings, VfoStatus};
-use decdvb_io::{IqFileReader, IqSource, format_from_path};
+use decdvb_io::{IqFileReader, IqSource};
 
 pub struct DecodeArgs {
     pub file: Option<PathBuf>,
@@ -116,14 +116,7 @@ pub fn decode(a: DecodeArgs) -> Result<()> {
             (src, rate)
         }
         (None, Some(file)) => {
-            let fmt = a
-                .format
-                .or_else(|| format_from_path(file))
-                .context("cannot tell the sample format from the extension — pass --format")?;
-            let rate = a
-                .rate
-                .or_else(|| crate::rate_from_name(file))
-                .context("cannot tell the sample rate from the file name — pass --rate")?;
+            let (fmt, rate) = crate::capture_format_rate(file, a.format, a.rate)?;
             let reader = IqFileReader::open(file, fmt, rate, 1 << 16)
                 .with_context(|| format!("opening {}", file.display()))?;
             println!("decoding {} at {:.3} MS/s", reader.describe(), rate / 1e6);

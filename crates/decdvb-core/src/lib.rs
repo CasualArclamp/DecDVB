@@ -60,8 +60,13 @@ impl RollOff {
 pub enum SampleFormat {
     /// Signed 8-bit I, 8-bit Q — the HackRF's native format.
     Cs8,
+    /// Unsigned 8-bit I/Q, offset 128 — the RTL-SDR's native format, and
+    /// 8-bit WAV.
+    Cu8,
     /// Signed 16-bit I/Q (little-endian).
     Cs16,
+    /// Signed 24-bit I/Q (little-endian, packed) — 24-bit WAV.
+    Cs24,
     /// 32-bit float I/Q.
     Cf32,
 }
@@ -70,8 +75,9 @@ impl SampleFormat {
     /// Bytes per complex sample.
     pub const fn bytes_per_sample(self) -> usize {
         match self {
-            SampleFormat::Cs8 => 2,
+            SampleFormat::Cs8 | SampleFormat::Cu8 => 2,
             SampleFormat::Cs16 => 4,
+            SampleFormat::Cs24 => 6,
             SampleFormat::Cf32 => 8,
         }
     }
@@ -155,12 +161,30 @@ pub fn bytes_to_iq(bytes: &[u8], fmt: SampleFormat, out: &mut Vec<Iq>) {
                 out.push(Iq::new(i, q));
             }
         }
+        SampleFormat::Cu8 => {
+            let (chunks, _rest) = bytes.as_chunks::<2>();
+            for ch in chunks {
+                let i = (ch[0] as f32 - 127.5) / 128.0;
+                let q = (ch[1] as f32 - 127.5) / 128.0;
+                out.push(Iq::new(i, q));
+            }
+        }
         SampleFormat::Cs16 => {
             let (chunks, _rest) = bytes.as_chunks::<4>();
             for ch in chunks {
                 let i = i16::from_le_bytes([ch[0], ch[1]]) as f32 / 32768.0;
                 let q = i16::from_le_bytes([ch[2], ch[3]]) as f32 / 32768.0;
                 out.push(Iq::new(i, q));
+            }
+        }
+        SampleFormat::Cs24 => {
+            // Each 24-bit value placed in the top of an i32, then scaled: the
+            // shift keeps the sign.
+            let s24 =
+                |b: &[u8]| (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 / 8_388_608.0;
+            let (chunks, _rest) = bytes.as_chunks::<6>();
+            for ch in chunks {
+                out.push(Iq::new(s24(&ch[0..3]), s24(&ch[3..6])));
             }
         }
         SampleFormat::Cf32 => {
@@ -188,6 +212,17 @@ mod tests {
         assert!((out[1].re - 127.0 / 128.0).abs() < 1e-6);
         // 0x80 = -128
         assert!((out[2].re + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unsigned_8_and_24_bit_samples() {
+        let mut out = Vec::new();
+        bytes_to_iq(&[128, 127, 255, 0], SampleFormat::Cu8, &mut out);
+        assert!(out[0].re.abs() < 0.01 && out[0].im.abs() < 0.01);
+        assert!((out[1].re - 1.0).abs() < 0.01 && (out[1].im + 1.0).abs() < 0.01);
+        // 24-bit: 0x400000 = +0.5, 0xC00000 = -0.5
+        bytes_to_iq(&[0, 0, 0x40, 0, 0, 0xC0], SampleFormat::Cs24, &mut out);
+        assert_eq!(out, vec![Iq::new(0.5, -0.5)]);
     }
 
     #[test]

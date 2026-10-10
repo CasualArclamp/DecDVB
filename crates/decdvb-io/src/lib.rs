@@ -5,11 +5,13 @@
 //! the live HackRF One. Recording goes out through [`IqFileWriter`].
 
 pub mod file;
+pub mod wav;
 
 #[cfg(feature = "hackrf")]
 pub mod hackrf;
 
 pub use file::{IqFileReader, IqFileWriter, format_from_path};
+pub use wav::{CaptureInfo, WavIq, probe_capture};
 
 #[cfg(feature = "hackrf")]
 pub use hackrf::{HackRfControl, HackRfGains, HackRfSettings, HackRfSource};

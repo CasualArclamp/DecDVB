@@ -37,10 +37,12 @@ enum Command {
     Analyse {
         /// IQ capture to read.
         file: PathBuf,
-        /// Sample format; inferred from the extension when omitted.
+        /// Sample format; inferred from the extension (or a WAV header)
+        /// when omitted.
         #[arg(long, value_parser = parse_format)]
         format: Option<SampleFormat>,
-        /// Sample rate in samples/s (e.g. 2e6 or 2000000).
+        /// Sample rate in samples/s (e.g. 2e6 or 2000000); a WAV header's
+        /// wins.
         #[arg(long, default_value_t = 2_000_000.0)]
         rate: f64,
         /// Stop after this many blocks (0 = whole file).
@@ -190,10 +192,37 @@ enum Command {
 fn parse_format(s: &str) -> std::result::Result<SampleFormat, String> {
     match s.to_ascii_lowercase().as_str() {
         "cs8" | "s8" | "i8" => Ok(SampleFormat::Cs8),
+        "cu8" | "u8" => Ok(SampleFormat::Cu8),
         "cs16" | "s16" => Ok(SampleFormat::Cs16),
+        "cs24" | "s24" => Ok(SampleFormat::Cs24),
         "cf32" | "fc32" | "f32" => Ok(SampleFormat::Cf32),
-        other => Err(format!("unknown format `{other}` (want cs8, cs16 or cf32)")),
+        other => Err(format!(
+            "unknown format `{other}` (want cs8, cu8, cs16, cs24 or cf32)"
+        )),
     }
+}
+
+/// A capture's sample format and rate: from its WAV header if it is a WAV
+/// file (which then wins over the flags), else from the flags, the
+/// extension and the file name.
+pub(crate) fn capture_format_rate(
+    file: &std::path::Path,
+    format: Option<SampleFormat>,
+    rate: Option<f64>,
+) -> Result<(SampleFormat, f64)> {
+    let info =
+        decdvb_io::probe_capture(file).with_context(|| format!("reading {}", file.display()))?;
+    if info.wav {
+        // `probe_capture` fills both from the header.
+        return Ok((info.format.unwrap(), info.sample_rate.unwrap()));
+    }
+    let fmt = format
+        .or(info.format)
+        .context("cannot tell the sample format from the extension — pass --format")?;
+    let rate = rate
+        .or_else(|| rate_from_name(file))
+        .context("cannot tell the sample rate from the file name — pass --rate")?;
+    Ok((fmt, rate))
 }
 
 fn main() -> Result<()> {
@@ -331,12 +360,7 @@ fn scan(
     use decdvb_engine::{DecoderKind, Engine, EngineOptions, VfoSettings};
     use std::time::{Duration, Instant};
 
-    let fmt = format
-        .or_else(|| format_from_path(&file))
-        .context("cannot tell the sample format from the extension — pass --format")?;
-    let rate = rate
-        .or_else(|| rate_from_name(&file))
-        .context("cannot tell the sample rate from the file name — pass --rate")?;
+    let (fmt, rate) = capture_format_rate(&file, format, rate)?;
     let reader = IqFileReader::open(&file, fmt, rate, 1 << 16)
         .with_context(|| format!("opening {}", file.display()))?;
     println!("scanning {} at {:.3} MS/s", reader.describe(), rate / 1e6);
@@ -596,13 +620,8 @@ fn modcods() -> Result<()> {
 }
 
 fn analyse(file: PathBuf, format: Option<SampleFormat>, rate: f64, blocks: usize) -> Result<()> {
-    let fmt = match format.or_else(|| format_from_path(&file)) {
-        Some(f) => f,
-        None => bail!(
-            "cannot tell the sample format of {} from its extension — pass --format cs8|cs16|cf32",
-            file.display()
-        ),
-    };
+    // A WAV file's header gives both; otherwise the flags or the extension.
+    let (fmt, rate) = capture_format_rate(&file, format, Some(rate))?;
 
     const FFT: usize = 4096;
     let reader = IqFileReader::open(&file, fmt, rate, FFT * 16)

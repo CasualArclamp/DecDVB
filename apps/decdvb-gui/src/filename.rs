@@ -1,4 +1,5 @@
-//! Guess a capture's sample rate, centre frequency and format from its name.
+//! Guess a capture's sample rate, centre frequency and format from its name
+//! — or, for a two-channel WAV file, read them from its header.
 //!
 //! Raw IQ files carry no metadata, but most tools encode it in the file name:
 //! - gqrx: `gqrx_20261008_120000_10489750000_2000000_fc.raw` (freq, rate, cf32)
@@ -33,6 +34,20 @@ fn number_with_prefix(s: &str) -> Option<f64> {
 }
 
 pub fn guess(path: &Path) -> Guess {
+    let named = guess_from_name(path);
+    // A WAV header is authoritative for format and rate, and for the centre
+    // when it has an auxi chunk; HDSDR-style names give the centre otherwise.
+    match decdvb_io::probe_capture(path) {
+        Ok(info) if info.wav => Guess {
+            rate: info.sample_rate,
+            center: info.center_freq.or(named.center),
+            format: info.format,
+        },
+        _ => named,
+    }
+}
+
+fn guess_from_name(path: &Path) -> Guess {
     let mut g = Guess {
         format: decdvb_io::format_from_path(path),
         ..Guess::default()
@@ -112,6 +127,14 @@ mod tests {
         ));
         assert_eq!(g.rate, Some(333_333.0));
         assert_eq!(g.center, None);
+    }
+
+    #[test]
+    fn hdsdr_wav_names_give_the_centre() {
+        // HDSDR: HDSDR_<date>_<time>Z_<freq>kHz_RF.wav (the file need not
+        // exist: the name alone is read when there is no header).
+        let g = guess(Path::new("HDSDR_20261010_101500Z_1635640kHz_RF.wav"));
+        assert_eq!(g.center, Some(1_635_640_000.0));
     }
 
     #[test]
