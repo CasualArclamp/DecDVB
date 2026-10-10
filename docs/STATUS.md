@@ -1394,3 +1394,21 @@ TDM word: channels 0, 1 for 2 ms, then 2, 15). Result: not confirmed.
   multiplexer's mapping is not solved; with it, G.728 (or its 12.8/9.6
   kbit/s Annex H, if the fixed bits are padding) could be tried again. The
   make of the voice multiplexer would short-cut all of this.
+
+The calls' bit layout, found (2026-10-10, continued): one 16 kbit/s stream,
+two bits a TDM word — channels 0, 1 for 2 ms, then 2, 15 for 2 ms — each
+pair's data window at its own offset in the subframe (in the 19:54 call
+pair 2's starts a bit earlier than its doubled status octet suggests;
+15/16 bits), shifting a bit now and then as the channels slip. So taken,
+the talk spurts sit on a strict 10-bit grid: one bit 96 % constant
+(raw 0), the bit two places before it 81 % ones, the other eight free, no
+structure at any longer period (20–320 bits). 10 bits every 0.625 ms is
+G.728's codeword; its Annex H (12.8 kbit/s, which drops shape-index bit 9)
+explains a constant bit. But nothing decodes as speech: the ITU reference
+decoder, 16 kbit/s and a local 12.8 kbit/s variant (Annex H Table H.1 gain
+table; checked against the Annex H test vectors to 44.6 dB), over every
+codeword phase, bit order, polarity and lane arrangement (interleaved or
+split, each lane either way), gives a voicing score of at most 0.04 where
+real speech scores 0.57. The units show no sample-to-sample correlation
+either, so they are codec indices or data, not PCM. Still open: the codec,
+or a scrambling of the units.
