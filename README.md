@@ -67,6 +67,13 @@ Or open a capture from the toolbar, or drop it on the window. The sample rate,
 centre frequency and format are read from the file name when it carries them
 (gqrx, SDR++ and DecSAT's own recordings do); otherwise set them in the toolbar.
 
+DecSAT names its recordings — IQ, symbols, modem data, PCAP, TS, voice — by
+the RF frequency they hold, e.g. `decsat-ASA245_LHI-BN-12346.0340MHz-…`: the
+radio's tuning plus the LNB LO and LO trim. Reopened, an IQ recording takes
+its centre from that. When the RF is not known (no LO set, a file with no
+centre) the name holds the VFO's offset from the band's centre instead
+(`+5236688Hz`), as recordings from before 0.8.1 do.
+
 On the waterfall:
 
 | | |
@@ -282,7 +289,7 @@ choice of identifier, position, telephone and text (see
 For carriers that are not DVB-S2 — SCPC data, telemetry, DVB-S — a VFO locks
 the carrier and shows its constellation; press **● Record** and it writes the
 hard-decided symbols to
-`decsat-<VFO>-<freq>Hz-<rate>Bd-<modulation>-<time>.bin`, one byte per symbol:
+`decsat-<VFO>-<RF>MHz-<rate>Bd-<modulation>-<time>.bin`, one byte per symbol:
 the symbol's bit label under the DVB-S2 mapping (BPSK: 0 = +1). The symbol rate
 and constellation come from Identify, or set them by hand. Without a preamble
 the carrier phase is ambiguous by the constellation's symmetry (90° for QPSK),

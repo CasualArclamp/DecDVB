@@ -453,9 +453,9 @@ impl CallVoice {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let stem = format!(
-                    "decsat-{}-{:+.0}Hz-call-{stamp}",
+                    "decsat-{}-{}-call-{stamp}",
                     o.name.replace(' ', "_"),
-                    o.carrier_hz
+                    crate::rf::freq_tag(o.carrier_hz)
                 );
                 let _ = std::fs::create_dir_all(&o.dir);
                 match AudioRecorder::start(&e1_stream(0), &o.dir, &stem) {
@@ -908,9 +908,9 @@ impl E1Stage {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let stem = format!(
-                    "decsat-{}-{:+.0}Hz-e1-ts{t:02}-{stamp}",
+                    "decsat-{}-{}-e1-ts{t:02}-{stamp}",
                     o.name.replace(' ', "_"),
-                    o.carrier_hz
+                    crate::rf::freq_tag(o.carrier_hz)
                 );
                 let _ = std::fs::create_dir_all(&o.dir);
                 match AudioRecorder::start(&e1_stream(t), &o.dir, &stem) {
@@ -1421,9 +1421,9 @@ impl IpStage {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let path = o.dir.join(format!(
-                    "decsat-{}-{:+.0}Hz-{stamp}.pcap",
+                    "decsat-{}-{}-{stamp}.pcap",
                     o.name.replace(' ', "_"),
-                    o.carrier_hz
+                    crate::rf::freq_tag(o.carrier_hz)
                 ));
                 let _ = std::fs::create_dir_all(&o.dir);
                 match PcapWriter::create(&path) {
@@ -1682,9 +1682,9 @@ impl TsStage {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let path = o.dir.join(format!(
-                    "decsat-{}-{:+.0}Hz-{stamp}.ts",
+                    "decsat-{}-{}-{stamp}.ts",
                     o.name.replace(' ', "_"),
-                    o.carrier_hz
+                    crate::rf::freq_tag(o.carrier_hz)
                 ));
                 let _ = std::fs::create_dir_all(&o.dir);
                 match TsFile::create(&path) {
@@ -1886,9 +1886,9 @@ impl RawFile {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let path = o.dir.join(format!(
-                    "decsat-{}-{:+.0}Hz-{what}-{stamp}.bin",
+                    "decsat-{}-{}-{what}-{stamp}.bin",
                     o.name.replace(' ', "_"),
-                    o.carrier_hz
+                    crate::rf::freq_tag(o.carrier_hz)
                 ));
                 let _ = std::fs::create_dir_all(&o.dir);
                 match std::fs::File::create(&path) {

@@ -5,8 +5,10 @@
 //! - gqrx: `gqrx_20261008_120000_10489750000_2000000_fc.raw` (freq, rate, cf32)
 //! - SDR++ and others: `…_10489750000Hz_…`, `…_2Msps_…`, `…_500ksps_…`
 //! - DecSAT's own recordings (`decdvb-` before the rename):
-//!   `decsat-VFO_1-+250000Hz-333333Sps-….cf32`
-//!   (the signed Hz figure is an offset, not a centre, and is ignored).
+//!   `decsat-VFO_1-12346.0340MHz-333333Sps-….cf32` — the VFO's RF, which is
+//!   the recording's centre — or, when the RF was not known (and before
+//!   0.8.1), `decsat-VFO_1-+250000Hz-…`: a signed figure is an offset from
+//!   the radio's tuning, not a centre, and is ignored.
 
 use std::path::Path;
 
@@ -132,6 +134,15 @@ mod tests {
             assert_eq!(g.rate, Some(333_333.0));
             assert_eq!(g.center, None);
         }
+    }
+
+    #[test]
+    fn own_recordings_named_by_rf_give_the_centre() {
+        let g = guess(Path::new(
+            "decsat-ASA245_LHI-BN-12346.0340MHz-333333Sps-1791620000.cf32",
+        ));
+        assert_eq!(g.rate, Some(333_333.0));
+        assert_eq!(g.center, Some(12_346_034_000.0));
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod frontend;
 pub mod identify;
 pub mod period;
 pub mod psk;
+pub mod rf;
 pub mod spectrum;
 pub mod vfo;
 

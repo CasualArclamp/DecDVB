@@ -722,10 +722,12 @@ impl Worker {
             },
             DecoderKind::Spectrum => Decoder::Spectrum,
             DecoderKind::IqRecord => {
+                // Named by the VFO's RF centre (when known), which is the
+                // recording's centre: opening it labels the axis.
                 let path = s.record_dir.join(format!(
-                    "decsat-{}-{:+.0}Hz-{:.0}Sps-{}.cf32",
+                    "decsat-{}-{}-{:.0}Sps-{}.cf32",
                     s.name.replace(' ', "_"),
-                    s.offset_hz,
+                    crate::rf::freq_tag(s.offset_hz),
                     ddc.out_rate(),
                     unix_stamp()
                 ));
@@ -1856,9 +1858,9 @@ impl PskFile<'_> {
         match (settings.record, self.writer.is_some()) {
             (true, false) if !*self.open_failed => {
                 let p = settings.record_dir.join(format!(
-                    "decsat-{}-{:+.0}Hz-{:.0}Bd-{}{}-{}.bin",
+                    "decsat-{}-{}-{:.0}Bd-{}{}-{}.bin",
                     settings.name.replace(' ', "_"),
-                    carrier_hz,
+                    crate::rf::freq_tag(carrier_hz),
                     d.symbol_rate(),
                     d.modulation().name().replace('/', ""),
                     if settings.psk_bits { "-bits" } else { "" },

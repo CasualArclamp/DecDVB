@@ -1087,6 +1087,8 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.sync_clock_ppm();
+        // Recordings are named by the RF they hold (tuning + LO + trim).
+        decsat_engine::rf::set_rf_center(self.rf_center());
         self.keep_session();
         if self.plan_keep
             && !self.plan.is_empty()
