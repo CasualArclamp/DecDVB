@@ -1427,3 +1427,20 @@ The header wins over flags and name guesses (`probe_capture`,
 `capture_format_rate`). Checked: the 8 MS/s test scene as 16-bit WAV with
 an auxi centre scans to the same carriers and identifications without
 flags, and opens in the GUI at Cs16, 8 MS/s, 1.635640 GHz.
+
+## The CDM-600L's TS1 voice is the same codec as the Q-Flex calls (2026-10-10)
+
+Rory hears digital noise on the CDM-600L's D&I timeslot 1: rightly — it is
+not G.711. Its codec rides in bits 2 and 3 of each octet, a 16 kbit/s
+sub-channel at two bits a 125 µs, the same shape as the Q-Flex calls' stream,
+and folded at 10 bits it shows the same thing: in talk (0–6 s and 12–14 s
+of the recording) one column at 0.03 — the talk flag — and the rest near
+0.5; in silence (8–11 s) frames repeating every 20 ms with mostly-1 columns.
+So the same voice equipment feeds both modems, and the Comtech
+demodulation, TPC and D&I++ framing are right; only the codec is unknown.
+On this clean stream (no pair alternation or slips) G.728 again fails at
+16 kbit/s and 12.8 kbit/s, both lane orders, all phases, bit orders and
+polarities: what scores as voiced is a pitch at multiples of 5 samples —
+the codeword period showing through — not speech. (Voicing now measured on
+the first difference with the peak kept off the range edge: speech 0.45,
+random codewords 0.14.)
